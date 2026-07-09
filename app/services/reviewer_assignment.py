@@ -42,7 +42,6 @@ def _sla_due(priority: str) -> datetime:
     hours = _SLA_HOURS.get(priority, 48)
     return datetime.now(timezone.utc) + timedelta(hours=hours)
 
-
 async def _select_reviewer(
     db: AsyncSession,
     ticket_type: str = "NURSE_DOCUMENT_REVIEW",
@@ -61,8 +60,10 @@ async def _select_reviewer(
         .subquery()
     )
 
-    stmt = (
-        select(ReviewerProfile)
+    # Step 1: find the best candidate id WITHOUT locking (GROUP BY + FOR UPDATE
+    # is not allowed together in PostgreSQL).
+    id_stmt = (
+        select(ReviewerProfile.id)
         .outerjoin(
             open_count_sq,
             ReviewerProfile.id == open_count_sq.c.assigned_reviewer_id,
@@ -71,21 +72,31 @@ async def _select_reviewer(
             ReviewerProfile.is_active.is_(True),
             ReviewerProfile.can_review_nurse_documents.is_(True),
         )
-        # Exclude reviewers at capacity.
         .where(
             func.coalesce(open_count_sq.c.open_count, 0) < ReviewerProfile.max_open_tickets
         )
-        # Primary: fewest open tickets → Secondary: oldest last assigned → Tertiary: lowest daily count.
         .order_by(
             func.coalesce(open_count_sq.c.open_count, 0).asc(),
             ReviewerProfile.last_assigned_at.asc().nullsfirst(),
             ReviewerProfile.daily_assigned_count.asc(),
         )
         .limit(1)
-        .with_for_update(skip_locked=True)   # concurrency protection
     )
-    result = await db.execute(stmt)
-    return result.scalar_one_or_none()
+    id_result = await db.execute(id_stmt)
+    reviewer_id = id_result.scalar_one_or_none()
+
+    if reviewer_id is None:
+        return None
+
+    # Step 2: lock that specific row (simple PK lookup — GROUP BY-free, so
+    # FOR UPDATE is fine here).
+    lock_stmt = (
+        select(ReviewerProfile)
+        .where(ReviewerProfile.id == reviewer_id)
+        .with_for_update(skip_locked=True)
+    )
+    lock_result = await db.execute(lock_stmt)
+    return lock_result.scalar_one_or_none()
 
 
 async def auto_assign_ticket(

@@ -28,6 +28,7 @@ from app.models.models import (
     ConsumerProfile,
     Escalation,
     FinancialLedger,
+    NurseReviewTicket,
     Patient,
     User,
     WorkerDocument,
@@ -35,6 +36,29 @@ from app.models.models import (
 )
 
 router = APIRouter(prefix="/admin", tags=["admin"])
+
+# Ticket statuses that are still "open" in the reviewer queue — used to find
+# the live ticket for a worker when syncing status after a review action.
+_OPEN_TICKET_STATUSES = ("PENDING_REVIEW", "IN_REVIEW", "NEEDS_CLARIFICATION", "UNASSIGNED")
+
+
+async def _sync_ticket_status(db: AsyncSession, worker_id: UUID, new_status: str) -> None:
+    """Keep the reviewer-queue ticket (NurseReviewTicket) in sync with worker
+    onboarding / document review actions taken from the admin endpoints below.
+
+    Without this, WorkerDocument/WorkerProfile get updated but the ticket that
+    actually drives the reviewer's queue UI (/api/review/my-queue) never
+    changes, so cards stay stuck on "PENDING REVIEW" forever.
+    """
+    res = await db.execute(
+        select(NurseReviewTicket).where(
+            NurseReviewTicket.nurse_id == worker_id,
+            NurseReviewTicket.status.in_(_OPEN_TICKET_STATUSES),
+        )
+    )
+    ticket = res.scalar_one_or_none()
+    if ticket:
+        ticket.status = new_status
 
 
 class DocumentReviewRequest(BaseModel):
@@ -174,7 +198,7 @@ async def approve_worker(
         raise HTTPException(status_code=409, detail="Worker has not submitted onboarding for review")
     docs_res = await db.execute(select(WorkerDocument).where(WorkerDocument.worker_id == wp.id))
     docs = list(docs_res.scalars().all())
-    required = {"aadhaar", "nursing_license", "education_certificate", "police_verification"}
+    required = {"aadhaar", "nursing_license", "degree_certificate", "police_verification"}
     verified_types = {
         d.document_type
         for d in docs
@@ -200,6 +224,8 @@ async def approve_worker(
     # Award the worker's tier badge on first approval (skill-based badge).
     from app.services.badges import award_tier_badge
     await award_tier_badge(db, wp)
+    # Keep the reviewer-queue ticket in sync so the card leaves "PENDING REVIEW".
+    await _sync_ticket_status(db, wp.id, "APPROVED")
     await db.commit()
     return {"approved": True}
 
@@ -227,6 +253,12 @@ async def review_worker_document(
     doc.verified_by = current.id
     doc.verified_at = datetime.now(timezone.utc)
     doc.rejection_reason = payload.reason if payload.status == "rejected" else None
+    # Keep the reviewer-queue ticket in sync: a rejected document needs the
+    # nurse to clarify/resubmit; a verified document moves the ticket into
+    # active review (out of the raw "just submitted" PENDING_REVIEW state).
+    await _sync_ticket_status(
+        db, worker_id, "NEEDS_CLARIFICATION" if payload.status == "rejected" else "IN_REVIEW"
+    )
     await db.commit()
     return {"reviewed": True, "verification_status": doc.verification_status}
 
@@ -249,6 +281,7 @@ async def record_background_check(
         wp.onboarding_status = WorkerOnboardingStatus.rejected
         wp.onboarding_rejection_reason = payload.reason or "Background check failed"
         wp.onboarding_reviewed_at = datetime.now(timezone.utc)
+        await _sync_ticket_status(db, wp.id, "REJECTED")
     await db.commit()
     return {"background_check_status": wp.background_check_status}
 
@@ -268,6 +301,8 @@ async def reject_worker(
     wp.onboarding_reviewed_at = datetime.now(timezone.utc)
     wp.onboarding_rejection_reason = payload.reason.strip()
     wp.availability = "offline"
+    # Keep the reviewer-queue ticket in sync so the card leaves the queue.
+    await _sync_ticket_status(db, wp.id, "REJECTED")
     await db.commit()
     return {"rejected": True}
 
