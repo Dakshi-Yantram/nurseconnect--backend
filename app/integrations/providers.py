@@ -102,7 +102,13 @@ class CloudinaryClient:
         import cloudinary  # type: ignore
         import cloudinary.uploader  # type: ignore
         cloudinary.config(cloud_name=self.cloud_name, api_key=self.api_key, api_secret=self.api_secret)
-        return cloudinary.uploader.upload(b64_payload, folder=folder, resource_type=resource_type)
+        # The SDK requires a URL, local file path, or a proper `data:` URI —
+        # a bare base64 string (no prefix) gets misinterpreted as a file path,
+        # which raises FileNotFoundError since no such file exists on disk.
+        payload = b64_payload
+        if not payload.startswith("data:") and not payload.startswith("http"):
+            payload = f"data:application/octet-stream;base64,{payload}"
+        return cloudinary.uploader.upload(payload, folder=folder, resource_type=resource_type)
 
     async def delete(self, public_id: str) -> Dict[str, Any]:
         if self.mock:
