@@ -227,6 +227,7 @@ async def new_requests(profile: WorkerProfile = Depends(get_worker_profile), db:
     visible: list[tuple[Booking, Optional[float]]] = []
     svc_cache: dict = {}
     pkg_cache: dict = {}
+    patient_cache: dict = {}
     now = datetime.now(timezone.utc)
     wave_dirty: list[Booking] = []
     for b in items:
@@ -308,12 +309,20 @@ async def new_requests(profile: WorkerProfile = Depends(get_worker_profile), db:
     out: list[BookingOut] = []
     for b, dist in visible:
         bm = BookingOut.model_validate(b)
-        if b.patient:                        # ← 8 spaces indent
-            bm.patient_name = b.patient.full_name
-        if b.service:
-            bm.service_name = b.service.name
-        elif b.package:
-            bm.service_name = b.package.name
+
+        if b.patient_id:
+            if b.patient_id not in patient_cache:
+                pres = await db.execute(select(Patient).where(Patient.id == b.patient_id))
+                patient_cache[b.patient_id] = pres.scalar_one_or_none()
+            patient = patient_cache[b.patient_id]
+            if patient:
+                bm.patient_name = patient.full_name
+
+        if b.service_id and b.service_id in svc_cache and svc_cache[b.service_id]:
+            bm.service_name = svc_cache[b.service_id].name
+        elif b.package_id and b.package_id in pkg_cache and pkg_cache[b.package_id]:
+            bm.service_name = pkg_cache[b.package_id].name
+
         if dist is not None:
             bm.distance_km = round(dist, 2)
         out.append(bm)
