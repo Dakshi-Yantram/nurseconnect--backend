@@ -224,6 +224,12 @@ async def approve_worker(
     # Award the worker's tier badge on first approval (skill-based badge).
     from app.services.badges import award_tier_badge
     await award_tier_badge(db, wp)
+    # BUGFIX: approval used to never create WorkerServiceQualification rows,
+    # so any service/package gated only by tier (no training/cert/assessment)
+    # stayed permanently locked with locked_reason=QUALIFICATION_RECORD_MISSING
+    # and no way for the worker to opt in or request access.
+    from app.services.qualification import sync_tier_qualifications
+    await sync_tier_qualifications(db, wp)
     # Keep the reviewer-queue ticket in sync so the card leaves "PENDING REVIEW".
     await _sync_ticket_status(db, wp.id, "APPROVED")
     await db.commit()
@@ -327,6 +333,11 @@ async def set_worker_tier(
     if wp.onboarding_status == WorkerOnboardingStatus.approved:
         from app.services.badges import award_tier_badge
         await award_tier_badge(db, wp)
+        # BUGFIX: re-sync qualification rows so a tier upgrade (e.g. to the
+        # top tier / "Clinical Lead") immediately unlocks any tier-only
+        # gated services instead of leaving them stuck as locked.
+        from app.services.qualification import sync_tier_qualifications
+        await sync_tier_qualifications(db, wp)
     await db.commit()
     return {"worker_id": str(wp.id), "tier": wp.tier.value}
 
