@@ -21,6 +21,7 @@ from app.models.enums import (
     VisitFrequency,
     WorkerOnboardingStatus,
     WorkerTier,
+    WorkerType,
 )
 from app.models.models import (
     Booking,
@@ -40,6 +41,11 @@ router = APIRouter(prefix="/admin", tags=["admin"])
 # Ticket statuses that are still "open" in the reviewer queue — used to find
 # the live ticket for a worker when syncing status after a review action.
 _OPEN_TICKET_STATUSES = ("PENDING_REVIEW", "IN_REVIEW", "NEEDS_CLARIFICATION", "UNASSIGNED")
+
+REQUIRED_DOCUMENTS_BY_WORKER_TYPE = {
+    WorkerType.nurse: {"aadhaar", "nursing_license", "degree_certificate", "police_verification"},
+    WorkerType.caregiver: {"aadhaar", "police_verification"},
+}
 
 
 async def _sync_ticket_status(db: AsyncSession, worker_id: UUID, new_status: str) -> None:
@@ -198,7 +204,10 @@ async def approve_worker(
         raise HTTPException(status_code=409, detail="Worker has not submitted onboarding for review")
     docs_res = await db.execute(select(WorkerDocument).where(WorkerDocument.worker_id == wp.id))
     docs = list(docs_res.scalars().all())
-    required = {"aadhaar", "nursing_license", "degree_certificate", "police_verification"}
+    required = REQUIRED_DOCUMENTS_BY_WORKER_TYPE.get(
+        getattr(wp, "worker_type", WorkerType.nurse),
+        REQUIRED_DOCUMENTS_BY_WORKER_TYPE[WorkerType.nurse],
+    )
     verified_types = {
         d.document_type
         for d in docs
