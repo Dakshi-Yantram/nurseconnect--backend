@@ -30,6 +30,7 @@ from app.models.models import (
 from app.schemas.schemas import (
     AuthResponse,
     PasswordLoginRequest,
+    PhoneLoginRequest,
     RefreshRequest,
     RegisterRequest,
     RegisterResponse,
@@ -295,6 +296,64 @@ async def login(payload: PasswordLoginRequest, db: AsyncSession = Depends(get_db
         fcm_token=payload.fcm_token,
     )
     await audit(db, user.id, user.role.value, "auth.password_login", "user", user.id)
+    await db.commit()
+    await db.refresh(user)
+    return AuthResponse(user=UserOut.model_validate(user), tokens=tokens)
+
+
+@router.post("/phone-login", response_model=AuthResponse)
+async def phone_login(payload: PhoneLoginRequest, db: AsyncSession = Depends(get_db)):
+    """Passwordless login/register for the mobile app.
+
+    The mobile app (intapp) has no password field — it authenticates purely
+    off phone number + role via `authService.loginDirect`. This mirrors that
+    contract: look the user up by (phone, role); if none exists, create one
+    on the spot (no email verification step, since the mobile flow never
+    collects/verifies an email). Consumers are activated immediately;
+    workers land in `onboarding` just like the email/password signup path,
+    since they still need document review + reviewer approval before they
+    can accept bookings.
+    """
+    _validate_signup_role(payload.role)
+    phone = _normalize_phone(payload.phone_e164)
+
+    ures = await db.execute(select(User).where(User.phone_e164 == phone))
+    user = ures.scalar_one_or_none()
+
+    if user and user.role != payload.role:
+        raise HTTPException(
+            status_code=409,
+            detail="This phone number is already registered under a different role",
+        )
+
+    if not user:
+        user = User(
+            phone_e164=phone,
+            full_name=(payload.full_name or "").strip() or None,
+            role=payload.role,
+            status=UserStatus.onboarding if payload.role == UserRole.worker else UserStatus.active,
+        )
+        db.add(user)
+        await db.flush()
+        await _ensure_role_profile(db, user)
+        await audit(db, user.id, user.role.value, "auth.phone_register", "user", user.id)
+    else:
+        if payload.full_name and payload.full_name.strip() and not user.full_name:
+            user.full_name = payload.full_name.strip()
+        if user.status not in (UserStatus.active, UserStatus.onboarding):
+            raise HTTPException(status_code=403, detail="Account is not active")
+
+    user.last_login_at = datetime.now(timezone.utc)
+    tokens = _issue_token_pair(user)
+    await _persist_session(
+        db,
+        user,
+        tokens,
+        device_id=payload.device_id,
+        device_platform=payload.device_platform,
+        fcm_token=payload.fcm_token,
+    )
+    await audit(db, user.id, user.role.value, "auth.phone_login", "user", user.id)
     await db.commit()
     await db.refresh(user)
     return AuthResponse(user=UserOut.model_validate(user), tokens=tokens)
