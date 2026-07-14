@@ -351,6 +351,34 @@ async def set_worker_tier(
     return {"worker_id": str(wp.id), "tier": wp.tier.value}
 
 
+@router.post("/workers/{worker_id}/resync-qualifications")
+async def resync_worker_qualifications(
+    worker_id: UUID,
+    current: CurrentUser = Depends(require_reviewer),
+    db: AsyncSession = Depends(get_db),
+):
+    """Re-run the tier→qualification bridge for a single worker.
+
+    `approve_worker` and `set_worker_tier` already call
+    `sync_tier_qualifications` going forward, but any worker who was
+    approved/tier-changed *before* that fix shipped still has no
+    WorkerServiceQualification rows at all, so their "My Services" page
+    shows everything Locked / QUALIFICATION_RECORD_MISSING with nothing to
+    opt in to or request. This endpoint lets a reviewer fix an existing
+    worker without having to re-approve or bounce their tier.
+    """
+    res = await db.execute(select(WorkerProfile).where(WorkerProfile.id == worker_id))
+    wp = res.scalar_one_or_none()
+    if not wp:
+        raise HTTPException(status_code=404, detail="Worker not found")
+    if wp.onboarding_status != WorkerOnboardingStatus.approved:
+        raise HTTPException(status_code=409, detail="Worker must be approved before syncing qualifications")
+    from app.services.qualification import sync_tier_qualifications
+    updated = await sync_tier_qualifications(db, wp)
+    await db.commit()
+    return {"worker_id": str(wp.id), "tier": wp.tier.value, "qualifications_synced": len(updated)}
+
+
 @router.post("/workers/{worker_id}/suspend")
 async def suspend_worker(
     worker_id: UUID,
