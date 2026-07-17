@@ -115,7 +115,7 @@ async def my_queue(
         stmt = stmt.where(NurseReviewTicket.priority == priority.upper())
     rows = (await db.execute(stmt)).scalars().all()
 
-    # Enrich with nurse name.
+    # Enrich with nurse name + profile summary (used by onboarding review UI).
     result = []
     for t in rows:
         wp_res = await db.execute(
@@ -127,6 +127,9 @@ async def my_queue(
         entry = serialize_ticket(t)
         entry["nurse_name"] = row[1].full_name if row else None
         entry["nurse_email"] = row[1].email if row else None
+        entry["specialty"] = (row[0].specialisations[0] if row and row[0].specialisations else None)
+        entry["experience_years"] = row[0].years_of_experience if row else None
+        entry["city"] = row[0].base_city if row else None
         result.append(entry)
     return result
 
