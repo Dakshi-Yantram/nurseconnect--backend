@@ -322,15 +322,6 @@ class ServiceOut(ORMModel):
     is_active: bool
 
 
-class PackageServiceSummary(BaseModel):
-    """Lightweight service reference embedded in a CarePackageOut, so the
-    frontend can populate a package-scoped Service dropdown without ever
-    calling the generic /services catalogue endpoint."""
-    id: UUID
-    service_code: str
-    name: str
-
-
 class CarePackageOut(ORMModel):
     id: UUID
     package_code: str
@@ -350,14 +341,6 @@ class CarePackageOut(ORMModel):
     available_cities: Optional[List[str]] = None
     is_active: bool
     primary_service_id: Optional[UUID] = None
-    # Full set of service ids included in this package (primary + any
-    # additional ones). Populated by the catalog API from
-    # CarePackage.included_service_ids (falling back to primary_service_id).
-    included_service_ids: List[UUID] = Field(default_factory=list)
-    # Resolved service objects (id/code/name) for the ids above — this is
-    # what the booking form's package-scoped Service dropdown should render,
-    # instead of loading the entire service catalogue.
-    services: List[PackageServiceSummary] = Field(default_factory=list)
 
 
 # ----- BOOKINGS -----

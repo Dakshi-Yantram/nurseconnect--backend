@@ -208,67 +208,6 @@ PACKAGES = [
 ]
 
 
-# ---------------------------------------------------------------------------
-# Package -> Service linkage.
-#
-# Root cause of the "care package booking shows the whole service catalogue"
-# bug: PACKAGES above never set primary_service_id / included_service_ids,
-# so CarePackage.primary_service_id was NULL for every seeded package and
-# the frontend had nothing to filter the Service dropdown by.
-#
-# Each entry maps a package_code to the service_code(s) it actually covers.
-# The first code in the list becomes primary_service_id; the full list
-# becomes included_service_ids. Kept as data (not hardcoded IDs) — codes are
-# resolved to real UUIDs at seed time, and this is the single place a future
-# package/service change needs to be reflected.
-# ---------------------------------------------------------------------------
-PACKAGE_SERVICE_LINKS: dict[str, list[str]] = {
-    "POST_OP_7D": ["POST_OP_CARE", "WOUND_DRESSING", "VITALS_CHECK"],
-    "ELDERLY_MONTHLY": ["ELDERLY_DAY_SHIFT", "ELDERLY_NIGHT_SHIFT"],
-    "DIABETES_CARE_14D": ["VITALS_CHECK", "INJECTION_IM_IV"],
-    "MATERNITY_POSTNATAL_30D": ["VITALS_CHECK", "WOUND_DRESSING"],
-}
-
-
-async def link_package_services(session) -> int:
-    """Populate primary_service_id / included_service_ids on every package
-    using PACKAGE_SERVICE_LINKS. Runs after seed_services/seed_packages, and
-    is safe to re-run (idempotent): only backfills packages whose
-    primary_service_id is still NULL, so it also fixes rows created by an
-    earlier, pre-fix version of this seed script without touching anything
-    an operator may have set manually since.
-    """
-    await session.flush()  # ensure any newly-added rows have ids
-
-    code_to_id: dict[str, "uuid.UUID"] = {}
-    sres = await session.execute(select(ServiceCatalogue.id, ServiceCatalogue.service_code))
-    for sid, code in sres.all():
-        code_to_id[code] = sid
-
-    linked = 0
-    for package_code, service_codes in PACKAGE_SERVICE_LINKS.items():
-        pres = await session.execute(select(CarePackage).where(CarePackage.package_code == package_code))
-        package = pres.scalar_one_or_none()
-        if not package:
-            print(f"  ! package {package_code} not found, skipping service link")
-            continue
-        if package.primary_service_id and package.included_service_ids:
-            continue  # already linked — don't clobber
-
-        resolved_ids = [code_to_id[c] for c in service_codes if c in code_to_id]
-        missing = [c for c in service_codes if c not in code_to_id]
-        if missing:
-            print(f"  ! package {package_code} references unknown service code(s): {missing}")
-        if not resolved_ids:
-            continue
-
-        package.primary_service_id = resolved_ids[0]
-        package.included_service_ids = resolved_ids
-        linked += 1
-        print(f"  + linked package {package_code} -> {service_codes}")
-    return linked
-
-
 async def seed_services(session) -> int:
     created = 0
     for data in SERVICES:
