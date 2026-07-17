@@ -106,6 +106,23 @@ class PasswordLoginRequest(BaseModel):
     device_platform: Optional[str] = None
     fcm_token: Optional[str] = None
 
+
+class PhoneLoginRequest(BaseModel):
+    """Passwordless phone login/register used by the mobile app (intapp).
+
+    Distinct from PasswordLoginRequest — the mobile app has no password
+    field and authenticates purely off phone number + role. If no account
+    exists yet for this phone+role, one is created (and activated)
+    immediately, same as `loginDirect` on the client expects.
+    """
+    phone_e164: str
+    full_name: Optional[str] = None
+    code: Optional[str] = None  # reserved for a future real OTP step; unused for now
+    role: UserRole = UserRole.consumer
+    device_id: Optional[str] = None
+    device_platform: Optional[str] = None
+    fcm_token: Optional[str] = None
+
 class UserOut(ORMModel):
     id: UUID
     phone_e164: str
@@ -323,6 +340,7 @@ class CarePackageOut(ORMModel):
     insurance_covered: bool
     available_cities: Optional[List[str]] = None
     is_active: bool
+    primary_service_id: Optional[UUID] = None
 
 
 # ----- BOOKINGS -----
