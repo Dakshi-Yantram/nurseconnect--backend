@@ -65,6 +65,7 @@ from app.models.enums import (
     ServiceCategory,
     ServiceRiskLevel,
     SubsidyType,
+    SupportTicketStatus,
     UserRole,
     UserStatus,
     VisitFrequency,
@@ -985,6 +986,102 @@ class Complaint(Base):
     action_taken: Mapped[Optional[str]] = mapped_column(String(100))
     resolution_notes: Mapped[Optional[str]] = mapped_column(Text)
     resolved_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now, server_default=func.now())
+
+
+class RoleDefinition(Base):
+    """Metadata (display name, description, permission list) for the
+    admin-manageable staff roles: operations, support,
+    clinical_training_lead, clinical_trainer. role_key must be one of
+    those UserRole enum values — the enum itself is the source of truth
+    for which roles can exist; this table lets admin configure how each
+    one presents and what it's permitted to do, without a code deploy.
+    """
+    __tablename__ = "role_definitions"
+    id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), primary_key=True, default=_uuid)
+    role_key: Mapped[UserRole] = mapped_column(SQLEnum(UserRole, name="user_role"), unique=True, nullable=False, index=True)
+    display_name: Mapped[str] = mapped_column(String(100), nullable=False)
+    description: Mapped[Optional[str]] = mapped_column(Text)
+    permissions: Mapped[list] = mapped_column(JSONB, default=list)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+    created_by: Mapped[Optional[UUID]] = mapped_column(PG_UUID(as_uuid=True), ForeignKey("users.id"))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now, server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now, onupdate=_now, server_default=func.now())
+
+
+class Message(Base):
+    """In-app chat between the assigned worker and the consumer, scoped to
+    either a single booking (one-off visit) or a care package booking
+    (multi-visit package — same worker/consumer thread across the whole
+    package). Exactly one of booking_id / package_booking_id is set.
+
+    Sending is blocked once the booking/package reaches a terminal status —
+    enforced at request time in app/api/v1/messaging.py by checking the
+    live Booking/CarePackageBooking status, not a stored "closed" flag, so
+    it can never drift out of sync with the booking's real status.
+    """
+    __tablename__ = "messages"
+    id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), primary_key=True, default=_uuid)
+    booking_id: Mapped[Optional[UUID]] = mapped_column(PG_UUID(as_uuid=True), ForeignKey("bookings.id", ondelete="CASCADE"), index=True)
+    package_booking_id: Mapped[Optional[UUID]] = mapped_column(PG_UUID(as_uuid=True), ForeignKey("care_package_bookings.id", ondelete="CASCADE"), index=True)
+    sender_id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), ForeignKey("users.id"))
+    sender_role: Mapped[str] = mapped_column(String(50))
+    body: Mapped[str] = mapped_column(Text, nullable=False)
+    is_read: Mapped[bool] = mapped_column(Boolean, default=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now, server_default=func.now(), index=True)
+
+
+class Faq(Base):
+    """Help-center FAQ entry. Managed by operations, shown to consumer
+    and/or worker portals depending on `audience`."""
+    __tablename__ = "faqs"
+    id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), primary_key=True, default=_uuid)
+    audience: Mapped[str] = mapped_column(String(20), nullable=False, index=True)  # consumer | worker | all
+    category: Mapped[Optional[str]] = mapped_column(String(100))
+    question: Mapped[str] = mapped_column(Text, nullable=False)
+    answer: Mapped[str] = mapped_column(Text, nullable=False)
+    display_order: Mapped[int] = mapped_column(Integer, default=0)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
+    created_by: Mapped[Optional[UUID]] = mapped_column(PG_UUID(as_uuid=True), ForeignKey("users.id"))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now, server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now, onupdate=_now, server_default=func.now())
+
+
+class SupportTicket(Base):
+    """Consumer/nurse-raised help-center ticket, distinct from clinical
+    escalations and the internal complaint/dispute workflow. Routes to the
+    support role's queue."""
+    __tablename__ = "support_tickets"
+    id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), primary_key=True, default=_uuid)
+    ticket_ref: Mapped[str] = mapped_column(String(30), unique=True, nullable=False, index=True)
+    raised_by: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), ForeignKey("users.id"), index=True)
+    raiser_role: Mapped[str] = mapped_column(String(50))
+    category: Mapped[str] = mapped_column(String(50), default="other")
+    subject: Mapped[str] = mapped_column(String(255), nullable=False)
+    description: Mapped[str] = mapped_column(Text, nullable=False)
+    booking_id: Mapped[Optional[UUID]] = mapped_column(PG_UUID(as_uuid=True), ForeignKey("bookings.id"))
+    status: Mapped["SupportTicketStatus"] = mapped_column(
+        SQLEnum(SupportTicketStatus, name="support_ticket_status"),
+        default=SupportTicketStatus.open, server_default=SupportTicketStatus.open.value,
+        nullable=False, index=True,
+    )
+    priority: Mapped[str] = mapped_column(String(20), default="normal")
+    assigned_to: Mapped[Optional[UUID]] = mapped_column(PG_UUID(as_uuid=True), ForeignKey("users.id"), index=True)
+    resolution_notes: Mapped[Optional[str]] = mapped_column(Text)
+    resolved_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now, server_default=func.now(), index=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now, onupdate=_now, server_default=func.now())
+
+
+class SupportTicketMessage(Base):
+    """Thread of replies on a support ticket — raiser and support staff
+    exchange messages here."""
+    __tablename__ = "support_ticket_messages"
+    id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), primary_key=True, default=_uuid)
+    ticket_id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), ForeignKey("support_tickets.id", ondelete="CASCADE"), index=True)
+    sender_id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), ForeignKey("users.id"))
+    sender_role: Mapped[str] = mapped_column(String(50))
+    message: Mapped[str] = mapped_column(Text, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now, server_default=func.now())
 
 
