@@ -99,3 +99,43 @@ def require_reviewer(current: CurrentUser = Depends(get_current_user)) -> Curren
     if current.role not in (UserRole.admin, UserRole.reviewer):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Reviewer or admin role required")
     return current
+
+
+def require_operations(current: CurrentUser = Depends(get_current_user)) -> CurrentUser:
+    """Operations accounts, or admin (superuser)."""
+    if current.role not in (UserRole.admin, UserRole.operations):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Operations or admin role required")
+    return current
+
+
+def require_support(current: CurrentUser = Depends(get_current_user)) -> CurrentUser:
+    """Support-desk accounts, or operations/admin (who can always cover support)."""
+    if current.role not in (UserRole.admin, UserRole.operations, UserRole.support):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Support role required")
+    return current
+
+
+def require_clinical_training_lead(current: CurrentUser = Depends(get_current_user)) -> CurrentUser:
+    """Clinical training leads (approve training content), or admin."""
+    if current.role not in (UserRole.admin, UserRole.clinical_training_lead):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Clinical training lead role required")
+    return current
+
+
+def require_clinical_trainer(current: CurrentUser = Depends(get_current_user)) -> CurrentUser:
+    """Clinical trainers (author training content) — training leads and admin can also author."""
+    if current.role not in (UserRole.admin, UserRole.clinical_training_lead, UserRole.clinical_trainer):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Clinical trainer role required")
+    return current
+
+
+def is_staff(role: UserRole) -> bool:
+    """Any internal (non-consumer, non-worker) account."""
+    return role in (
+        UserRole.admin,
+        UserRole.reviewer,
+        UserRole.operations,
+        UserRole.support,
+        UserRole.clinical_training_lead,
+        UserRole.clinical_trainer,
+    )
