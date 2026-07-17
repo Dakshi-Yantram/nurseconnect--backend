@@ -339,6 +339,97 @@ async def evaluate_and_upsert_qualifications_for_module(
     return updated
 
 
+# ---------------------------------------------------------------------------
+# Tier assignment → qualification bridge
+#
+# BUGFIX: approving a worker / setting their tier (admin.py: approve_worker,
+# set_worker_tier) used to only set `worker.tier` and mint the tier badge —
+# it never touched WorkerServiceQualification. Any service/package with no
+# training, certificate or assessment requirement (i.e. gated by tier alone)
+# therefore stayed stuck at QUALIFICATION_RECORD_MISSING forever, because
+# nothing else in the codebase ever creates that row for a tier-only service.
+# This mirrors evaluate_and_upsert_qualifications_for_module/_assessment but
+# is triggered from tier assignment / approval instead of training.
+# ---------------------------------------------------------------------------
+async def sync_tier_qualifications(
+    db: AsyncSession, worker: WorkerProfile
+) -> list[WorkerServiceQualification]:
+    """Re-evaluate every active service/package against the worker's current
+    tier and upsert a WorkerServiceQualification row wherever the worker now
+    meets (or no longer meets) the requirements that don't depend on training
+    or assessment completion.
+
+    - Tier not met -> leaves/creates the row as NOT_QUALIFIED (locked, tier).
+    - Tier met + no training/cert/assessment required + no admin-approval
+      required -> APPROVED, source=TIER.
+    - Tier met + no training/cert/assessment required + admin-approval
+      required -> QUALIFIED_PENDING_APPROVAL (unless already admin-approved).
+    - Tier met but training/cert/assessment still outstanding -> leaves the
+      status for the training/assessment bridge to manage; only touches the
+      row here if it doesn't exist yet (so `can_opt_in` shows the right
+      locked_reason instead of QUALIFICATION_RECORD_MISSING).
+    """
+    updated: list[WorkerServiceQualification] = []
+
+    sres = await db.execute(select(ServiceCatalogue).where(ServiceCatalogue.is_active.is_(True)))
+    services = list(sres.scalars().all())
+    pres = await db.execute(select(CarePackage).where(CarePackage.is_active.is_(True)))
+    packages = list(pres.scalars().all())
+
+    for target in services + packages:
+        tier_ok = _tier_value(worker.tier) >= _tier_value(target.min_tier)
+
+        training_codes = list(getattr(target, "required_training_module_codes", None) or [])
+        cert_codes = list(getattr(target, "required_certificate_codes", None) or [])
+        assessment_codes = list(getattr(target, "required_assessment_codes", None) or [])
+        requires_admin = bool(getattr(target, "requires_admin_skill_approval", False))
+        min_pass = getattr(target, "minimum_pass_score", None)
+
+        training_ok = await _has_passed_required_trainings(db, worker, training_codes)
+        cert_ok = await _has_valid_certificates(db, worker, cert_codes)
+        assess_ok = await _has_passed_required_assessments(db, worker, assessment_codes, min_pass)
+
+        qual = await _get_qualification_row(db, worker.id, target)
+
+        if not qual:
+            qual = WorkerServiceQualification(
+                worker_id=worker.id,
+                service_id=target.id if _is_service(target) else None,
+                package_id=None if _is_service(target) else target.id,
+                qualification_source=WorkerQualificationSource.TIER,
+            )
+            db.add(qual)
+
+        # Never downgrade a qualification that was already earned through
+        # training/assessment/admin approval — this bridge only manages the
+        # tier-only case.
+        if qual.qualification_status == WorkerQualificationStatus.APPROVED:
+            continue
+
+        if not tier_ok:
+            qual.qualification_status = WorkerQualificationStatus.NOT_QUALIFIED
+        elif not (training_ok and cert_ok and assess_ok):
+            # Tier is fine but something else is still outstanding — leave
+            # status as-is (defaults to NOT_QUALIFIED for a brand new row) so
+            # the eligibility endpoint reports the *real* locked_reason
+            # (TRAINING_REQUIRED / CERTIFICATE_REQUIRED / ASSESSMENT_REQUIRED)
+            # rather than QUALIFICATION_RECORD_MISSING.
+            if qual.qualification_status is None:
+                qual.qualification_status = WorkerQualificationStatus.NOT_QUALIFIED
+        elif requires_admin and not qual.admin_approved_at:
+            qual.qualification_status = WorkerQualificationStatus.QUALIFIED_PENDING_APPROVAL
+            qual.qualification_source = WorkerQualificationSource.TIER
+        else:
+            qual.qualification_status = WorkerQualificationStatus.APPROVED
+            qual.qualification_source = WorkerQualificationSource.TIER
+            qual.valid_from = qual.valid_from or datetime.now(timezone.utc)
+
+        await db.flush()
+        updated.append(qual)
+
+    return updated
+
+
 # Backwards-compat shim removed
 
 
