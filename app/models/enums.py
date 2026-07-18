@@ -379,6 +379,30 @@ class ServiceRiskLevel(str, Enum):
     CRITICAL = "CRITICAL"
 
 
+class AssessmentSessionStatus(str, Enum):
+    in_progress = "in_progress"
+    completed = "completed"
+    expired = "expired"
+
+
+class QualificationGate(str, Enum):
+    """Which verification track a service/care package requires.
+
+    credential_only  — identity, basic training, behavioral suitability,
+                        maybe background check. No formal exam — don't
+                        over-test low-risk tasks (companionship, meal
+                        assistance, walking support, ...).
+    theory_verified   — a remote knowledge assessment is required (anti-cheat
+                        assessment mechanics apply), no in-person practical.
+    practical_verified — highest risk: theory must be passed AND a trainer
+                        must observe and sign off a practical competency
+                        checklist before the system unlocks the service.
+    """
+    credential_only = "credential_only"
+    theory_verified = "theory_verified"
+    practical_verified = "practical_verified"
+
+
 # ============================================================================
 # Patch 4B — Trainer / Reviewer content lifecycle
 # ============================================================================

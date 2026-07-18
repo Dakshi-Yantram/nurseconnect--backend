@@ -13,7 +13,8 @@ opt-in endpoint from Patch 2.
 """
 from __future__ import annotations
 
-from datetime import datetime, timezone
+import random
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 from uuid import UUID
 
@@ -27,19 +28,25 @@ from app.core.deps import (
     CurrentUser,
     get_current_user,
     get_worker_profile,
+    require_clinical_trainer,
     require_roles,
 )
 from app.models.enums import (
     AssessmentQuestionType,
+    AssessmentSessionStatus,
     ContentStatus,
     UserRole,
 )
 from app.models.models import (
     AssessmentModule,
+    CarePackage,
+    PracticalSignOff,
+    ServiceCatalogue,
     TrainingCompletion,
     TrainingModule,
     User,
     WorkerAssessmentAttempt,
+    WorkerAssessmentSession,
     WorkerProfile,
 )
 
@@ -123,7 +130,11 @@ def _validate_questions(questions: List[Dict[str, Any]]) -> None:
     for i, q in enumerate(questions):
         if not isinstance(q, dict):
             raise HTTPException(status_code=400, detail=f"question[{i}] must be an object")
+        # The anti-cheat session engine keys everything off `id` — assign a
+        # stable positional fallback here (not just for the uniqueness
+        # check) so every question is guaranteed a real id once persisted.
         qid = q.get("id") or f"q{i}"
+        q["id"] = qid
         if qid in seen_ids:
             raise HTTPException(status_code=400, detail=f"duplicate question id {qid}")
         seen_ids.add(qid)
@@ -146,6 +157,32 @@ def _validate_questions(questions: List[Dict[str, Any]]) -> None:
         elif qtype == "text":
             # Text questions are not auto-scored (counted as correct).
             pass
+
+        # Optional variants — same shape rules as the base question, minus
+        # `id`/`type` (inherited from the parent). Lets a question have
+        # several equivalent versions with different numbers/wording so the
+        # anti-cheat session engine can hand different workers different
+        # values for "the same" question.
+        variants = q.get("variants")
+        if variants is not None:
+            if not isinstance(variants, list) or not variants:
+                raise HTTPException(status_code=400, detail=f"question[{i}] variants must be a non-empty list if present")
+            for vi, v in enumerate(variants):
+                if not isinstance(v, dict):
+                    raise HTTPException(status_code=400, detail=f"question[{i}] variant[{vi}] must be an object")
+                if qtype == "single_select":
+                    if not isinstance(v.get("options"), list) or len(v["options"]) < 2:
+                        raise HTTPException(status_code=400, detail=f"question[{i}] variant[{vi}] options required")
+                    if not isinstance(v.get("correct_index"), int):
+                        raise HTTPException(status_code=400, detail=f"question[{i}] variant[{vi}] correct_index required")
+                elif qtype == "multi_select":
+                    if not isinstance(v.get("options"), list) or len(v["options"]) < 2:
+                        raise HTTPException(status_code=400, detail=f"question[{i}] variant[{vi}] options required")
+                    if not isinstance(v.get("correct_indices"), list):
+                        raise HTTPException(status_code=400, detail=f"question[{i}] variant[{vi}] correct_indices required")
+                elif qtype == "boolean":
+                    if not isinstance(v.get("correct_bool"), bool):
+                        raise HTTPException(status_code=400, detail=f"question[{i}] variant[{vi}] correct_bool required")
 
 
 def _score_attempt(questions: List[Dict[str, Any]], answers: List[Any]) -> int:
@@ -244,6 +281,13 @@ def _serialize_assessment(a: AssessmentModule, *, include_admin_fields: bool = F
         "linked_training_module_code": a.linked_training_module_code,
         "status": a.status.value if a.status else None,
         "is_active": a.is_active,
+        # Anti-cheat config — safe to show upfront (no answers), lets the
+        # worker know what they're about to attempt before starting.
+        "randomize_options": a.randomize_options,
+        "questions_per_attempt": a.questions_per_attempt or len(a.questions or []),
+        "time_limit_minutes": a.time_limit_minutes,
+        "max_attempts": a.max_attempts,
+        "cooldown_hours": a.cooldown_hours,
     }
     if include_admin_fields:
         out.update({
@@ -430,15 +474,20 @@ async def list_published_assessments(
         prev = attempts.get(att.assessment_id)
         if not prev or att.submitted_at > prev.submitted_at:
             attempts[att.assessment_id] = att
+    now = _now()
     out = []
     for a in items:
         att = attempts.get(a.id)
+        eligibility = await _assessment_start_eligibility(db, profile, a, now)
         d = _serialize_assessment(a, include_admin_fields=False, include_correct=False)
         d.update({
             "attempted": bool(att),
             "latest_score": att.score if att else None,
             "latest_passed": att.passed if att else None,
             "latest_submitted_at": att.submitted_at.isoformat() if att else None,
+            "can_start": eligibility["can_start"],
+            "locked_reason": eligibility["reason"],
+            "attempts_used": eligibility["attempts_used"],
         })
         out.append(d)
     return out
@@ -462,35 +511,24 @@ async def get_published_assessment(
     return _serialize_assessment(a, include_admin_fields=False, include_correct=False)
 
 
-@router.post("/assessments/{assessment_id}/submit")
-async def submit_assessment(
-    assessment_id: UUID,
-    body: AssessmentSubmit,
-    profile: WorkerProfile = Depends(get_worker_profile),
-    db: AsyncSession = Depends(get_db),
-):
-    """Worker submits answers → score computed + attempt persisted.
-
-    Passing an assessment does NOT auto-opt the worker in for a service.
-    Qualification status is upserted via Patch 2 qualification engine.
-    """
-    res = await db.execute(
-        select(AssessmentModule).where(
-            AssessmentModule.id == assessment_id,
-            AssessmentModule.status == ContentStatus.published,
-        )
-    )
-    a = res.scalar_one_or_none()
-    if not a:
-        raise HTTPException(status_code=404, detail="Assessment not found or not published")
-    score = _score_attempt(a.questions or [], body.answers or [])
-    passed = score >= int(a.pass_score or 0)
+async def _finalize_scored_attempt(
+    db: AsyncSession,
+    profile: WorkerProfile,
+    a: AssessmentModule,
+    answers: list,
+    score: int,
+    passed: bool,
+) -> tuple[WorkerAssessmentAttempt, list[str]]:
+    """Shared tail end of scoring an attempt: persist the attempt row, then
+    (if passed) run it through the qualification engine and award a badge.
+    Used by both the legacy flat-submit endpoint and the anti-cheat session
+    engine so qualification unlock logic only lives in one place."""
     attempt = WorkerAssessmentAttempt(
         worker_id=profile.id,
         assessment_id=a.id,
         assessment_version=int(a.published_version or a.version or 1),
         assessment_code_snapshot=a.code,
-        answers=list(body.answers or []),
+        answers=answers,
         score=score,
         passed=passed,
         pass_score_snapshot=int(a.pass_score or 0),
@@ -510,12 +548,43 @@ async def submit_assessment(
             )
         except Exception:  # noqa: BLE001
             qualification_unlocked = []
-        # Award/refresh the skill badge for this passed assessment.
         try:
             from app.services.badges import award_assessment_badge
             await award_assessment_badge(db, profile, a, attempt)
         except Exception:  # noqa: BLE001
             pass
+    return attempt, qualification_unlocked
+
+
+@router.post("/assessments/{assessment_id}/submit")
+async def submit_assessment(
+    assessment_id: UUID,
+    body: AssessmentSubmit,
+    profile: WorkerProfile = Depends(get_worker_profile),
+    db: AsyncSession = Depends(get_db),
+):
+    """Legacy flat-submit path — answers all sent at once, no anti-cheat
+    protections. Kept for assessments that don't need Gate 2/3 rigor.
+    New anti-cheat assessments should use POST /assessments/{id}/start
+    + POST /assessments/{id}/sessions/{session_id}/answer instead.
+
+    Passing an assessment does NOT auto-opt the worker in for a service.
+    Qualification status is upserted via Patch 2 qualification engine.
+    """
+    res = await db.execute(
+        select(AssessmentModule).where(
+            AssessmentModule.id == assessment_id,
+            AssessmentModule.status == ContentStatus.published,
+        )
+    )
+    a = res.scalar_one_or_none()
+    if not a:
+        raise HTTPException(status_code=404, detail="Assessment not found or not published")
+    score = _score_attempt(a.questions or [], body.answers or [])
+    passed = score >= int(a.pass_score or 0)
+    attempt, qualification_unlocked = await _finalize_scored_attempt(
+        db, profile, a, list(body.answers or []), score, passed
+    )
     await db.commit()
     return {
         "score": score,
@@ -524,6 +593,310 @@ async def submit_assessment(
         "completion_status": "passed" if passed else "failed",
         "submitted_at": attempt.submitted_at.isoformat(),
         "qualification_unlocked": qualification_unlocked,
+    }
+
+
+# ===========================================================================
+# ANTI-CHEAT ASSESSMENT SESSION ENGINE (Gate 2/3 "theory-verified")
+#
+# Questions are delivered one at a time; correct answers, unpicked question
+# variants, and true option order NEVER reach the client. All scoring
+# happens server-side against `question_order` recorded at session start.
+# ===========================================================================
+def _build_question_order(questions: List[Dict[str, Any]], count: Optional[int]) -> List[Dict[str, Any]]:
+    # Defensive fallback for assessments authored before question ids were
+    # made mandatory — positional id, stable for the lifetime of this list.
+    indexed = [(q, q.get("id") or f"q{i}") for i, q in enumerate(questions or [])]
+    random.shuffle(indexed)
+    if count is not None and count > 0:
+        indexed = indexed[:count]
+    order: List[Dict[str, Any]] = []
+    for q, qid in indexed:
+        variants = q.get("variants") or []
+        variant_index = random.randrange(len(variants)) if variants else None
+        active = variants[variant_index] if variant_index is not None else q
+        n_options = len(active.get("options") or [])
+        option_order = list(range(n_options))
+        random.shuffle(option_order)
+        order.append({
+            "question_id": qid,
+            "variant_index": variant_index,
+            "option_order": option_order,
+        })
+    return order
+
+
+def _resolve_question(assessment_questions: List[Dict[str, Any]], entry: Dict[str, Any]) -> tuple[Dict[str, Any], Dict[str, Any]]:
+    """Return (base_question, active_question) — active is the picked variant, or base if none."""
+    base = next(
+        (q for i, q in enumerate(assessment_questions) if (q.get("id") or f"q{i}") == entry["question_id"]),
+        None,
+    )
+    if base is None:
+        raise HTTPException(status_code=500, detail="Assessment question no longer exists")
+    variant_index = entry.get("variant_index")
+    if variant_index is not None:
+        variants = base.get("variants") or []
+        if variant_index < len(variants):
+            return base, variants[variant_index]
+    return base, base
+
+
+def _sanitize_question(assessment_questions: List[Dict[str, Any]], entry: Dict[str, Any], index: int, total: int) -> Dict[str, Any]:
+    base, active = _resolve_question(assessment_questions, entry)
+    options = active.get("options") or []
+    option_order = entry["option_order"]
+    shown_options = [options[i] for i in option_order if i < len(options)]
+    return {
+        "question_number": index + 1,
+        "total_questions": total,
+        "question_id": entry["question_id"],
+        "type": base.get("type", "single_select"),
+        "text": active.get("text") or active.get("question") or base.get("text") or base.get("question"),
+        "options": shown_options,
+        "difficulty": base.get("difficulty"),
+    }
+
+
+def _grade_answer(assessment_questions: List[Dict[str, Any]], entry: Dict[str, Any], answer: Any) -> bool:
+    base, active = _resolve_question(assessment_questions, entry)
+    qtype = base.get("type", "single_select")
+    option_order = entry["option_order"]
+
+    if qtype == "single_select":
+        try:
+            shown_idx = int(answer)
+        except (TypeError, ValueError):
+            return False
+        if shown_idx < 0 or shown_idx >= len(option_order):
+            return False
+        original_idx = option_order[shown_idx]
+        return original_idx == active.get("correct_index")
+    if qtype == "boolean":
+        try:
+            shown_idx = int(answer)
+        except (TypeError, ValueError):
+            return False
+        if shown_idx < 0 or shown_idx >= len(option_order):
+            return False
+        original_idx = option_order[shown_idx]
+        # boolean questions are authored as a 2-option list ["True","False"]
+        # with correct_bool telling us which one is right.
+        correct_idx = 0 if active.get("correct_bool") else 1
+        return original_idx == correct_idx
+    if qtype == "multi_select":
+        if not isinstance(answer, list):
+            return False
+        try:
+            shown_indices = {int(x) for x in answer}
+        except (TypeError, ValueError):
+            return False
+        original_indices = {option_order[i] for i in shown_indices if 0 <= i < len(option_order)}
+        return original_indices == set(active.get("correct_indices") or [])
+    if qtype == "text":
+        return isinstance(answer, str) and bool(answer.strip())
+    return False
+
+
+class SessionAnswerRequest(BaseModel):
+    answer: Any
+
+
+async def _assessment_start_eligibility(
+    db: AsyncSession, profile: WorkerProfile, a: AssessmentModule, now: datetime,
+) -> Dict[str, Any]:
+    """Single source of truth for max_attempts / cooldown gating — used by
+    both /start (enforces it) and the list endpoint (reports it)."""
+    completed_count = 0
+    if a.max_attempts or a.cooldown_hours:
+        cres = await db.execute(
+            select(WorkerAssessmentSession).where(
+                WorkerAssessmentSession.worker_id == profile.id,
+                WorkerAssessmentSession.assessment_id == a.id,
+                WorkerAssessmentSession.status == AssessmentSessionStatus.completed,
+            ).order_by(WorkerAssessmentSession.completed_at.desc())
+        )
+        completed_sessions = cres.scalars().all()
+        completed_count = len(completed_sessions)
+    else:
+        completed_sessions = []
+
+    if a.max_attempts and completed_count >= a.max_attempts:
+        return {
+            "can_start": False,
+            "reason": f"Maximum attempts ({a.max_attempts}) reached for this assessment.",
+            "unlock_at": None,
+            "attempts_used": completed_count,
+        }
+
+    if a.cooldown_hours and completed_sessions:
+        last = completed_sessions[0]
+        if last.passed is False and last.completed_at:
+            unlock_at = last.completed_at + timedelta(hours=a.cooldown_hours)
+            if now < unlock_at:
+                return {
+                    "can_start": False,
+                    "reason": f"Try again after {unlock_at.isoformat()} (cooldown after a failed attempt).",
+                    "unlock_at": unlock_at,
+                    "attempts_used": completed_count,
+                }
+
+    return {"can_start": True, "reason": None, "unlock_at": None, "attempts_used": completed_count}
+
+
+@router.post("/assessments/{assessment_id}/start")
+async def start_assessment_session(
+    assessment_id: UUID,
+    profile: WorkerProfile = Depends(get_worker_profile),
+    db: AsyncSession = Depends(get_db),
+):
+    res = await db.execute(
+        select(AssessmentModule).where(
+            AssessmentModule.id == assessment_id,
+            AssessmentModule.status == ContentStatus.published,
+        )
+    )
+    a = res.scalar_one_or_none()
+    if not a:
+        raise HTTPException(status_code=404, detail="Assessment not found or not published")
+
+    now = _now()
+
+    # Resume an unexpired in-progress session instead of starting a new one.
+    sres = await db.execute(
+        select(WorkerAssessmentSession).where(
+            WorkerAssessmentSession.worker_id == profile.id,
+            WorkerAssessmentSession.assessment_id == assessment_id,
+            WorkerAssessmentSession.status == AssessmentSessionStatus.in_progress,
+        ).order_by(WorkerAssessmentSession.started_at.desc())
+    )
+    existing = sres.scalar_one_or_none()
+    if existing:
+        if existing.expires_at and existing.expires_at < now:
+            existing.status = AssessmentSessionStatus.expired
+            await db.commit()
+        else:
+            question = _sanitize_question(a.questions or [], existing.question_order[existing.current_index], existing.current_index, len(existing.question_order))
+            return {
+                "session_id": str(existing.id),
+                "expires_at": existing.expires_at.isoformat() if existing.expires_at else None,
+                "question": question,
+            }
+
+    eligibility = await _assessment_start_eligibility(db, profile, a, now)
+    if not eligibility["can_start"]:
+        raise HTTPException(status_code=403, detail=eligibility["reason"])
+
+    order = _build_question_order(a.questions or [], a.questions_per_attempt)
+    if not order:
+        raise HTTPException(status_code=500, detail="Assessment has no questions")
+
+    expires_at = now + timedelta(minutes=a.time_limit_minutes) if a.time_limit_minutes else None
+    session = WorkerAssessmentSession(
+        worker_id=profile.id,
+        assessment_id=a.id,
+        assessment_version=int(a.published_version or a.version or 1),
+        question_order=order,
+        current_index=0,
+        answers=[],
+        started_at=now,
+        expires_at=expires_at,
+    )
+    db.add(session)
+    await db.commit()
+    await db.refresh(session)
+
+    question = _sanitize_question(a.questions or [], order[0], 0, len(order))
+    return {
+        "session_id": str(session.id),
+        "expires_at": expires_at.isoformat() if expires_at else None,
+        "question": question,
+    }
+
+
+@router.post("/assessments/{assessment_id}/sessions/{session_id}/answer")
+async def answer_assessment_session(
+    assessment_id: UUID,
+    session_id: UUID,
+    payload: SessionAnswerRequest,
+    profile: WorkerProfile = Depends(get_worker_profile),
+    db: AsyncSession = Depends(get_db),
+):
+    ares = await db.execute(
+        select(AssessmentModule).where(AssessmentModule.id == assessment_id)
+    )
+    a = ares.scalar_one_or_none()
+    if not a:
+        raise HTTPException(status_code=404, detail="Assessment not found")
+
+    sres = await db.execute(
+        select(WorkerAssessmentSession).where(
+            WorkerAssessmentSession.id == session_id,
+            WorkerAssessmentSession.worker_id == profile.id,
+            WorkerAssessmentSession.assessment_id == assessment_id,
+        )
+    )
+    session = sres.scalar_one_or_none()
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+    if session.status != AssessmentSessionStatus.in_progress:
+        raise HTTPException(status_code=409, detail=f"Session is {session.status.value}, not in progress")
+
+    now = _now()
+    if session.expires_at and session.expires_at < now:
+        session.status = AssessmentSessionStatus.expired
+        await db.commit()
+        raise HTTPException(status_code=410, detail="Time limit exceeded — session expired")
+
+    if session.current_index >= len(session.question_order):
+        raise HTTPException(status_code=409, detail="Session already has all questions answered")
+
+    entry = session.question_order[session.current_index]
+    correct = _grade_answer(a.questions or [], entry, payload.answer)
+
+    # Rebuild JSONB list — SQLAlchemy won't track in-place mutation on JSONB columns.
+    new_answers = list(session.answers or []) + [{
+        "question_id": entry["question_id"],
+        "selected": payload.answer,
+        "correct": correct,
+    }]
+    session.answers = new_answers
+    session.current_index += 1
+
+    total = len(session.question_order)
+    if session.current_index >= total:
+        # Finished — score, persist a WorkerAssessmentAttempt, run qualification.
+        correct_count = sum(1 for x in new_answers if x["correct"])
+        score = int((correct_count / total) * 100) if total else 0
+        passed = score >= int(a.pass_score or 0)
+        session.status = AssessmentSessionStatus.completed
+        session.score = score
+        session.passed = passed
+        session.completed_at = now
+        await db.flush()
+
+        attempt, qualification_unlocked = await _finalize_scored_attempt(
+            db, profile, a,
+            [x["selected"] for x in new_answers],
+            score, passed,
+        )
+        await db.commit()
+        return {
+            "finished": True,
+            "correct": correct,
+            "score": score,
+            "passed": passed,
+            "pass_score": int(a.pass_score or 0),
+            "qualification_unlocked": qualification_unlocked,
+        }
+
+    await db.commit()
+    next_entry = session.question_order[session.current_index]
+    next_question = _sanitize_question(a.questions or [], next_entry, session.current_index, total)
+    return {
+        "finished": False,
+        "correct": correct,
+        "question": next_question,
     }
 
 
@@ -928,3 +1301,165 @@ async def publish_assessment(
     a.review_notes = body.notes or a.review_notes
     await db.commit()
     return _serialize_assessment(a, include_admin_fields=True, include_correct=True)
+
+
+# ===========================================================================
+# GATE 3 — PRACTICAL SIGN-OFF ("practical_verified" services/packages)
+#
+# A clinical_trainer or clinical_training_lead observes the worker perform
+# the skill and ticks off the checklist authored on the service/package
+# (ServiceCatalogue.practical_checklist_items / CarePackage.practical_checklist_items).
+# Only a passed sign-off counts toward qualification (see qualification.py).
+# ===========================================================================
+class PracticalSignOffRequest(BaseModel):
+    worker_id: UUID
+    target_type: str  # "service" | "package"
+    target_id: UUID
+    checklist_responses: Dict[str, bool]
+    passed: bool
+    notes: Optional[str] = None
+
+
+def _serialize_signoff(s: PracticalSignOff, target_name: Optional[str] = None, signer_name: Optional[str] = None) -> dict:
+    return {
+        "id": str(s.id),
+        "worker_id": str(s.worker_id),
+        "target_type": "service" if s.service_id else "package",
+        "target_id": str(s.service_id or s.package_id),
+        "target_name": target_name,
+        "checklist_responses": s.checklist_responses,
+        "passed": s.passed,
+        "notes": s.notes,
+        "signed_by": str(s.signed_by),
+        "signer_name": signer_name,
+        "signed_at": s.signed_at.isoformat(),
+    }
+
+
+@router.get("/practical-targets")
+async def list_practical_targets(
+    current: CurrentUser = Depends(require_clinical_trainer),
+    db: AsyncSession = Depends(get_db),
+):
+    """Every active Gate 3 ("practical_verified") service/package, with its
+    checklist items — populates the sign-off form's target picker."""
+    from app.models.enums import QualificationGate as _QG
+    from app.models.models import CarePackage as _CP, ServiceCatalogue as _SC
+
+    sres = await db.execute(select(_SC).where(_SC.is_active.is_(True), _SC.gate == _QG.practical_verified))
+    services = sres.scalars().all()
+    pres = await db.execute(select(_CP).where(_CP.is_active.is_(True), _CP.gate == _QG.practical_verified))
+    packages = pres.scalars().all()
+
+    return [
+        {"target_type": "service", "target_id": str(s.id), "name": s.name, "checklist_items": s.practical_checklist_items or []}
+        for s in services
+    ] + [
+        {"target_type": "package", "target_id": str(p.id), "name": p.name, "checklist_items": p.practical_checklist_items or []}
+        for p in packages
+    ]
+
+
+@router.get("/workers/search")
+async def search_workers_for_signoff(
+    q: str = "",
+    current: CurrentUser = Depends(require_clinical_trainer),
+    db: AsyncSession = Depends(get_db),
+):
+    """Minimal worker lookup so a trainer can find who they're signing off
+    for by name/phone, without needing the consumer/admin-only /workers/search."""
+    from app.models.models import WorkerProfile as WP
+    stmt = select(WP, User).join(User, User.id == WP.user_id)
+    if q.strip():
+        like = f"%{q.strip()}%"
+        stmt = stmt.where((User.full_name.ilike(like)) | (User.phone_e164.ilike(like)))
+    stmt = stmt.limit(20)
+    rows = (await db.execute(stmt)).all()
+    return [
+        {"worker_id": str(wp.id), "full_name": u.full_name, "phone_e164": u.phone_e164, "tier": wp.tier.value if wp.tier else None}
+        for wp, u in rows
+    ]
+
+
+@router.post("/practical-signoff")
+async def create_practical_signoff(
+    payload: PracticalSignOffRequest,
+    current: CurrentUser = Depends(require_clinical_trainer),
+    db: AsyncSession = Depends(get_db),
+):
+    if payload.target_type not in ("service", "package"):
+        raise HTTPException(status_code=400, detail="target_type must be 'service' or 'package'")
+
+    target_name: Optional[str] = None
+    checklist_items: List[str] = []
+    if payload.target_type == "service":
+        res = await db.execute(select(ServiceCatalogue).where(ServiceCatalogue.id == payload.target_id))
+        target = res.scalar_one_or_none()
+        if not target:
+            raise HTTPException(status_code=404, detail="Service not found")
+        target_name = target.name
+        checklist_items = list(target.practical_checklist_items or [])
+    else:
+        res = await db.execute(select(CarePackage).where(CarePackage.id == payload.target_id))
+        target = res.scalar_one_or_none()
+        if not target:
+            raise HTTPException(status_code=404, detail="Care package not found")
+        target_name = target.name
+        checklist_items = list(target.practical_checklist_items or [])
+
+    if checklist_items:
+        missing = [item for item in checklist_items if item not in payload.checklist_responses]
+        if missing:
+            raise HTTPException(status_code=400, detail=f"Missing checklist responses for: {missing}")
+
+    signoff = PracticalSignOff(
+        worker_id=payload.worker_id,
+        service_id=payload.target_id if payload.target_type == "service" else None,
+        package_id=payload.target_id if payload.target_type == "package" else None,
+        checklist_responses=payload.checklist_responses,
+        passed=payload.passed,
+        notes=payload.notes,
+        signed_by=current.id,
+    )
+    db.add(signoff)
+    await db.commit()
+    await db.refresh(signoff)
+
+    if payload.passed:
+        try:
+            from app.services.qualification import evaluate_and_upsert_qualification_for_practical_signoff
+            wres = await db.execute(select(WorkerProfile).where(WorkerProfile.id == payload.worker_id))
+            worker = wres.scalar_one_or_none()
+            if worker:
+                await evaluate_and_upsert_qualification_for_practical_signoff(db, worker, target)
+                await db.commit()
+        except Exception:  # noqa: BLE001
+            pass
+
+    return _serialize_signoff(signoff, target_name=target_name, signer_name=current.user.full_name or current.user.email)
+
+
+@router.get("/practical-signoff")
+async def list_practical_signoffs(
+    worker_id: Optional[UUID] = None,
+    target_type: Optional[str] = None,
+    target_id: Optional[UUID] = None,
+    current: CurrentUser = Depends(require_clinical_trainer),
+    db: AsyncSession = Depends(get_db),
+):
+    stmt = select(PracticalSignOff).order_by(PracticalSignOff.signed_at.desc())
+    if worker_id:
+        stmt = stmt.where(PracticalSignOff.worker_id == worker_id)
+    if target_type == "service" and target_id:
+        stmt = stmt.where(PracticalSignOff.service_id == target_id)
+    elif target_type == "package" and target_id:
+        stmt = stmt.where(PracticalSignOff.package_id == target_id)
+    rows = (await db.execute(stmt)).scalars().all()
+
+    signer_ids = {r.signed_by for r in rows}
+    names: Dict[UUID, str] = {}
+    if signer_ids:
+        ures = await db.execute(select(User).where(User.id.in_(signer_ids)))
+        names = {u.id: (u.full_name or u.email or str(u.id)) for u in ures.scalars().all()}
+
+    return [_serialize_signoff(r, signer_name=names.get(r.signed_by)) for r in rows]
