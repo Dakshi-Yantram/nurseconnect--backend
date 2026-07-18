@@ -340,6 +340,7 @@ class CarePackageOut(ORMModel):
     insurance_covered: bool
     available_cities: Optional[List[str]] = None
     is_active: bool
+    primary_service_id: Optional[UUID] = None
 
 
 # ----- BOOKINGS -----
