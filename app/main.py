@@ -24,9 +24,11 @@ from app.api.v1 import (
     catalog,
     escalations,
     insurance_review,
+    messaging,
     notifications,
     offline_sync,
     payments,
+    support,
     tracking,
     training,
     users,
@@ -171,6 +173,8 @@ for r in [
     training.router,
     training_assessments_router,
     admin.router,
+    support.router,
+    messaging.router,
 ]:
     app.include_router(r, prefix=_API_PREFIX)
 

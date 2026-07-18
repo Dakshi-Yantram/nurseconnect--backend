@@ -1,4 +1,4 @@
-"""Auth endpoints: email signup/login, refresh, me."""
+"""Auth endpoints: email signup/login, phone OTP, refresh, me."""
 import logging
 import re
 import secrets
@@ -23,13 +23,18 @@ from app.models.enums import UserRole, UserStatus
 from app.models.models import (
     ConsumerProfile,
     EmailVerificationCode,
+    OtpCode,
     User,
     UserSession,
     WorkerProfile,
 )
 from app.schemas.schemas import (
     AuthResponse,
+    OtpSendRequest,
+    OtpSendResponse,
+    OtpVerifyRequest,
     PasswordLoginRequest,
+    PhoneLoginRequest,
     RefreshRequest,
     RegisterRequest,
     RegisterResponse,
@@ -300,6 +305,64 @@ async def login(payload: PasswordLoginRequest, db: AsyncSession = Depends(get_db
     return AuthResponse(user=UserOut.model_validate(user), tokens=tokens)
 
 
+@router.post("/phone-login", response_model=AuthResponse)
+async def phone_login(payload: PhoneLoginRequest, db: AsyncSession = Depends(get_db)):
+    """Passwordless login/register for the mobile app.
+
+    The mobile app (intapp) has no password field — it authenticates purely
+    off phone number + role via `authService.loginDirect`. This mirrors that
+    contract: look the user up by (phone, role); if none exists, create one
+    on the spot (no email verification step, since the mobile flow never
+    collects/verifies an email). Consumers are activated immediately;
+    workers land in `onboarding` just like the email/password signup path,
+    since they still need document review + reviewer approval before they
+    can accept bookings.
+    """
+    _validate_signup_role(payload.role)
+    phone = _normalize_phone(payload.phone_e164)
+
+    ures = await db.execute(select(User).where(User.phone_e164 == phone))
+    user = ures.scalar_one_or_none()
+
+    if user and user.role != payload.role:
+        raise HTTPException(
+            status_code=409,
+            detail="This phone number is already registered under a different role",
+        )
+
+    if not user:
+        user = User(
+            phone_e164=phone,
+            full_name=(payload.full_name or "").strip() or None,
+            role=payload.role,
+            status=UserStatus.onboarding if payload.role == UserRole.worker else UserStatus.active,
+        )
+        db.add(user)
+        await db.flush()
+        await _ensure_role_profile(db, user)
+        await audit(db, user.id, user.role.value, "auth.phone_register", "user", user.id)
+    else:
+        if payload.full_name and payload.full_name.strip() and not user.full_name:
+            user.full_name = payload.full_name.strip()
+        if user.status not in (UserStatus.active, UserStatus.onboarding):
+            raise HTTPException(status_code=403, detail="Account is not active")
+
+    user.last_login_at = datetime.now(timezone.utc)
+    tokens = _issue_token_pair(user)
+    await _persist_session(
+        db,
+        user,
+        tokens,
+        device_id=payload.device_id,
+        device_platform=payload.device_platform,
+        fcm_token=payload.fcm_token,
+    )
+    await audit(db, user.id, user.role.value, "auth.phone_login", "user", user.id)
+    await db.commit()
+    await db.refresh(user)
+    return AuthResponse(user=UserOut.model_validate(user), tokens=tokens)
+
+
 @router.post("/refresh", response_model=TokenPair)
 async def refresh_token(payload: RefreshRequest, db: AsyncSession = Depends(get_db)):
     try:
@@ -349,3 +412,121 @@ async def logout(payload: RefreshRequest, db: AsyncSession = Depends(get_db)):
 @router.get("/me", response_model=UserOut)
 async def me(current: CurrentUser = Depends(get_current_user)):
     return UserOut.model_validate(current.user)
+
+
+# ---------------------------------------------------------------------------
+# Phone OTP — consumer login (no password required)
+# ---------------------------------------------------------------------------
+@router.post("/otp/send", response_model=OtpSendResponse)
+async def otp_send(payload: OtpSendRequest, db: AsyncSession = Depends(get_db)):
+    """Generate and send a 6-digit OTP to the given phone number.
+
+    In dev mode (OTP_DEV_MODE=True) the OTP is returned in the response body
+    instead of being dispatched via SMS so testing works without MSG91 credits.
+    """
+    phone = _normalize_phone(payload.phone_e164)
+    code = (
+        settings.OTP_DEV_FIXED_CODE
+        if settings.OTP_DEV_MODE
+        else f"{secrets.randbelow(1000000):06d}"
+    )
+    expires_at = datetime.now(timezone.utc) + timedelta(minutes=settings.OTP_EXPIRE_MINUTES)
+    db.add(
+        OtpCode(
+            phone_e164=phone,
+            code_hash=hash_password(code),
+            purpose=payload.purpose,
+            expires_at=expires_at,
+        )
+    )
+    await db.commit()
+
+    if not settings.OTP_DEV_MODE:
+        try:
+            from app.integrations.providers import msg91_client
+            await msg91_client.send_otp(phone, code)
+        except Exception:
+            logger.exception("MSG91 OTP dispatch failed for %s", phone)
+
+    return OtpSendResponse(
+        sent=True,
+        phone_e164=phone,
+        expires_in_seconds=settings.OTP_EXPIRE_MINUTES * 60,
+        dev_otp=code if settings.OTP_DEV_MODE else None,
+    )
+
+
+@router.post("/otp/verify", response_model=AuthResponse)
+async def otp_verify(payload: OtpVerifyRequest, db: AsyncSession = Depends(get_db)):
+    """Verify OTP and issue tokens.  Creates a consumer account on first use.
+
+    - If the phone is already registered as a *consumer* → logs them in.
+    - If phone is new → auto-creates an active consumer account.
+    - If phone belongs to a *worker* → returns 409 (use worker login instead).
+    """
+    phone = _normalize_phone(payload.phone_e164)
+
+    otp_res = await db.execute(
+        select(OtpCode)
+        .where(
+            OtpCode.phone_e164 == phone,
+            OtpCode.consumed.is_(False),
+        )
+        .order_by(OtpCode.created_at.desc())
+        .limit(1)
+    )
+    otp = otp_res.scalar_one_or_none()
+    if not otp:
+        raise HTTPException(status_code=400, detail="No active OTP for this number. Request a new code.")
+    if otp.expires_at < datetime.now(timezone.utc):
+        raise HTTPException(status_code=400, detail="OTP expired. Request a new code.")
+    if otp.attempts >= 5:
+        raise HTTPException(status_code=429, detail="Too many attempts. Request a new code.")
+
+    otp.attempts += 1
+    if not verify_password(payload.code, otp.code_hash):
+        await db.commit()
+        raise HTTPException(status_code=400, detail="Invalid OTP.")
+
+    otp.consumed = True
+
+    user_res = await db.execute(select(User).where(User.phone_e164 == phone))
+    user = user_res.scalar_one_or_none()
+
+    if user and user.role == UserRole.worker:
+        raise HTTPException(
+            status_code=409,
+            detail="This number is registered as a care professional. Use the nurse/caregiver login.",
+        )
+
+    if not user:
+        user = User(
+            phone_e164=phone,
+            full_name=(payload.role.value if not hasattr(payload, "full_name") else None),
+            role=UserRole.consumer,
+            status=UserStatus.active,
+            email_verified_at=datetime.now(timezone.utc),
+        )
+        db.add(user)
+        await db.flush()
+        await _ensure_role_profile(db, user)
+        await audit(db, user.id, user.role.value, "auth.otp_register", "user", user.id)
+    else:
+        if user.status not in (UserStatus.active, UserStatus.onboarding):
+            raise HTTPException(status_code=403, detail="Account is not active.")
+        if not user.email_verified_at:
+            user.email_verified_at = datetime.now(timezone.utc)
+            user.status = UserStatus.active
+
+    user.last_login_at = datetime.now(timezone.utc)
+    tokens = _issue_token_pair(user)
+    await _persist_session(
+        db, user, tokens,
+        device_id=payload.device_id,
+        device_platform=payload.device_platform,
+        fcm_token=payload.fcm_token,
+    )
+    await audit(db, user.id, user.role.value, "auth.otp_login", "user", user.id)
+    await db.commit()
+    await db.refresh(user)
+    return AuthResponse(user=UserOut.model_validate(user), tokens=tokens)

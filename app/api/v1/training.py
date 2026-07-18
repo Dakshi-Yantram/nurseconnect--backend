@@ -45,11 +45,12 @@ from app.models.models import (
 
 router = APIRouter(prefix="/training", tags=["training"])
 
-# Trainer + Reviewer roles. Reviewer can author training content and
-# approve/publish assessments; admin is a superuser and can always do
-# reviewer/trainer tasks too.
-TRAINER_ROLES = (UserRole.admin, UserRole.reviewer)
-REVIEWER_ROLES = (UserRole.admin, UserRole.reviewer)
+# Trainer + Reviewer roles. Reviewer/clinical_training_lead can author
+# training content and approve/publish assessments; admin is a superuser
+# and can always do reviewer/trainer tasks too. clinical_trainer authors
+# content but cannot approve its own submissions.
+TRAINER_ROLES = (UserRole.admin, UserRole.reviewer, UserRole.clinical_trainer, UserRole.clinical_training_lead)
+REVIEWER_ROLES = (UserRole.admin, UserRole.reviewer, UserRole.clinical_training_lead)
 require_trainer = require_roles(*TRAINER_ROLES)
 require_reviewer = require_roles(*REVIEWER_ROLES)
 
@@ -319,19 +320,36 @@ async def get_module(module_id: UUID, db: AsyncSession = Depends(get_db), _=Depe
         "content_url": m.content_url,
         "video_url": m.video_url,
         "duration_minutes": m.duration_minutes,
-        "assessment": [{"question": q.get("question"), "options": q.get("options")} for q in (m.assessment or [])],
         "pass_percent": m.pass_percent,
+        # Include full question data for adaptive MCQ; correct_index and explanation
+        # are needed for immediate per-question feedback in the adaptive flow.
+        "assessment": [
+            {
+                "id": q.get("id", str(i)),
+                "question": q.get("question"),
+                "options": q.get("options", []),
+                "correct_index": q.get("correct_index"),
+                "explanation": q.get("explanation", ""),
+                "difficulty": q.get("difficulty", 2),
+                "type": q.get("type", "single_select"),
+            }
+            for i, q in enumerate(m.assessment or [])
+        ],
     }
 
 
 @router.post("/modules/{module_id}/assessment/submit")
 async def submit_module_assessment(
     module_id: UUID,
-    answers: List[int] = Body(...),
+    answers: List[Any] = Body(...),
     profile: WorkerProfile = Depends(get_worker_profile),
     db: AsyncSession = Depends(get_db),
 ):
-    """Legacy training-module-embedded assessment (Patch 2)."""
+    """Submit module assessment. Accepts two formats:
+    - Legacy flat list: [0, 2, 1, ...]  (answer index per question by position)
+    - Adaptive list:    [{"id": "ic1", "answer": 2}, ...]  (per-question id + answer)
+    Adaptive format scores based on answered questions only.
+    """
     res = await db.execute(
         select(TrainingModule).where(
             TrainingModule.id == module_id,
@@ -341,11 +359,22 @@ async def submit_module_assessment(
     m = res.scalar_one_or_none()
     if not m or not m.assessment:
         raise HTTPException(status_code=404, detail="Assessment not found")
+
+    # Detect adaptive vs. legacy format
+    is_adaptive = answers and isinstance(answers[0], dict)
     correct = 0
-    for idx, q in enumerate(m.assessment):
-        if idx < len(answers) and answers[idx] == q.get("correct_index"):
-            correct += 1
-    score = int((correct / len(m.assessment)) * 100) if m.assessment else 0
+    if is_adaptive:
+        qmap = {q.get("id", str(i)): q for i, q in enumerate(m.assessment)}
+        for item in answers:
+            q = qmap.get(item.get("id"))
+            if q and item.get("answer") == q.get("correct_index"):
+                correct += 1
+        score = int((correct / len(answers)) * 100) if answers else 0
+    else:
+        for idx, q in enumerate(m.assessment):
+            if idx < len(answers) and answers[idx] == q.get("correct_index"):
+                correct += 1
+        score = int((correct / len(m.assessment)) * 100) if m.assessment else 0
     passed = score >= m.pass_percent
     cres = await db.execute(
         select(TrainingCompletion).where(
@@ -617,16 +646,20 @@ async def approve_module(
     current: CurrentUser = Depends(require_reviewer),
     db: AsyncSession = Depends(get_db),
 ):
+    """Approving a module publishes it immediately — approved content
+    reaches nurses automatically, no separate publish step needed."""
     res = await db.execute(select(TrainingModule).where(TrainingModule.id == id))
     m = res.scalar_one_or_none()
     if not m:
         raise HTTPException(status_code=404, detail="Module not found")
     if m.status != ContentStatus.under_review:
         raise HTTPException(status_code=409, detail=f"Cannot approve module in status {m.status.value}")
-    m.status = ContentStatus.approved
+    m.status = ContentStatus.published
     m.reviewed_by = current.id
     m.reviewed_at = _now()
     m.review_notes = body.notes
+    m.published_at = _now()
+    m.published_version = m.version
     await db.commit()
     return _serialize_module(m, include_admin_fields=True, include_full_assessment=True)
 
@@ -837,16 +870,20 @@ async def approve_assessment(
     current: CurrentUser = Depends(require_reviewer),
     db: AsyncSession = Depends(get_db),
 ):
+    """Approving an assessment publishes it immediately — same
+    auto-publish-on-approve behavior as training modules."""
     res = await db.execute(select(AssessmentModule).where(AssessmentModule.id == id))
     a = res.scalar_one_or_none()
     if not a:
         raise HTTPException(status_code=404, detail="Assessment not found")
     if a.status != ContentStatus.under_review:
         raise HTTPException(status_code=409, detail=f"Cannot approve assessment in status {a.status.value}")
-    a.status = ContentStatus.approved
+    a.status = ContentStatus.published
     a.reviewed_by = current.id
     a.reviewed_at = _now()
     a.review_notes = body.notes
+    a.published_at = _now()
+    a.published_version = a.version
     await db.commit()
     return _serialize_assessment(a, include_admin_fields=True, include_correct=True)
 

@@ -21,6 +21,7 @@ from app.models.enums import (
     WorkerAvailability,
     WorkerOnboardingStatus,
     WorkerPreferenceStatus,
+    WorkerQualificationSource,
     WorkerQualificationStatus,
 )
 from app.models.models import (
@@ -598,22 +599,22 @@ class ServicePreferenceUpdate(BaseModel):
     preferred_radius_km: Optional[int] = None
 
 
+class ServiceQualificationRequest(BaseModel):
+    target_type: str  # "service" | "package"
+    target_id: UUID
+
+
 @router.get("/me/service-eligibility", response_model=List[ServiceEligibilityItem])
 async def my_service_eligibility(
     profile: WorkerProfile = Depends(get_worker_profile),
     db: AsyncSession = Depends(get_db),
 ):
-    """List every active service + package with the worker's current
-    qualification + preference status and whether they may opt in."""
+    """List every active care package (admin-managed, no standalone
+    services) with the worker's current qualification + preference status
+    and whether they may opt in. No price is ever included here — nurses
+    see packages purely as opt-in offerings gated by training/assessments."""
     items: List[ServiceEligibilityItem] = []
 
-    # Services
-    sres = await db.execute(
-        select(ServiceCatalogue).where(ServiceCatalogue.is_active.is_(True))
-    )
-    services = list(sres.scalars().all())
-
-    # Packages
     pres = await db.execute(select(CarePackage).where(CarePackage.is_active.is_(True)))
     packages = list(pres.scalars().all())
 
@@ -623,51 +624,41 @@ async def my_service_eligibility(
             WorkerServiceQualification.worker_id == profile.id
         )
     )
-    quals = list(qres.scalars().all())
-    qmap_svc = {q.service_id: q for q in quals if q.service_id is not None}
-    qmap_pkg = {q.package_id: q for q in quals if q.package_id is not None}
+    qmap_pkg = {q.package_id: q for q in qres.scalars().all() if q.package_id is not None}
 
     prres = await db.execute(
         select(WorkerServicePreference).where(
             WorkerServicePreference.worker_id == profile.id
         )
     )
-    prefs = list(prres.scalars().all())
-    pmap_svc = {p.service_id: p for p in prefs if p.service_id is not None}
-    pmap_pkg = {p.package_id: p for p in prefs if p.package_id is not None}
+    pmap_pkg = {p.package_id: p for p in prres.scalars().all() if p.package_id is not None}
 
-    async def _build(target, target_type: str, qmap: dict, pmap: dict):
-        q = qmap.get(target.id)
-        p = pmap.get(target.id)
+    for pkg in packages:
+        q = qmap_pkg.get(pkg.id)
+        p = pmap_pkg.get(pkg.id)
         q_status = q.qualification_status.value if q else WorkerQualificationStatus.NOT_QUALIFIED.value
         q_source = q.qualification_source.value if (q and q.qualification_source) else None
         p_status = p.preference_status.value if p else WorkerPreferenceStatus.OPTED_OUT.value
         willing = bool(p.willing_to_accept) if p else False
 
-        qualified, locked_reason = await is_worker_qualified_for_service(profile, target, db)
-        can_opt_in = qualified
+        qualified, locked_reason = await is_worker_qualified_for_service(profile, pkg, db)
 
-        return ServiceEligibilityItem(
-            target_type=target_type,
-            id=target.id,
-            code=getattr(target, "service_code", None) or getattr(target, "package_code", ""),
-            name=target.name,
-            category=getattr(target.category, "value", None) if hasattr(target, "category") else None,
-            min_tier=target.min_tier.value if target.min_tier else None,
-            risk_level=getattr(target, "risk_level", None).value if getattr(target, "risk_level", None) else None,
+        items.append(ServiceEligibilityItem(
+            target_type="package",
+            id=pkg.id,
+            code=pkg.package_code,
+            name=pkg.name,
+            category=None,
+            min_tier=pkg.min_tier.value if pkg.min_tier else None,
+            risk_level=pkg.risk_level.value if pkg.risk_level else None,
             qualification_status=q_status,
             qualification_source=q_source,
             preference_status=p_status,
             willing_to_accept=willing,
-            can_opt_in=can_opt_in,
+            can_opt_in=qualified,
             locked_reason=None if qualified else locked_reason,
-            requires_admin_skill_approval=bool(getattr(target, "requires_admin_skill_approval", False)),
-        )
-
-    for s in services:
-        items.append(await _build(s, "service", qmap_svc, pmap_svc))
-    for pkg in packages:
-        items.append(await _build(pkg, "package", qmap_pkg, pmap_pkg))
+            requires_admin_skill_approval=bool(pkg.requires_admin_skill_approval),
+        ))
 
     return items
 
@@ -793,6 +784,94 @@ async def update_service_preference(
 # during onboarding; drives geo-dispatch when live location isn't fresh.
 # PUT /api/workers/me/service-area
 # ---------------------------------------------------------------------------
+@router.post("/me/service-qualification-requests", response_model=ServiceEligibilityItem)
+async def request_service_qualification(
+    payload: ServiceQualificationRequest,
+    profile: WorkerProfile = Depends(get_worker_profile),
+    db: AsyncSession = Depends(get_db),
+):
+    """Let an approved care professional request reviewer unlock for a locked
+    service/package instead of leaving the Services page as a dead end."""
+    if payload.target_type not in ("service", "package"):
+        raise HTTPException(status_code=400, detail="target_type must be 'service' or 'package'")
+    if profile.onboarding_status != WorkerOnboardingStatus.approved:
+        raise HTTPException(status_code=403, detail="Care professional must be approved before requesting service unlocks")
+
+    if payload.target_type == "service":
+        res = await db.execute(
+            select(ServiceCatalogue).where(
+                ServiceCatalogue.id == payload.target_id,
+                ServiceCatalogue.is_active.is_(True),
+            )
+        )
+        target = res.scalar_one_or_none()
+    else:
+        res = await db.execute(
+            select(CarePackage).where(
+                CarePackage.id == payload.target_id,
+                CarePackage.is_active.is_(True),
+            )
+        )
+        target = res.scalar_one_or_none()
+    if not target:
+        raise HTTPException(status_code=404, detail=f"{payload.target_type} not found or inactive")
+
+    qualified, _ = await is_worker_qualified_for_service(profile, target, db)
+    q_status = WorkerQualificationStatus.APPROVED if qualified else WorkerQualificationStatus.QUALIFIED_PENDING_APPROVAL
+
+    cond = (
+        WorkerServiceQualification.service_id == target.id
+        if payload.target_type == "service"
+        else WorkerServiceQualification.package_id == target.id
+    )
+    qres = await db.execute(
+        select(WorkerServiceQualification).where(
+            and_(WorkerServiceQualification.worker_id == profile.id, cond)
+        )
+    )
+    qual = qres.scalar_one_or_none()
+    if not qual:
+        qual = WorkerServiceQualification(
+            worker_id=profile.id,
+            service_id=target.id if payload.target_type == "service" else None,
+            package_id=target.id if payload.target_type == "package" else None,
+            qualification_source=WorkerQualificationSource.ADMIN_APPROVAL,
+        )
+        db.add(qual)
+    qual.qualification_status = q_status
+    qual.qualification_source = qual.qualification_source or WorkerQualificationSource.ADMIN_APPROVAL
+
+    await audit(
+        db,
+        profile.user_id,
+        "worker",
+        "worker.service_qualification.request",
+        payload.target_type,
+        target.id,
+        {"qualification_status": q_status.value},
+    )
+    await db.commit()
+    await db.refresh(qual)
+
+    qualified, locked_reason = await is_worker_qualified_for_service(profile, target, db)
+    return ServiceEligibilityItem(
+        target_type=payload.target_type,
+        id=target.id,
+        code=getattr(target, "service_code", None) or getattr(target, "package_code", ""),
+        name=target.name,
+        category=getattr(target.category, "value", None) if hasattr(target, "category") else None,
+        min_tier=target.min_tier.value if target.min_tier else None,
+        risk_level=getattr(target, "risk_level", None).value if getattr(target, "risk_level", None) else None,
+        qualification_status=qual.qualification_status.value,
+        qualification_source=(qual.qualification_source.value if qual.qualification_source else None),
+        preference_status=WorkerPreferenceStatus.OPTED_OUT.value,
+        willing_to_accept=False,
+        can_opt_in=qualified,
+        locked_reason=None if qualified else locked_reason,
+        requires_admin_skill_approval=bool(getattr(target, "requires_admin_skill_approval", False)),
+    )
+
+
 class ServiceAreaRequest(BaseModel):
     base_city: Optional[str] = None
     latitude: Optional[float] = None

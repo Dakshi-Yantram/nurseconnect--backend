@@ -8,6 +8,12 @@ class UserRole(str, Enum):
     admin = "admin"          # single, full-access admin
     reviewer = "reviewer"    # reviews docs, authors training, checks assessments
     system = "system"
+    # Internal staff roles — created only by admin (operations) or by
+    # operations (support / clinical_training_lead / clinical_trainer).
+    operations = "operations"
+    support = "support"
+    clinical_training_lead = "clinical_training_lead"
+    clinical_trainer = "clinical_trainer"
 
 
 class UserStatus(str, Enum):
@@ -280,6 +286,22 @@ class RetentionAction(str, Enum):
     anonymise = "anonymise"
     archive = "archive"
     archive_and_anonymise = "archive_and_anonymise"
+
+
+class SupportTicketStatus(str, Enum):
+    open = "open"
+    in_progress = "in_progress"
+    resolved = "resolved"
+    closed = "closed"
+
+
+class SupportTicketCategory(str, Enum):
+    booking = "booking"
+    billing = "billing"
+    clinical = "clinical"
+    nurse_conduct = "nurse_conduct"
+    technical = "technical"
+    other = "other"
 
 
 class InsuranceCoverageStatus(str, Enum):
