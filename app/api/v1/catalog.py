@@ -9,7 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.database import get_db
 from app.core.deps import get_current_user
 from app.models.models import CarePackage, ChecklistTemplate, ServiceCatalogue
-from app.schemas.schemas import CarePackageOut, ServiceOut
+from app.schemas.schemas import CarePackageOut, PackageServiceSummary, ServiceOut
 
 router = APIRouter(tags=["catalog"])
 
@@ -38,6 +38,48 @@ async def get_service(service_id: UUID, db: AsyncSession = Depends(get_db)):
     return ServiceOut.model_validate(s)
 
 
+def _package_included_ids(package: CarePackage) -> List[UUID]:
+    """A package's own service ids: included_service_ids plus primary_service_id
+    (deduplicated, primary first). This is the single source of truth for
+    'which services belong to this package' — never the full catalogue."""
+    ids: List[UUID] = []
+    if package.primary_service_id:
+        ids.append(package.primary_service_id)
+    for sid in (package.included_service_ids or []):
+        if sid not in ids:
+            ids.append(sid)
+    return ids
+
+
+async def _care_packages_out(
+    packages: List[CarePackage], db: AsyncSession
+) -> List[CarePackageOut]:
+    """Resolve and embed each package's own service(s) in one batched query,
+    so callers get a self-contained response and never need to fall back to
+    the generic /services catalogue to know what a package includes."""
+    all_ids: set = set()
+    for p in packages:
+        all_ids.update(_package_included_ids(p))
+
+    services_by_id: dict = {}
+    if all_ids:
+        sres = await db.execute(select(ServiceCatalogue).where(ServiceCatalogue.id.in_(all_ids)))
+        services_by_id = {s.id: s for s in sres.scalars().all()}
+
+    out: List[CarePackageOut] = []
+    for p in packages:
+        included_ids = _package_included_ids(p)
+        data = CarePackageOut.model_validate(p).model_dump()
+        data["included_service_ids"] = included_ids
+        data["services"] = [
+            PackageServiceSummary(id=s.id, service_code=s.service_code, name=s.name)
+            for sid in included_ids
+            if (s := services_by_id.get(sid)) is not None
+        ]
+        out.append(CarePackageOut(**data))
+    return out
+
+
 @router.get("/care-packages", response_model=List[CarePackageOut])
 async def list_care_packages(
     city: Optional[str] = None,
@@ -51,7 +93,7 @@ async def list_care_packages(
     items = res.scalars().all()
     if city:
         items = [p for p in items if not p.available_cities or city in p.available_cities]
-    return [CarePackageOut.model_validate(p) for p in items]
+    return await _care_packages_out(items, db)
 
 
 @router.get("/care-packages/{package_id}", response_model=CarePackageOut)
@@ -60,7 +102,7 @@ async def get_care_package(package_id: UUID, db: AsyncSession = Depends(get_db))
     p = res.scalar_one_or_none()
     if not p:
         raise HTTPException(status_code=404, detail="Care package not found")
-    return CarePackageOut.model_validate(p)
+    return (await _care_packages_out([p], db))[0]
 
 
 @router.get("/care/checklist-template/{template_id}")
