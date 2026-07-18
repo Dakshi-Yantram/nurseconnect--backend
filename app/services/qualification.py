@@ -14,6 +14,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.enums import (
+    QualificationGate,
     UserStatus,
     WorkerOnboardingStatus,
     WorkerPreferenceStatus,
@@ -24,6 +25,7 @@ from app.models.enums import (
 from app.models.models import (
     AssessmentModule,
     CarePackage,
+    PracticalSignOff,
     ServiceCatalogue,
     TrainingCompletion,
     TrainingModule,
@@ -147,6 +149,70 @@ async def _has_passed_required_assessments(
     return True
 
 
+# Gate 3 — practical sign-off helper
+async def _has_passed_practical_signoff(
+    db: AsyncSession, worker: WorkerProfile, service: ServiceLike
+) -> bool:
+    """True if the worker's most recent PracticalSignOff for this
+    service/package is a pass. Only the latest sign-off counts — a new
+    failed one after an old pass re-locks the service until a new pass."""
+    cond = (
+        PracticalSignOff.service_id == service.id
+        if _is_service(service)
+        else PracticalSignOff.package_id == service.id
+    )
+    res = await db.execute(
+        select(PracticalSignOff)
+        .where(PracticalSignOff.worker_id == worker.id, cond)
+        .order_by(PracticalSignOff.signed_at.desc())
+        .limit(1)
+    )
+    latest = res.scalar_one_or_none()
+    return bool(latest and latest.passed)
+
+
+async def evaluate_and_upsert_qualification_for_practical_signoff(
+    db: AsyncSession, worker: WorkerProfile, target: ServiceLike
+) -> Optional[WorkerServiceQualification]:
+    """Re-evaluate qualification for one service/package after a passing
+    practical sign-off. Does NOT auto opt-in."""
+    if getattr(target, "gate", None) != QualificationGate.practical_verified:
+        return None
+
+    qual = await _get_qualification_row(db, worker.id, target)
+    training_codes = list(getattr(target, "required_training_module_codes", None) or [])
+    cert_codes = list(getattr(target, "required_certificate_codes", None) or [])
+    assessment_codes = list(getattr(target, "required_assessment_codes", None) or [])
+    min_pass = getattr(target, "minimum_pass_score", None)
+    requires_admin = bool(getattr(target, "requires_admin_skill_approval", False))
+
+    training_ok = await _has_passed_required_trainings(db, worker, training_codes)
+    cert_ok = await _has_valid_certificates(db, worker, cert_codes)
+    assess_ok = await _has_passed_required_assessments(db, worker, assessment_codes, min_pass)
+    practical_ok = await _has_passed_practical_signoff(db, worker, target)
+    tier_ok = _tier_value(worker.tier) >= _tier_value(target.min_tier)
+
+    if not qual:
+        qual = WorkerServiceQualification(
+            worker_id=worker.id,
+            service_id=target.id if _is_service(target) else None,
+            package_id=None if _is_service(target) else target.id,
+            qualification_source=WorkerQualificationSource.TRAINING,
+        )
+        db.add(qual)
+
+    if not (training_ok and cert_ok and assess_ok and practical_ok and tier_ok):
+        qual.qualification_status = WorkerQualificationStatus.TRAINING_REQUIRED
+    elif requires_admin and not qual.admin_approved_at:
+        qual.qualification_status = WorkerQualificationStatus.QUALIFIED_PENDING_APPROVAL
+    else:
+        qual.qualification_status = WorkerQualificationStatus.APPROVED
+        qual.valid_from = qual.valid_from or datetime.now(timezone.utc)
+
+    await db.flush()
+    return qual
+
+
 async def _get_qualification_row(
     db: AsyncSession, worker_id: UUID, service: ServiceLike
 ) -> Optional[WorkerServiceQualification]:
@@ -221,6 +287,14 @@ async def is_worker_qualified_for_service(
         passed = await _has_passed_required_assessments(db, worker, assessment_codes, min_pass)
         if not passed:
             return False, "ASSESSMENT_REQUIRED"
+
+    # Gate 3 — practical sign-off requirement. Theory (the assessment check
+    # above) must already have passed; a trainer must additionally have
+    # observed and signed the practical checklist.
+    if getattr(service, "gate", None) == QualificationGate.practical_verified:
+        practical_ok = await _has_passed_practical_signoff(db, worker, service)
+        if not practical_ok:
+            return False, "PRACTICAL_SIGNOFF_REQUIRED"
 
     # Admin approval requirement
     requires_admin = bool(getattr(service, "requires_admin_skill_approval", False))
@@ -305,10 +379,18 @@ async def evaluate_and_upsert_qualifications_for_module(
         # Re-check all requirements except the qualification row itself.
         all_codes = list(getattr(target, "required_training_module_codes", None) or [])
         cert_codes = list(getattr(target, "required_certificate_codes", None) or [])
+        assessment_codes = list(getattr(target, "required_assessment_codes", None) or [])
+        min_pass = getattr(target, "minimum_pass_score", None)
         requires_admin = bool(getattr(target, "requires_admin_skill_approval", False))
 
         training_ok = await _has_passed_required_trainings(db, worker, all_codes)
         cert_ok = await _has_valid_certificates(db, worker, cert_codes)
+        assess_ok = await _has_passed_required_assessments(db, worker, assessment_codes, min_pass)
+        practical_ok = (
+            await _has_passed_practical_signoff(db, worker, target)
+            if getattr(target, "gate", None) == QualificationGate.practical_verified
+            else True
+        )
         tier_ok = _tier_value(worker.tier) >= _tier_value(target.min_tier)
 
         if not qual:
@@ -325,7 +407,7 @@ async def evaluate_and_upsert_qualifications_for_module(
         qual.assessment_score = completion.assessment_score
         qual.qualification_source = WorkerQualificationSource.TRAINING
 
-        if not (training_ok and cert_ok and tier_ok):
+        if not (training_ok and cert_ok and assess_ok and practical_ok and tier_ok):
             qual.qualification_status = WorkerQualificationStatus.TRAINING_REQUIRED
         elif requires_admin and not qual.admin_approved_at:
             qual.qualification_status = WorkerQualificationStatus.QUALIFIED_PENDING_APPROVAL
@@ -388,6 +470,11 @@ async def sync_tier_qualifications(
         training_ok = await _has_passed_required_trainings(db, worker, training_codes)
         cert_ok = await _has_valid_certificates(db, worker, cert_codes)
         assess_ok = await _has_passed_required_assessments(db, worker, assessment_codes, min_pass)
+        practical_ok = (
+            await _has_passed_practical_signoff(db, worker, target)
+            if getattr(target, "gate", None) == QualificationGate.practical_verified
+            else True
+        )
 
         qual = await _get_qualification_row(db, worker.id, target)
 
@@ -408,7 +495,7 @@ async def sync_tier_qualifications(
 
         if not tier_ok:
             qual.qualification_status = WorkerQualificationStatus.NOT_QUALIFIED
-        elif not (training_ok and cert_ok and assess_ok):
+        elif not (training_ok and cert_ok and assess_ok and practical_ok):
             # Tier is fine but something else is still outstanding — leave
             # status as-is (defaults to NOT_QUALIFIED for a brand new row) so
             # the eligibility endpoint reports the *real* locked_reason
@@ -483,6 +570,11 @@ async def evaluate_and_upsert_qualifications_for_assessment(
         training_ok = await _has_passed_required_trainings(db, worker, training_codes)
         cert_ok = await _has_valid_certificates(db, worker, cert_codes)
         assess_ok = await _has_passed_required_assessments(db, worker, assessment_codes, min_pass)
+        practical_ok = (
+            await _has_passed_practical_signoff(db, worker, target)
+            if getattr(target, "gate", None) == QualificationGate.practical_verified
+            else True
+        )
         tier_ok = _tier_value(worker.tier) >= _tier_value(target.min_tier)
 
         if not qual:
@@ -498,7 +590,7 @@ async def evaluate_and_upsert_qualifications_for_assessment(
         qual.qualification_source = WorkerQualificationSource.TRAINING
         prev_status = qual.qualification_status
 
-        if not (training_ok and cert_ok and assess_ok and tier_ok):
+        if not (training_ok and cert_ok and assess_ok and practical_ok and tier_ok):
             qual.qualification_status = WorkerQualificationStatus.TRAINING_REQUIRED
         elif requires_admin and not qual.admin_approved_at:
             qual.qualification_status = WorkerQualificationStatus.QUALIFIED_PENDING_APPROVAL
