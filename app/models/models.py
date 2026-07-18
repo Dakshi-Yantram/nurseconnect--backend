@@ -59,8 +59,10 @@ from app.models.enums import (
     OfflineSyncStatus,
     PackageBookingStatus,
     PaymentStatus,
+    AssessmentSessionStatus,
     PayoutBatchStatus,
     PrescriptionStatus,
+    QualificationGate,
     RetentionAction,
     ServiceCategory,
     ServiceRiskLevel,
@@ -420,6 +422,14 @@ class ServiceCatalogue(Base):
     # Patch 4B — assessment linkage (extends Patch 2 qualification engine)
     required_assessment_codes: Mapped[Optional[list]] = mapped_column(ARRAY(String))
     minimum_pass_score: Mapped[Optional[int]] = mapped_column(Integer)
+    # Three-gate qualification model
+    gate: Mapped[QualificationGate] = mapped_column(
+        SQLEnum(QualificationGate, name="qualification_gate"),
+        default=QualificationGate.credential_only,
+        server_default=QualificationGate.credential_only.value,
+        nullable=False,
+    )
+    practical_checklist_items: Mapped[Optional[list]] = mapped_column(ARRAY(String))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now, server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now, onupdate=_now, server_default=func.now())
 
@@ -469,6 +479,14 @@ class CarePackage(Base):
     # Patch 4B — assessment linkage (extends Patch 2 qualification engine)
     required_assessment_codes: Mapped[Optional[list]] = mapped_column(ARRAY(String))
     minimum_pass_score: Mapped[Optional[int]] = mapped_column(Integer)
+    # Three-gate qualification model
+    gate: Mapped[QualificationGate] = mapped_column(
+        SQLEnum(QualificationGate, name="qualification_gate"),
+        default=QualificationGate.credential_only,
+        server_default=QualificationGate.credential_only.value,
+        nullable=False,
+    )
+    practical_checklist_items: Mapped[Optional[list]] = mapped_column(ARRAY(String))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now, server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now, onupdate=_now, server_default=func.now())
 
@@ -504,6 +522,31 @@ class WorkerServiceQualification(Base):
     __table_args__ = (
         UniqueConstraint("worker_id", "service_id", name="uq_worker_service_qual_service"),
         UniqueConstraint("worker_id", "package_id", name="uq_worker_service_qual_package"),
+    )
+
+
+class PracticalSignOff(Base):
+    """Gate 3 ("practical_verified") requirement: a trainer observes the
+    worker perform the skill in person/video and signs off a checklist
+    (ServiceCatalogue.practical_checklist_items / CarePackage.practical_checklist_items).
+    Only counts toward qualification when `passed=True` — a failed sign-off
+    is kept for audit history, the worker needs a new passing one.
+    """
+    __tablename__ = "practical_sign_offs"
+    id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), primary_key=True, default=_uuid)
+    worker_id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), ForeignKey("worker_profiles.id", ondelete="CASCADE"), index=True, nullable=False)
+    service_id: Mapped[Optional[UUID]] = mapped_column(PG_UUID(as_uuid=True), ForeignKey("service_catalogue.id"), index=True)
+    package_id: Mapped[Optional[UUID]] = mapped_column(PG_UUID(as_uuid=True), ForeignKey("care_packages.id"), index=True)
+    # checklist_responses: {item_text: bool} — one entry per
+    # practical_checklist_items entry on the service/package at sign-off time.
+    checklist_responses: Mapped[dict] = mapped_column(JSONB, nullable=False)
+    passed: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    notes: Mapped[Optional[str]] = mapped_column(Text)
+    signed_by: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), ForeignKey("users.id"), nullable=False)
+    signed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now, server_default=func.now())
+    __table_args__ = (
+        Index("ix_practical_sign_offs_worker_service", "worker_id", "service_id"),
+        Index("ix_practical_sign_offs_worker_package", "worker_id", "package_id"),
     )
 
 
@@ -1216,9 +1259,19 @@ class AssessmentModule(Base):
     description: Mapped[Optional[str]] = mapped_column(Text)
     version: Mapped[int] = mapped_column(Integer, default=1, server_default="1", nullable=False)
     pass_score: Mapped[int] = mapped_column(Integer, default=70, server_default="70", nullable=False)
-    # questions: [{id, type, text, options?, correct_index?, correct_indices?, correct_bool?, weight?}]
+    # questions: [{id, type, text, options?, correct_index?, correct_indices?, correct_bool?, weight?,
+    #              variants?: [{text, options, correct_index}]}]
+    # `variants` lets a question have several equivalent versions with
+    # different numbers/wording — the session engine picks one per worker
+    # per attempt so two workers rarely see byte-identical questions.
     questions: Mapped[list] = mapped_column(JSONB, nullable=False)
     linked_training_module_code: Mapped[Optional[str]] = mapped_column(String(100), index=True)
+    # ── Anti-cheat assessment mechanics (Gate 2/3 "theory-verified") ──────
+    randomize_options: Mapped[bool] = mapped_column(Boolean, default=True, server_default="true", nullable=False)
+    questions_per_attempt: Mapped[Optional[int]] = mapped_column(Integer)  # null = use every question in the bank
+    time_limit_minutes: Mapped[Optional[int]] = mapped_column(Integer)     # null = no time limit
+    max_attempts: Mapped[Optional[int]] = mapped_column(Integer)           # null = unlimited
+    cooldown_hours: Mapped[int] = mapped_column(Integer, default=0, server_default="0", nullable=False)  # wait after a failed attempt
     status: Mapped[ContentStatus] = mapped_column(
         SQLEnum(ContentStatus, name="content_status"),
         default=ContentStatus.draft,
@@ -1252,6 +1305,41 @@ class WorkerAssessmentAttempt(Base):
     submitted_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now, server_default=func.now())
     __table_args__ = (
         Index("ix_worker_assessment_attempts_worker_ass", "worker_id", "assessment_id"),
+    )
+
+
+class WorkerAssessmentSession(Base):
+    """Server-held state for one in-progress or completed anti-cheat
+    assessment attempt. Questions are delivered one at a time; the client
+    never receives correct answers, unshuffled option order, or unpicked
+    question variants — everything needed to score fairly lives here.
+    """
+    __tablename__ = "worker_assessment_sessions"
+    id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), primary_key=True, default=_uuid)
+    worker_id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), ForeignKey("worker_profiles.id", ondelete="CASCADE"), index=True, nullable=False)
+    assessment_id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), ForeignKey("assessment_modules.id", ondelete="CASCADE"), index=True, nullable=False)
+    assessment_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    status: Mapped[AssessmentSessionStatus] = mapped_column(
+        SQLEnum(AssessmentSessionStatus, name="assessment_session_status"),
+        default=AssessmentSessionStatus.in_progress,
+        server_default=AssessmentSessionStatus.in_progress.value,
+        nullable=False,
+        index=True,
+    )
+    # question_order: [{question_id, variant_index|null, option_order: [orig_idx,...]}]
+    # — the picked variant + shuffled option order for every question in
+    # this attempt, fixed at session start so scoring is deterministic.
+    question_order: Mapped[list] = mapped_column(JSONB, nullable=False)
+    current_index: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    # answers: [{question_id, selected_option_index|null, correct: bool}] — appended as the worker answers.
+    answers: Mapped[list] = mapped_column(JSONB, default=list)
+    score: Mapped[Optional[int]] = mapped_column(Integer)
+    passed: Mapped[Optional[bool]] = mapped_column(Boolean)
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now, server_default=func.now())
+    expires_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    completed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    __table_args__ = (
+        Index("ix_worker_assessment_sessions_worker_ass", "worker_id", "assessment_id"),
     )
 
 
