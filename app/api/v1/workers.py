@@ -609,17 +609,12 @@ async def my_service_eligibility(
     profile: WorkerProfile = Depends(get_worker_profile),
     db: AsyncSession = Depends(get_db),
 ):
-    """List every active service + package with the worker's current
-    qualification + preference status and whether they may opt in."""
+    """List every active care package (admin-managed, no standalone
+    services) with the worker's current qualification + preference status
+    and whether they may opt in. No price is ever included here — nurses
+    see packages purely as opt-in offerings gated by training/assessments."""
     items: List[ServiceEligibilityItem] = []
 
-    # Services
-    sres = await db.execute(
-        select(ServiceCatalogue).where(ServiceCatalogue.is_active.is_(True))
-    )
-    services = list(sres.scalars().all())
-
-    # Packages
     pres = await db.execute(select(CarePackage).where(CarePackage.is_active.is_(True)))
     packages = list(pres.scalars().all())
 
@@ -629,51 +624,41 @@ async def my_service_eligibility(
             WorkerServiceQualification.worker_id == profile.id
         )
     )
-    quals = list(qres.scalars().all())
-    qmap_svc = {q.service_id: q for q in quals if q.service_id is not None}
-    qmap_pkg = {q.package_id: q for q in quals if q.package_id is not None}
+    qmap_pkg = {q.package_id: q for q in qres.scalars().all() if q.package_id is not None}
 
     prres = await db.execute(
         select(WorkerServicePreference).where(
             WorkerServicePreference.worker_id == profile.id
         )
     )
-    prefs = list(prres.scalars().all())
-    pmap_svc = {p.service_id: p for p in prefs if p.service_id is not None}
-    pmap_pkg = {p.package_id: p for p in prefs if p.package_id is not None}
+    pmap_pkg = {p.package_id: p for p in prres.scalars().all() if p.package_id is not None}
 
-    async def _build(target, target_type: str, qmap: dict, pmap: dict):
-        q = qmap.get(target.id)
-        p = pmap.get(target.id)
+    for pkg in packages:
+        q = qmap_pkg.get(pkg.id)
+        p = pmap_pkg.get(pkg.id)
         q_status = q.qualification_status.value if q else WorkerQualificationStatus.NOT_QUALIFIED.value
         q_source = q.qualification_source.value if (q and q.qualification_source) else None
         p_status = p.preference_status.value if p else WorkerPreferenceStatus.OPTED_OUT.value
         willing = bool(p.willing_to_accept) if p else False
 
-        qualified, locked_reason = await is_worker_qualified_for_service(profile, target, db)
-        can_opt_in = qualified
+        qualified, locked_reason = await is_worker_qualified_for_service(profile, pkg, db)
 
-        return ServiceEligibilityItem(
-            target_type=target_type,
-            id=target.id,
-            code=getattr(target, "service_code", None) or getattr(target, "package_code", ""),
-            name=target.name,
-            category=getattr(target.category, "value", None) if hasattr(target, "category") else None,
-            min_tier=target.min_tier.value if target.min_tier else None,
-            risk_level=getattr(target, "risk_level", None).value if getattr(target, "risk_level", None) else None,
+        items.append(ServiceEligibilityItem(
+            target_type="package",
+            id=pkg.id,
+            code=pkg.package_code,
+            name=pkg.name,
+            category=None,
+            min_tier=pkg.min_tier.value if pkg.min_tier else None,
+            risk_level=pkg.risk_level.value if pkg.risk_level else None,
             qualification_status=q_status,
             qualification_source=q_source,
             preference_status=p_status,
             willing_to_accept=willing,
-            can_opt_in=can_opt_in,
+            can_opt_in=qualified,
             locked_reason=None if qualified else locked_reason,
-            requires_admin_skill_approval=bool(getattr(target, "requires_admin_skill_approval", False)),
-        )
-
-    for s in services:
-        items.append(await _build(s, "service", qmap_svc, pmap_svc))
-    for pkg in packages:
-        items.append(await _build(pkg, "package", qmap_pkg, pmap_pkg))
+            requires_admin_skill_approval=bool(pkg.requires_admin_skill_approval),
+        ))
 
     return items
 
