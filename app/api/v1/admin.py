@@ -23,6 +23,7 @@ from app.models.enums import (
     GenderRestriction,
     PaymentStatus,
     PayoutBatchStatus,
+    QualificationGate,
     UserRole,
     UserStatus,
     VisitFrequency,
@@ -594,6 +595,10 @@ class CarePackageCreateRequest(BaseModel):
     requires_prescription: bool = False
     insurance_covered: bool = True
     available_cities: Optional[List[str]] = None
+    # Three-gate qualification model
+    gate: str = "credential_only"  # credential_only | theory_verified | practical_verified
+    required_assessment_codes: Optional[List[str]] = None
+    practical_checklist_items: Optional[List[str]] = None
 
 
 class CarePackageUpdateRequest(CarePackageCreateRequest):
@@ -623,6 +628,9 @@ def _serialize_care_package(pkg: CarePackage) -> dict:
         "is_active": pkg.is_active,
         "version": pkg.version,
         "available_cities": pkg.available_cities,
+        "gate": pkg.gate.value if pkg.gate else None,
+        "required_assessment_codes": pkg.required_assessment_codes,
+        "practical_checklist_items": pkg.practical_checklist_items,
         "created_at": pkg.created_at.isoformat() if pkg.created_at else None,
     }
 
@@ -655,6 +663,7 @@ async def create_care_package(
     min_tier = _validate_enum_field(payload.min_tier, WorkerTier, "min_tier")
     gender_restriction = _validate_enum_field(payload.gender_restriction, GenderRestriction, "gender_restriction")
     visit_frequency = _validate_enum_field(payload.visit_frequency, VisitFrequency, "visit_frequency")
+    gate = _validate_enum_field(payload.gate, QualificationGate, "gate")
 
     pkg = CarePackage(
         package_code=payload.package_code.strip().upper(),
@@ -674,6 +683,9 @@ async def create_care_package(
         requires_prescription=payload.requires_prescription,
         insurance_covered=payload.insurance_covered,
         available_cities=payload.available_cities,
+        gate=gate or QualificationGate.credential_only,
+        required_assessment_codes=payload.required_assessment_codes,
+        practical_checklist_items=payload.practical_checklist_items,
         is_active=True,
         version=1,
         created_by=current.id,
@@ -707,6 +719,7 @@ async def update_care_package(
     min_tier = _validate_enum_field(payload.min_tier, WorkerTier, "min_tier")
     gender_restriction = _validate_enum_field(payload.gender_restriction, GenderRestriction, "gender_restriction")
     visit_frequency = _validate_enum_field(payload.visit_frequency, VisitFrequency, "visit_frequency")
+    gate = _validate_enum_field(payload.gate, QualificationGate, "gate")
 
     pkg.package_code = new_code
     pkg.name = payload.name.strip()
@@ -725,6 +738,9 @@ async def update_care_package(
     pkg.requires_prescription = payload.requires_prescription
     pkg.insurance_covered = payload.insurance_covered
     pkg.available_cities = payload.available_cities
+    pkg.gate = gate or pkg.gate
+    pkg.required_assessment_codes = payload.required_assessment_codes
+    pkg.practical_checklist_items = payload.practical_checklist_items
     pkg.version = (pkg.version or 1) + 1
 
     await db.commit()
@@ -1593,6 +1609,23 @@ async def create_operations_account(
     """Only admin can create operations accounts."""
     if payload.role != UserRole.operations.value:
         raise HTTPException(status_code=400, detail="This endpoint only creates operations accounts")
+    user = await _create_staff_user(payload, db)
+    return _serialize_staff_user(user)
+
+
+@router.post("/staff/reviewer")
+async def create_reviewer_account(
+    payload: StaffCreateRequest,
+    current: CurrentUser = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Only admin can create reviewer accounts. Reviewers review nurse
+    onboarding documents and background checks — separate from the
+    support/clinical_training_lead/clinical_trainer roles operations
+    manages via /staff, so this gets its own admin-only endpoint (same
+    shape as /staff/operations)."""
+    if payload.role != UserRole.reviewer.value:
+        raise HTTPException(status_code=400, detail="This endpoint only creates reviewer accounts")
     user = await _create_staff_user(payload, db)
     return _serialize_staff_user(user)
 
