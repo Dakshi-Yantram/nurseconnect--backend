@@ -481,6 +481,16 @@ async def accept_booking(
         except Exception:  # noqa: BLE001
             await db.rollback()
 
+        # Generate the visit-start OTP right away so it's already sitting on
+        # the consumer's booking card by the time they open the app — no
+        # separate "send code" step needed. Best-effort; a failure here must
+        # never undo the booking claim itself.
+        try:
+            from app.api.v1.visits import _ensure_visit_start_otp
+            await _ensure_visit_start_otp(db, b)
+        except Exception:  # noqa: BLE001
+            await db.rollback()
+
         return JSONResponse(status_code=200, content=BookingOut.model_validate(b).model_dump(mode="json"))
 
     # rowcount == 0 — determine why and respond with structured error.
