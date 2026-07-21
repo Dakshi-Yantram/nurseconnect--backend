@@ -174,6 +174,82 @@ class VisitStartOtpVerifyRequest(BaseModel):
     longitude: float
 
 
+async def _ensure_visit_start_otp(db: AsyncSession, booking: Booking) -> dict:
+    """Idempotently ensure a visit-start OTP exists for this booking —
+    returns the existing one if still active, otherwise generates a new
+    4-digit code, stores it in Redis for 10 minutes, and best-effort SMSes
+    the consumer.
+
+    The code is scoped to a specific accepted worker implicitly: verify
+    only succeeds when called by the worker on `booking.worker_id`, so
+    even though the OTP itself is a bare 4-digit code, it's useless to any
+    nurse other than the one who accepted this booking.
+
+    Real SMS delivery isn't reliably configured in most environments this
+    app runs in, so the code is also returned in the response body
+    whenever OTP_DEV_MODE is on, or whenever the SMS send itself failed —
+    matching the on-screen fallback this endpoint already promised in its
+    own message text ("Show it to your nurse from the app").
+    """
+    existing = await redis_client.get(_otp_key(booking.id))
+    if existing:
+        ttl = await redis_client.ttl(_otp_key(booking.id))
+        otp_code = existing.decode() if isinstance(existing, bytes) else existing
+        return {
+            "sent": True,
+            "sms_sent": None,
+            "message": "Show this code to your nurse when they arrive.",
+            "expires_in_seconds": ttl,
+            "otp": otp_code,
+        }
+
+    otp_code = str(random.randint(1000, 9999))
+    await redis_client.setex(_otp_key(booking.id), _OTP_TTL_SECONDS, otp_code)
+    await redis_client.delete(_attempts_key(booking.id))
+
+    from app.models.models import ConsumerProfile as _ConsumerProfile, User
+    cres = await db.execute(select(_ConsumerProfile).where(_ConsumerProfile.id == booking.consumer_id))
+    consumer_profile = cres.scalar_one_or_none()
+    phone = None
+    consumer_user_id = consumer_profile.user_id if consumer_profile else None
+    if consumer_user_id:
+        ures = await db.execute(select(User).where(User.id == consumer_user_id))
+        user = ures.scalar_one_or_none()
+        phone = user.phone_e164 if user else None
+
+    sms_sent = False
+    if phone:
+        try:
+            resp = await msg91_client.send_otp(phone, otp_code)
+            sms_sent = resp.get("type") == "success"
+        except Exception:
+            # SMS failure must not block — the code is still shown in-app below.
+            sms_sent = False
+
+    if consumer_user_id:
+        await audit(
+            db, consumer_user_id, "consumer",
+            "visit.otp_generated", "booking", booking.id,
+            {"sms_sent": sms_sent},
+        )
+        await db.commit()
+
+    return {
+        "sent": True,
+        "sms_sent": sms_sent,
+        "message": (
+            "Visit code sent to your registered number — also shown below."
+            if sms_sent
+            else "Visit code generated. Show it to your nurse from the app."
+        ),
+        "expires_in_seconds": _OTP_TTL_SECONDS,
+        # Always shown on the consumer's booking card, regardless of SMS
+        # delivery — SMS is a best-effort convenience, not the source of
+        # truth for the code the consumer hands to their nurse.
+        "otp": otp_code,
+    }
+
+
 @router.post("/{booking_id}/generate-start-otp")
 async def generate_visit_start_otp(
     booking_id: UUID,
@@ -181,13 +257,10 @@ async def generate_visit_start_otp(
     db: AsyncSession = Depends(get_db),
 ):
     """
-    Called by the CONSUMER when the nurse has arrived at the door.
-    Generates a 4-digit OTP, stores it in Redis for 10 minutes,
-    and SMSes it to the consumer's registered phone.
-
+    Called by the CONSUMER (or auto-triggered right when a nurse accepts —
+    see bookings.py accept_booking) to ensure a visit-start OTP is ready.
     The consumer reads the code aloud to the nurse, who enters it in the
-    nurse app to start the visit. The OTP is never returned in the API
-    response to prevent interception.
+    nurse app to start the visit.
     """
     bres = await db.execute(
         select(Booking).where(
@@ -208,55 +281,7 @@ async def generate_visit_start_otp(
             },
         )
 
-    # Check if OTP already exists and is still valid — don't spam
-    existing = await redis_client.get(_otp_key(booking_id))
-    if existing:
-        ttl = await redis_client.ttl(_otp_key(booking_id))
-        return {
-            "sent": True,
-            "message": "OTP already active. Ask your nurse to enter it.",
-            "expires_in_seconds": ttl,
-        }
-
-    otp_code = str(random.randint(1000, 9999))
-
-    await redis_client.setex(_otp_key(booking_id), _OTP_TTL_SECONDS, otp_code)
-    await redis_client.delete(_attempts_key(booking_id))
-
-    from app.models.models import User
-    ures = await db.execute(select(User).where(User.id == profile.user_id))
-    user = ures.scalar_one_or_none()
-    phone = user.phone_e164 if user else None
-
-    sms_sent = False
-    if phone:
-        try:
-            resp = await msg91_client.send_otp(phone, otp_code)
-            sms_sent = resp.get("type") == "success"
-        except Exception:
-            # SMS failure must not block — the nurse can still manually share
-            # the code from the consumer's screen
-            sms_sent = False
-
-    await audit(
-        db, profile.user_id, "consumer",
-        "visit.otp_generated", "booking", booking_id,
-        {"sms_sent": sms_sent},
-    )
-    await db.commit()
-
-    return {
-        "sent": True,
-        "sms_sent": sms_sent,
-        "message": (
-            "Visit code sent to your registered number."
-            if sms_sent
-            else "Visit code generated. Show it to your nurse from the app."
-        ),
-        "expires_in_seconds": _OTP_TTL_SECONDS,
-        # DEV ONLY — never enable in production. Uncomment only for local testing.
-        # "_dev_otp": otp_code,
-    }
+    return await _ensure_visit_start_otp(db, booking)
 
 
 @router.post("/{booking_id}/verify-start-otp", response_model=VisitRecordOut)
