@@ -99,7 +99,13 @@ async def my_queue(
     db: AsyncSession = Depends(get_db),
 ):
     """All tickets currently assigned to the logged-in reviewer, newest SLA first."""
-    rp = await _get_reviewer_profile(current.id, db)
+    res = await db.execute(select(ReviewerProfile).where(ReviewerProfile.user_id == current.id))
+    rp = res.scalar_one_or_none()
+    if not rp:
+        # Not every user with reviewer-tier access (e.g. admins browsing this
+        # screen) has a reviewer profile. Treat that as "no queue" instead of
+        # a 404 so the frontend doesn't log noisy network errors.
+        return []
     stmt = (
         select(NurseReviewTicket)
         .where(NurseReviewTicket.assigned_reviewer_id == rp.id)
