@@ -47,6 +47,7 @@ from app.models.models import (
     NurseReviewTicket,
     Patient,
     PayoutBatch,
+    ReviewerProfile,
     RoleDefinition,
     ServiceCatalogue,
     SubsidyEligibility,
@@ -1610,6 +1611,38 @@ async def create_operations_account(
     if payload.role != UserRole.operations.value:
         raise HTTPException(status_code=400, detail="This endpoint only creates operations accounts")
     user = await _create_staff_user(payload, db)
+    return _serialize_staff_user(user)
+
+
+@router.post("/staff/reviewer")
+async def create_reviewer_account(
+    payload: StaffCreateRequest,
+    current: CurrentUser = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Only admin can create reviewer accounts. Reviewers review nurse
+    onboarding documents and background checks — separate from the
+    support/clinical_training_lead/clinical_trainer roles operations
+    manages via /staff, so this gets its own admin-only endpoint (same
+    shape as /staff/operations)."""
+    if payload.role != UserRole.reviewer.value:
+        raise HTTPException(status_code=400, detail="This endpoint only creates reviewer accounts")
+    user = await _create_staff_user(payload, db)
+
+    # Without a ReviewerProfile row, the auto-assignment engine never sees
+    # this reviewer as eligible, so nurse review tickets would never reach
+    # them. Create one automatically, active and ready to review.
+    db.add(
+        ReviewerProfile(
+            user_id=user.id,
+            is_active=True,
+            can_review_nurse_documents=True,
+            max_open_tickets=20,
+            specialization="nursing",
+        )
+    )
+    await db.commit()
+
     return _serialize_staff_user(user)
 
 
