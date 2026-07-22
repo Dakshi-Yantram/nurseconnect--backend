@@ -47,6 +47,7 @@ from app.models.models import (
     NurseReviewTicket,
     Patient,
     PayoutBatch,
+    ReviewerProfile,
     RoleDefinition,
     ServiceCatalogue,
     SubsidyEligibility,
@@ -1627,6 +1628,21 @@ async def create_reviewer_account(
     if payload.role != UserRole.reviewer.value:
         raise HTTPException(status_code=400, detail="This endpoint only creates reviewer accounts")
     user = await _create_staff_user(payload, db)
+
+    # Without a ReviewerProfile row, the auto-assignment engine never sees
+    # this reviewer as eligible, so nurse review tickets would never reach
+    # them. Create one automatically, active and ready to review.
+    db.add(
+        ReviewerProfile(
+            user_id=user.id,
+            is_active=True,
+            can_review_nurse_documents=True,
+            max_open_tickets=20,
+            specialization="nursing",
+        )
+    )
+    await db.commit()
+
     return _serialize_staff_user(user)
 
 
