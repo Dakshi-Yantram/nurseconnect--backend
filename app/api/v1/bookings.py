@@ -194,6 +194,10 @@ async def my_worker_bookings(
     return [BookingOut.model_validate(b) for b in res.scalars().all()]
 
 
+# Backward-compatible alias for older frontend bundles that still call
+# /api/bookings/available. Keep it before /{booking_id}, otherwise FastAPI
+# treats "available" as a UUID path param and returns 422.
+@router.get("/available", response_model=List[BookingOut], include_in_schema=False)
 @router.get("/worker/new-requests", response_model=List[BookingOut])
 async def new_requests(profile: WorkerProfile = Depends(get_worker_profile), db: AsyncSession = Depends(get_db)):
     """Unassigned bookings the worker is qualified for, opted into, AND inside
