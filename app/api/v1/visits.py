@@ -349,10 +349,9 @@ async def verify_visit_start_otp(
             },
         )
 
-    # OTP verified — delete keys immediately
-    await redis_client.delete(_otp_key(booking_id))
-    await redis_client.delete(_attempts_key(booking_id))
-
+    # OTP matches — but don't consume it yet. If a downstream check (consent,
+    # already-checked-in) fails, the nurse/consumer shouldn't have to
+    # generate a brand new code for something unrelated to the code itself.
     vres = await db.execute(select(VisitRecord).where(VisitRecord.booking_id == booking_id))
     visit = vres.scalar_one_or_none()
     if visit and visit.check_in_at:
@@ -371,6 +370,12 @@ async def verify_visit_start_otp(
             status_code=403,
             detail={"code": ce.code, "message": ce.message, "consent_type": ce.consent_type.value},
         ) from None
+
+    # All checks passed — the code is now spent, whether or not the rest of
+    # the check-in succeeds (matches the original all-or-nothing behavior
+    # for genuine check-in failures past this point).
+    await redis_client.delete(_otp_key(booking_id))
+    await redis_client.delete(_attempts_key(booking_id))
 
     if not visit:
         visit = VisitRecord(
