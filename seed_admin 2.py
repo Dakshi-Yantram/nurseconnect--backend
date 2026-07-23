@@ -17,7 +17,6 @@ creation instead of erroring or creating a duplicate.
 """
 import asyncio
 import sys
-from datetime import datetime, timezone
 
 from app.core.database import AsyncSessionLocal, engine
 from app.core.security import hash_password
@@ -44,16 +43,10 @@ async def main():
         user = existing.scalar_one_or_none()
 
         if user:
-            changed = False
             if user.role != ADMIN_ROLE:
                 user.role = ADMIN_ROLE
-                changed = True
-            if not user.email_verified_at:
-                user.email_verified_at = datetime.now(timezone.utc)
-                changed = True
-            if changed:
                 await session.commit()
-                print(f"  · admin user {ADMIN_EMAIL} already existed — role/verification corrected")
+                print(f"  · admin user {ADMIN_EMAIL} already existed — role corrected to '{ADMIN_ROLE.value}'")
             else:
                 print(f"  · admin user {ADMIN_EMAIL} already exists (id={user.id}), skipping creation")
         else:
@@ -64,7 +57,6 @@ async def main():
                 role=ADMIN_ROLE,
                 status=UserStatus.active,
                 password_hash=hash_password(ADMIN_PASSWORD),
-                email_verified_at=datetime.now(timezone.utc),
             )
             session.add(user)
             await session.commit()

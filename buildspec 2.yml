@@ -1,0 +1,9 @@
+version: 0.2
+phases:
+  install:
+    commands:
+      - echo "No build needed"
+artifacts:
+  base-directory: backend
+  files:
+    - '**/*'

@@ -609,14 +609,26 @@ async def my_service_eligibility(
     profile: WorkerProfile = Depends(get_worker_profile),
     db: AsyncSession = Depends(get_db),
 ):
-    """List every active care package (admin-managed, no standalone
-    services) with the worker's current qualification + preference status
-    and whether they may opt in. No price is ever included here — nurses
-    see packages purely as opt-in offerings gated by training/assessments."""
+    """List every active care package AND standalone service (admin-managed)
+    with the worker's current qualification + preference status and whether
+    they may opt in. No price is ever included here — nurses see offerings
+    purely as opt-in items gated by training/assessments.
+
+    BUGFIX: this used to only return CarePackage rows, so standalone
+    micro-visit services (Wound Dressing, Injection, Vitals Monitoring,
+    etc.) never appeared here and workers had no way to opt in to them —
+    even though the PUT /me/service-preferences endpoint already fully
+    supported target_type="service". Booking dispatch (new-requests) filters
+    on opt-in for both services and packages, so without this fix standalone
+    services could never be surfaced to any worker.
+    """
     items: List[ServiceEligibilityItem] = []
 
     pres = await db.execute(select(CarePackage).where(CarePackage.is_active.is_(True)))
     packages = list(pres.scalars().all())
+
+    sres = await db.execute(select(ServiceCatalogue).where(ServiceCatalogue.is_active.is_(True)))
+    services = list(sres.scalars().all())
 
     # Pre-fetch qualifications & preferences for this worker (single-pass).
     qres = await db.execute(
@@ -624,14 +636,45 @@ async def my_service_eligibility(
             WorkerServiceQualification.worker_id == profile.id
         )
     )
-    qmap_pkg = {q.package_id: q for q in qres.scalars().all() if q.package_id is not None}
+    all_quals = list(qres.scalars().all())
+    qmap_pkg = {q.package_id: q for q in all_quals if q.package_id is not None}
+    qmap_svc = {q.service_id: q for q in all_quals if q.service_id is not None}
 
     prres = await db.execute(
         select(WorkerServicePreference).where(
             WorkerServicePreference.worker_id == profile.id
         )
     )
-    pmap_pkg = {p.package_id: p for p in prres.scalars().all() if p.package_id is not None}
+    all_prefs = list(prres.scalars().all())
+    pmap_pkg = {p.package_id: p for p in all_prefs if p.package_id is not None}
+    pmap_svc = {p.service_id: p for p in all_prefs if p.service_id is not None}
+
+    for svc in services:
+        q = qmap_svc.get(svc.id)
+        p = pmap_svc.get(svc.id)
+        q_status = q.qualification_status.value if q else WorkerQualificationStatus.NOT_QUALIFIED.value
+        q_source = q.qualification_source.value if (q and q.qualification_source) else None
+        p_status = p.preference_status.value if p else WorkerPreferenceStatus.OPTED_OUT.value
+        willing = bool(p.willing_to_accept) if p else False
+
+        qualified, locked_reason = await is_worker_qualified_for_service(profile, svc, db)
+
+        items.append(ServiceEligibilityItem(
+            target_type="service",
+            id=svc.id,
+            code=svc.service_code,
+            name=svc.name,
+            category=svc.category.value if svc.category else None,
+            min_tier=svc.min_tier.value if svc.min_tier else None,
+            risk_level=svc.risk_level.value if getattr(svc, "risk_level", None) else None,
+            qualification_status=q_status,
+            qualification_source=q_source,
+            preference_status=p_status,
+            willing_to_accept=willing,
+            can_opt_in=qualified,
+            locked_reason=None if qualified else locked_reason,
+            requires_admin_skill_approval=bool(getattr(svc, "requires_admin_skill_approval", False)),
+        ))
 
     for pkg in packages:
         q = qmap_pkg.get(pkg.id)

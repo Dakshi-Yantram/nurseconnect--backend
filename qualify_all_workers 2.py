@@ -26,7 +26,6 @@ from datetime import datetime, timezone
 
 from app.core.database import AsyncSessionLocal, engine
 from app.models.models import (
-    CarePackage,
     WorkerProfile,
     ServiceCatalogue,
     WorkerServiceQualification,
@@ -55,14 +54,12 @@ async def main():
 
         sres = await session.execute(select(ServiceCatalogue))
         services = sres.scalars().all()
-        pres_all = await session.execute(select(CarePackage))
-        packages = pres_all.scalars().all()
-        if not services and not packages:
-            print("No services or packages found. Run run_seed.py first to seed the catalogue.")
+        if not services:
+            print("No services found. Run run_seed.py first to seed the catalogue.")
             return
 
-        print(f"Found {len(workers)} worker(s), {len(services)} service(s), {len(packages)} package(s).")
-        print(f"That's {len(workers) * (len(services) + len(packages))} qualification rows to upsert.\n")
+        print(f"Found {len(workers)} worker(s) and {len(services)} service(s).")
+        print(f"That's {len(workers) * len(services)} qualification rows to upsert.\n")
 
         now = datetime.now(timezone.utc)
 
@@ -71,30 +68,17 @@ async def main():
             worker.tier = WorkerTier.tier3
             print(f"Worker {worker.id}: onboarding=approved, tier=tier3")
 
-            # Consumer bookings are package-based — qualifying only services
-            # left every package booking invisible to every worker
-            # (QUALIFICATION_RECORD_MISSING), so cover both target types.
-            for target in list(services) + list(packages):
-                is_service = isinstance(target, ServiceCatalogue)
-                qual_cond = (
-                    WorkerServiceQualification.service_id == target.id
-                    if is_service
-                    else WorkerServiceQualification.package_id == target.id
-                )
+            for service in services:
                 # -- qualification --
                 qres = await session.execute(
                     select(WorkerServiceQualification).where(
                         WorkerServiceQualification.worker_id == worker.id,
-                        qual_cond,
+                        WorkerServiceQualification.service_id == service.id,
                     )
                 )
                 qual = qres.scalar_one_or_none()
                 if not qual:
-                    qual = WorkerServiceQualification(
-                        worker_id=worker.id,
-                        service_id=target.id if is_service else None,
-                        package_id=None if is_service else target.id,
-                    )
+                    qual = WorkerServiceQualification(worker_id=worker.id, service_id=service.id)
                     session.add(qual)
                 qual.qualification_status = WorkerQualificationStatus.APPROVED
                 qual.qualification_source = WorkerQualificationSource.TRAINING
@@ -103,29 +87,20 @@ async def main():
                 qual.valid_from = now
 
                 # -- preference (opt-in) --
-                pref_cond = (
-                    WorkerServicePreference.service_id == target.id
-                    if is_service
-                    else WorkerServicePreference.package_id == target.id
-                )
                 pres = await session.execute(
                     select(WorkerServicePreference).where(
                         WorkerServicePreference.worker_id == worker.id,
-                        pref_cond,
+                        WorkerServicePreference.service_id == service.id,
                     )
                 )
                 pref = pres.scalar_one_or_none()
                 if not pref:
-                    pref = WorkerServicePreference(
-                        worker_id=worker.id,
-                        service_id=target.id if is_service else None,
-                        package_id=None if is_service else target.id,
-                    )
+                    pref = WorkerServicePreference(worker_id=worker.id, service_id=service.id)
                     session.add(pref)
                 pref.preference_status = WorkerPreferenceStatus.OPTED_IN
                 pref.willing_to_accept = True
 
-            print(f"  + qualified + opted-in for {len(services)} service(s) + {len(packages)} package(s)")
+            print(f"  + qualified + opted-in for all {len(services)} services")
 
         await session.commit()
 
