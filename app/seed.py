@@ -993,9 +993,30 @@ async def seed_faqs(session) -> int:
     return created
 
 
+async def _run_pending_column_migrations():
+    """Small, safe, idempotent ALTER TABLE fixes that must run before the app
+    serves traffic. Each statement uses IF NOT EXISTS / WHERE-guarded UPDATE,
+    so re-running on every startup is harmless."""
+    from sqlalchemy import text
+
+    async with engine.begin() as conn:
+        await conn.execute(text(
+            "ALTER TABLE bookings ADD COLUMN IF NOT EXISTS dispatch_started_at TIMESTAMPTZ NULL"
+        ))
+        await conn.execute(text(
+            "UPDATE bookings SET dispatch_started_at = created_at "
+            "WHERE dispatch_started_at IS NULL AND status NOT IN ('draft', 'pending_payment')"
+        ))
+    print("Column migrations: bookings.dispatch_started_at ensured")
+
+
 async def main():
     print("NurseConnect seed runner")
     print("=" * 50)
+
+    print("\nRunning pending column migrations...")
+    await _run_pending_column_migrations()
+
     async with AsyncSessionLocal() as session:
         print("\nSeeding services...")
         services_created = await seed_services(session)
