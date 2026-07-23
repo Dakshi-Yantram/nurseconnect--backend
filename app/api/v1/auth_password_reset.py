@@ -15,12 +15,13 @@ from __future__ import annotations
 
 import secrets
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, EmailStr
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
+from app.core.rate_limit import client_ip, enforce_rate_limit
 from app.core.redis_client import redis_client
 from app.core.security import hash_password
 from app.integrations import msg91_client
@@ -51,7 +52,12 @@ class ResetPasswordRequest(BaseModel):
 
 
 @router.post("/auth/forgot-password")
-async def forgot_password(payload: ForgotPasswordRequest, db: AsyncSession = Depends(get_db)):
+async def forgot_password(payload: ForgotPasswordRequest, request: Request, db: AsyncSession = Depends(get_db)):
+    # SMS bombing / enumeration guard: 3 requests / 15 min per email,
+    # 10 / hour per IP.
+    await enforce_rate_limit("pwreset:email", payload.email.lower(), 3, 15 * 60)
+    await enforce_rate_limit("pwreset:ip", client_ip(request), 10, 60 * 60)
+
     res = await db.execute(select(User).where(User.email == payload.email.lower()))
     user = res.scalar_one_or_none()
 
