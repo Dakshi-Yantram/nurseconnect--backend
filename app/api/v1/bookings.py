@@ -1,5 +1,5 @@
 """Booking lifecycle: create, accept, cancel, list, escalate."""
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import List, Optional
 from uuid import UUID, uuid4
@@ -194,6 +194,10 @@ async def my_worker_bookings(
     return [BookingOut.model_validate(b) for b in res.scalars().all()]
 
 
+# Backward-compatible alias for older frontend bundles that still call
+# /api/bookings/available. Keep it before /{booking_id}, otherwise FastAPI
+# treats "available" as a UUID path param and returns 422.
+@router.get("/available", response_model=List[BookingOut], include_in_schema=False)
 @router.get("/worker/new-requests", response_model=List[BookingOut])
 async def new_requests(profile: WorkerProfile = Depends(get_worker_profile), db: AsyncSession = Depends(get_db)):
     """Unassigned bookings the worker is qualified for, opted into, AND inside
@@ -527,6 +531,17 @@ async def accept_booking(
     )
 
 
+# Neither the nurse nor the customer may cancel inside this window before
+# the scheduled visit start. Admin/ops can always cancel (support cases).
+_CANCELLATION_CUTOFF_HOURS = 6
+
+
+def _scheduled_start_utc(b: Booking) -> datetime:
+    # Same convention as dispatch._window: scheduled_date + scheduled_start_time
+    # are treated as UTC wall-clock throughout the codebase.
+    return datetime.combine(b.scheduled_date, b.scheduled_start_time, tzinfo=timezone.utc)
+
+
 @router.post("/{booking_id}/cancel", response_model=BookingOut)
 async def cancel_booking(
     booking_id: UUID,
@@ -555,6 +570,65 @@ async def cancel_booking(
     elif not is_admin(current.role):
         raise HTTPException(status_code=403, detail="Forbidden")
 
+    # 6-hour cutoff — applies to nurse and customer alike; admin is exempt
+    # so support can still intervene on emergencies.
+    if not is_admin(current.role):
+        now = datetime.now(timezone.utc)
+        cutoff = _scheduled_start_utc(b) - timedelta(hours=_CANCELLATION_CUTOFF_HOURS)
+        if now > cutoff:
+            raise HTTPException(
+                status_code=403,
+                detail={
+                    "success": False,
+                    "code": "CANCELLATION_WINDOW_CLOSED",
+                    "message": (
+                        f"Cancellations are only allowed up to {_CANCELLATION_CUTOFF_HOURS} hours "
+                        "before the scheduled visit. Please contact support for help."
+                    ),
+                },
+            )
+
+    # A nurse backing out does NOT kill the booking — it goes straight back
+    # into the dispatch pool for other qualified nurses (rematch_pending is
+    # already included in /worker/new-requests), with the wave clock reset
+    # so proximity waves start over from the rematch moment.
+    if current.role == UserRole.worker:
+        released_worker_id = b.worker_id
+        b.worker_id = None
+        b.status = BookingStatus.rematch_pending
+        b.accepted_at = None
+        b.rematch_count = (b.rematch_count or 0) + 1
+        b.assignment_wave = 1
+        b.assignment_escalated_at = None
+        b.dispatch_started_at = datetime.now(timezone.utc)
+        await audit(
+            db, current.id, current.role.value, "booking.worker_cancel_rematch", "booking", b.id,
+            {"reason": payload.reason, "released_worker_id": str(released_worker_id), "rematch_count": b.rematch_count},
+        )
+        await db.commit()
+        await db.refresh(b)
+
+        # Best-effort: tell the customer we're finding a replacement, and
+        # push the request to other nearby qualified nurses right away.
+        try:
+            cres = await db.execute(select(ConsumerProfile).where(ConsumerProfile.id == b.consumer_id))
+            cp = cres.scalar_one_or_none()
+            if cp:
+                await send_notification(
+                    db, cp.user_id, "booking_rematch", "Finding You a New Nurse",
+                    f"Your nurse had to cancel booking {b.booking_ref}. "
+                    "We're automatically matching you with another verified nurse.",
+                    {"booking_id": str(b.id)},
+                )
+            from app.services.dispatch import notify_nearby_workers
+            await notify_nearby_workers(db, b)
+            await db.commit()
+        except Exception:  # noqa: BLE001
+            await db.rollback()
+        await manager.broadcast(booking_topic(b.id), {"type": "booking.rematch", "booking_id": str(b.id)})
+        return BookingOut.model_validate(b)
+
+    # Consumer / admin cancellation — terminal.
     b.status = BookingStatus.cancelled
     b.cancelled_by = current.id
     b.cancelled_at = datetime.now(timezone.utc)

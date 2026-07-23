@@ -302,10 +302,36 @@ async def is_worker_qualified_for_service(
         if not qual or not qual.admin_approved_at:
             return False, "ADMIN_APPROVAL_REQUIRED"
 
-    # Qualification record must be APPROVED and not expired
+    # Qualification record must be APPROVED and not expired.
+    #
+    # EXCEPTION — requirement-free targets: when the service/package has no
+    # configured requirements at all (no training modules, no certificates,
+    # no assessments, gate is credential_only, no admin skill approval) the
+    # tier + onboarding checks above are the entire bar. Requiring a
+    # WorkerServiceQualification row on top of that dead-ends dispatch:
+    # nothing in the product ever creates that row for such targets unless
+    # an admin re-approves the worker AFTER the target was created
+    # (sync_tier_qualifications only runs on approve/tier-change), so every
+    # nurse silently failed QUALIFICATION_RECORD_MISSING for care packages
+    # added later — which is why paid bookings never reached any nurse.
+    has_configured_requirements = bool(
+        required_codes
+        or cert_codes
+        or assessment_codes
+        or requires_admin
+        or getattr(service, "gate", None) == QualificationGate.practical_verified
+    )
     if not qual:
+        if not has_configured_requirements:
+            return True, None
         return False, "QUALIFICATION_RECORD_MISSING"
     if qual.qualification_status != WorkerQualificationStatus.APPROVED:
+        if not has_configured_requirements:
+            # Row exists but was parked in a non-approved state (e.g. created
+            # as QUALIFIED_PENDING_APPROVAL by the request-qualification
+            # endpoint's chicken-and-egg check) even though nothing is
+            # actually required — same dead-end, same exception.
+            return True, None
         return False, f"QUALIFICATION_STATUS_{qual.qualification_status.value}"
     now = datetime.now(timezone.utc)
     if qual.valid_until and qual.valid_until < now:
@@ -316,9 +342,16 @@ async def is_worker_qualified_for_service(
 async def is_worker_opted_in_for_service(
     worker: WorkerProfile, service: ServiceLike, db: AsyncSession
 ) -> bool:
+    """A worker with no preference row on file is treated as opted-in.
+
+    Explicit OPT_OUT / PAUSED rows are always respected. Defaulting the
+    absent row to opted-out meant a booking was invisible to every nurse
+    who had simply never visited the preferences screen — dispatch must
+    reach willing workers by default, with opt-out as the exception.
+    """
     pref = await _get_preference_row(db, worker.id, service)
     if not pref:
-        return False
+        return True
     return (
         pref.preference_status == WorkerPreferenceStatus.OPTED_IN
         and bool(pref.willing_to_accept)

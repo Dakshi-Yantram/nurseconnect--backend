@@ -5,13 +5,20 @@ import secrets
 from datetime import datetime, timedelta, timezone
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
 from app.core.database import get_db
 from app.core.deps import CurrentUser, get_current_user
+from app.core.rate_limit import (
+    clear_failures,
+    client_ip,
+    enforce_rate_limit,
+    ensure_not_locked,
+    register_failure,
+)
 from app.core.security import (
     create_access_token,
     create_refresh_token,
@@ -152,8 +159,10 @@ def _issue_token_pair(user: User, claims_extra: dict | None = None) -> TokenPair
 
 
 @router.post("/register", response_model=RegisterResponse, status_code=status.HTTP_201_CREATED)
-async def register(payload: RegisterRequest, db: AsyncSession = Depends(get_db)):
+async def register(payload: RegisterRequest, request: Request, db: AsyncSession = Depends(get_db)):
     """Create a pending account and send a code to the supplied email."""
+    # Mass-registration / verification-email bombing guard.
+    await enforce_rate_limit("register:ip", client_ip(request), 10, 60 * 60)
     _validate_signup_role(payload.role)
     _validate_password(payload.password)
     email = _normalize_email(str(payload.email))
@@ -276,19 +285,37 @@ async def resend_email_verification(
     )
 
 
+# Brute-force policy for /login:
+#   - per-IP throttle: 20 attempts / 15 min (any outcome)
+#   - per-account lockout: 5 FAILED attempts locks the email for 15 min
+#     (counter clears on successful login)
+_LOGIN_IP_MAX = 20
+_LOGIN_WINDOW_SECONDS = 15 * 60
+_LOGIN_MAX_FAILURES = 5
+_LOGIN_LOCK_SECONDS = 15 * 60
+
+
 @router.post("/login", response_model=AuthResponse)
-async def login(payload: PasswordLoginRequest, db: AsyncSession = Depends(get_db)):
+async def login(payload: PasswordLoginRequest, request: Request, db: AsyncSession = Depends(get_db)):
     """Authenticate a verified account using email and password."""
     email = _normalize_email(str(payload.email))
+    ip = client_ip(request)
+    await enforce_rate_limit("login:ip", ip, _LOGIN_IP_MAX, _LOGIN_WINDOW_SECONDS)
+    await ensure_not_locked("login", email)
+
     ures = await db.execute(select(User).where(User.email == email))
     user = ures.scalar_one_or_none()
     if not user or not user.password_hash or not verify_password(payload.password, user.password_hash):
+        # Same failure counter whether the account exists or not, so the
+        # response timing/behaviour doesn't leak which emails are registered.
+        await register_failure("login", email, _LOGIN_MAX_FAILURES, _LOGIN_LOCK_SECONDS)
         raise HTTPException(status_code=401, detail="Invalid email or password")
     if not user.email_verified_at:
         raise HTTPException(status_code=403, detail="Verify your email before signing in")
     if user.status not in (UserStatus.active, UserStatus.onboarding):
         raise HTTPException(status_code=403, detail="Account is not active")
 
+    await clear_failures("login", email)
     user.last_login_at = datetime.now(timezone.utc)
     tokens = _issue_token_pair(user)
     await _persist_session(
@@ -306,7 +333,7 @@ async def login(payload: PasswordLoginRequest, db: AsyncSession = Depends(get_db
 
 
 @router.post("/phone-login", response_model=AuthResponse)
-async def phone_login(payload: PhoneLoginRequest, db: AsyncSession = Depends(get_db)):
+async def phone_login(payload: PhoneLoginRequest, request: Request, db: AsyncSession = Depends(get_db)):
     """Passwordless login/register for the mobile app.
 
     The mobile app (intapp) has no password field — it authenticates purely
@@ -320,6 +347,12 @@ async def phone_login(payload: PhoneLoginRequest, db: AsyncSession = Depends(get
     """
     _validate_signup_role(payload.role)
     phone = _normalize_phone(payload.phone_e164)
+    # This endpoint authenticates on phone number ALONE (mobile-app
+    # contract) — throttle hard so it can't be used to enumerate accounts
+    # or mass-register: 5 calls/hour per IP and per phone number.
+    ip = client_ip(request)
+    await enforce_rate_limit("phone_login:ip", ip, 5, 60 * 60)
+    await enforce_rate_limit("phone_login:phone", phone, 5, 60 * 60)
 
     ures = await db.execute(select(User).where(User.phone_e164 == phone))
     user = ures.scalar_one_or_none()
@@ -418,13 +451,21 @@ async def me(current: CurrentUser = Depends(get_current_user)):
 # Phone OTP — consumer login (no password required)
 # ---------------------------------------------------------------------------
 @router.post("/otp/send", response_model=OtpSendResponse)
-async def otp_send(payload: OtpSendRequest, db: AsyncSession = Depends(get_db)):
+async def otp_send(payload: OtpSendRequest, request: Request, db: AsyncSession = Depends(get_db)):
     """Generate and send a 6-digit OTP to the given phone number.
 
     In dev mode (OTP_DEV_MODE=True) the OTP is returned in the response body
     instead of being dispatched via SMS so testing works without MSG91 credits.
     """
     phone = _normalize_phone(payload.phone_e164)
+    # Throttle: 3 codes / 10 min per phone (SMS bombing + credit burn),
+    # 15 sends / hour per IP (mass enumeration).
+    ip = client_ip(request)
+    await enforce_rate_limit(
+        "otp_send:phone", phone, 3, 10 * 60,
+        message="Too many codes requested for this number. Wait a few minutes and try again.",
+    )
+    await enforce_rate_limit("otp_send:ip", ip, 15, 60 * 60)
     code = (
         settings.OTP_DEV_FIXED_CODE
         if settings.OTP_DEV_MODE
@@ -457,7 +498,7 @@ async def otp_send(payload: OtpSendRequest, db: AsyncSession = Depends(get_db)):
 
 
 @router.post("/otp/verify", response_model=AuthResponse)
-async def otp_verify(payload: OtpVerifyRequest, db: AsyncSession = Depends(get_db)):
+async def otp_verify(payload: OtpVerifyRequest, request: Request, db: AsyncSession = Depends(get_db)):
     """Verify OTP and issue tokens.  Creates a consumer account on first use.
 
     - If the phone is already registered as a *consumer* → logs them in.
@@ -465,6 +506,9 @@ async def otp_verify(payload: OtpVerifyRequest, db: AsyncSession = Depends(get_d
     - If phone belongs to a *worker* → returns 409 (use worker login instead).
     """
     phone = _normalize_phone(payload.phone_e164)
+    # Per-code attempts are capped below (otp.attempts >= 5); this per-IP
+    # throttle additionally stops one host cycling many phone numbers.
+    await enforce_rate_limit("otp_verify:ip", client_ip(request), 20, 15 * 60)
 
     otp_res = await db.execute(
         select(OtpCode)

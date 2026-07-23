@@ -614,6 +614,12 @@ class Booking(Base):
     # Patch 3 — Radius-wave dispatch tracking.
     assignment_wave: Mapped[int] = mapped_column(Integer, default=1, server_default="1")
     assignment_escalated_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    # When the booking became dispatchable to workers (payment captured →
+    # status confirmed). The wave clock runs from here, NOT created_at:
+    # workers only see confirmed bookings, so counting waves from creation
+    # burned the whole 20-minute wave window while the consumer was still
+    # on the payment screen.
+    dispatch_started_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now, server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now, onupdate=_now, server_default=func.now())
 
