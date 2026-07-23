@@ -191,7 +191,40 @@ async def my_worker_bookings(
     if status:
         conds.append(Booking.status == status)
     res = await db.execute(select(Booking).where(and_(*conds)).order_by(Booking.scheduled_date.desc()))
-    return [BookingOut.model_validate(b) for b in res.scalars().all()]
+    items: list[Booking] = list(res.scalars().all())
+
+    # Enrich with patient_name / service_name — mirrors the logic in
+    # /worker/new-requests. Without this, "My Visits" shows blank names.
+    svc_cache: dict = {}
+    pkg_cache: dict = {}
+    patient_cache: dict = {}
+    out: list[BookingOut] = []
+    for b in items:
+        bm = BookingOut.model_validate(b)
+
+        if b.patient_id:
+            if b.patient_id not in patient_cache:
+                pres = await db.execute(select(Patient).where(Patient.id == b.patient_id))
+                patient_cache[b.patient_id] = pres.scalar_one_or_none()
+            patient = patient_cache[b.patient_id]
+            if patient:
+                bm.patient_name = patient.full_name
+
+        if b.service_id:
+            if b.service_id not in svc_cache:
+                sr = await db.execute(select(ServiceCatalogue).where(ServiceCatalogue.id == b.service_id))
+                svc_cache[b.service_id] = sr.scalar_one_or_none()
+            if svc_cache[b.service_id]:
+                bm.service_name = svc_cache[b.service_id].name
+        elif b.package_id:
+            if b.package_id not in pkg_cache:
+                pr = await db.execute(select(CarePackage).where(CarePackage.id == b.package_id))
+                pkg_cache[b.package_id] = pr.scalar_one_or_none()
+            if pkg_cache[b.package_id]:
+                bm.service_name = pkg_cache[b.package_id].name
+
+        out.append(bm)
+    return out
 
 
 # Backward-compatible alias for older frontend bundles that still call
