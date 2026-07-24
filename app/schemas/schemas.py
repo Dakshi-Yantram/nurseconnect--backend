@@ -423,6 +423,7 @@ class BookingOut(ORMModel):
     distance_km: Optional[float] = None
     patient_name: Optional[str] = None
     service_name: Optional[str] = None
+    worker_name: Optional[str] = None
 
 
 class BookingCancelRequest(BaseModel):
