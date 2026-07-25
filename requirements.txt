@@ -16,6 +16,7 @@ alembic==1.18.4
 redis==7.4.0
 celery==5.6.3
 httpx==0.28.1
+pywebpush==2.0.3
 websockets==16.0
 starlette==0.37.2
 python-jose==3.5.0
