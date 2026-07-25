@@ -192,6 +192,77 @@ class FirebasePushClient:
 
 
 # ============================================================================
+# Dyte (in-app voice/video calling)
+# ============================================================================
+class DyteClient:
+    """Thin wrapper over the Dyte REST API.
+
+    Flow used by this app:
+      1. create_meeting()  -> once per booking, when the call is first started
+      2. add_participant() -> once per side (nurse / customer) each time they join,
+                               returns an authToken the frontend hands to Dyte's SDK
+    """
+
+    def __init__(self) -> None:
+        self.mock = settings.MOCK_EXTERNAL_PROVIDERS or not settings.DYTE_API_KEY or not settings.DYTE_ORG_ID
+        self.org_id = settings.DYTE_ORG_ID
+        self.api_key = settings.DYTE_API_KEY
+        self.base_url = settings.DYTE_BASE_URL
+
+    def _auth_header(self) -> str:
+        import base64
+        token = base64.b64encode(f"{self.org_id}:{self.api_key}".encode()).decode()
+        return f"Basic {token}"
+
+    async def create_meeting(self, title: str) -> Dict[str, Any]:
+        if self.mock:
+            meeting_id = f"meeting_mock_{uuid.uuid4().hex[:16]}"
+            logger.info("MOCK dyte create_meeting title=%s -> %s", title, meeting_id)
+            return {"id": meeting_id, "title": title, "status": "ACTIVE"}
+        import httpx
+        async with httpx.AsyncClient() as client:
+            resp = await client.post(
+                f"{self.base_url}/meetings",
+                headers={"Authorization": self._auth_header()},
+                json={"title": title, "record_on_start": False},
+            )
+            resp.raise_for_status()
+            return resp.json()["data"]
+
+    async def add_participant(self, meeting_id: str, participant_name: str, participant_id: str, preset_name: str = "group_call_host") -> Dict[str, Any]:
+        if self.mock:
+            auth_token = f"dyte_mock_token_{uuid.uuid4().hex}"
+            logger.info("MOCK dyte add_participant meeting=%s participant=%s", meeting_id, participant_id)
+            return {"authToken": auth_token, "id": participant_id}
+        import httpx
+        async with httpx.AsyncClient() as client:
+            resp = await client.post(
+                f"{self.base_url}/meetings/{meeting_id}/participants",
+                headers={"Authorization": self._auth_header()},
+                json={
+                    "name": participant_name,
+                    "preset_name": preset_name,
+                    "custom_participant_id": participant_id,
+                },
+            )
+            resp.raise_for_status()
+            return resp.json()["data"]
+
+    async def deactivate_meeting(self, meeting_id: str) -> Dict[str, Any]:
+        if self.mock:
+            logger.info("MOCK dyte deactivate_meeting %s", meeting_id)
+            return {"id": meeting_id, "status": "INACTIVE"}
+        import httpx
+        async with httpx.AsyncClient() as client:
+            resp = await client.delete(
+                f"{self.base_url}/meetings/{meeting_id}",
+                headers={"Authorization": self._auth_header()},
+            )
+            resp.raise_for_status()
+            return {"id": meeting_id, "status": "INACTIVE"}
+
+
+# ============================================================================
 # ABHA (Sandbox)
 # ============================================================================
 class AbhaClient:
@@ -219,3 +290,4 @@ msg91_client = Msg91Client()
 interakt_client = InteraktClient()
 firebase_push_client = FirebasePushClient()
 abha_client = AbhaClient()
+dyte_client = DyteClient()

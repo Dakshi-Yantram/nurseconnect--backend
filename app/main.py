@@ -19,6 +19,7 @@ from app.api.v1 import (
     admin,
     auth,
     bookings,
+    calls,
     care,
     care_workflow,
     catalog,
@@ -175,6 +176,8 @@ for r in [
     admin.router,
     support.router,
     messaging.router,
+    calls.router,
+    calls.push_router,
 ]:
     app.include_router(r, prefix=_API_PREFIX)
 
