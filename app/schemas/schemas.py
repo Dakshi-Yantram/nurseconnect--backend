@@ -423,6 +423,7 @@ class BookingOut(ORMModel):
     distance_km: Optional[float] = None
     patient_name: Optional[str] = None
     service_name: Optional[str] = None
+    worker_name: Optional[str] = None
 
 
 class BookingCancelRequest(BaseModel):
@@ -723,6 +724,38 @@ class NotificationOut(ORMModel):
     status: str
     read_at: Optional[datetime] = None
     created_at: datetime
+
+
+# ----- CALLING (Dyte) -----
+class CallStartResponse(BaseModel):
+    call_session_id: UUID
+    dyte_meeting_id: str
+    dyte_auth_token: str
+    dyte_org_id: str
+
+
+class CallSessionOut(ORMModel):
+    id: UUID
+    booking_id: UUID
+    dyte_meeting_id: str
+    initiated_by_role: str
+    status: str
+    started_at: datetime
+    callee_joined_at: Optional[datetime] = None
+    ended_at: Optional[datetime] = None
+    duration_seconds: Optional[int] = None
+    end_reason: Optional[str] = None
+
+
+class CallEndRequest(BaseModel):
+    end_reason: str = Field(default="completed")  # completed|no_answer|declined|failed
+
+
+class PushSubscribeRequest(BaseModel):
+    endpoint: str
+    p256dh_key: str
+    auth_key: str
+    user_agent: Optional[str] = None
 
 
 # ----- GENERIC -----
