@@ -118,6 +118,10 @@ class UserSession(Base):
     device_id: Mapped[Optional[str]] = mapped_column(String(255))
     device_platform: Mapped[Optional[str]] = mapped_column(String(50))
     fcm_token: Mapped[Optional[str]] = mapped_column(Text)
+    # iOS PushKit token. Deliberately separate from fcm_token: Apple issues a
+    # different token for VoIP pushes than for ordinary notifications, and
+    # sending a VoIP push to the standard token silently fails.
+    apns_voip_token: Mapped[Optional[str]] = mapped_column(Text)
     ip_address: Mapped[Optional[str]] = mapped_column(String(50))
     user_agent: Mapped[Optional[str]] = mapped_column(Text)
     revoked: Mapped[bool] = mapped_column(Boolean, default=False)

@@ -143,7 +143,13 @@ async def create_booking(
         booking_type=payload.booking_type,
         service_id=payload.service_id,
         package_id=payload.package_id,
-        worker_id=payload.preferred_worker_id,
+        # A booking is NEVER born assigned. `preferred_worker_id` used to be
+        # written straight into worker_id, which let any consumer hand-pick a
+        # worker and bypass the whole claim path: no accept step, no
+        # qualification/opt-in gate, no schedule-conflict check, and no consent
+        # from the worker. Assignment only ever happens through
+        # POST /bookings/{id}/accept (or an admin rematch).
+        worker_id=None,
         status=BookingStatus.pending_payment,
         scheduled_date=payload.scheduled_date,
         scheduled_start_time=payload.scheduled_start_time,
