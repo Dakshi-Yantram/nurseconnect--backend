@@ -83,6 +83,40 @@ class Settings(BaseSettings):
     ABHA_CLIENT_ID: str = ""
     ABHA_CLIENT_SECRET: str = ""
 
+    # Dyte (in-app voice/video calling)
+    DYTE_ORG_ID: str = ""
+    DYTE_API_KEY: str = ""
+    DYTE_BASE_URL: str = "https://api.dyte.io/v2"
+
+    # Web Push (VAPID) — best-effort background call ping for browser tabs.
+    # NOTE: this does NOT wake a fully force-killed browser; only the native
+    # PushKit / FCM paths below can ring a killed mobile app.
+    VAPID_PUBLIC_KEY: str = ""
+    VAPID_PRIVATE_KEY: str = ""
+    VAPID_SUBJECT: str = "mailto:support@nurseconnect.app"
+
+    # ---------------------------------------------------------------------
+    # APNs — iOS VoIP (PushKit) push.
+    #
+    # This is what lets a *force-killed* iOS app ring. It uses token-based
+    # auth: download a .p8 key from the Apple Developer portal (Keys → new key
+    # with "Apple Push Notifications service" enabled) and set the three
+    # values below. APNS_KEY_P8 accepts either the PEM contents directly or a
+    # path to the .p8 file.
+    #
+    # The push topic is always "<APNS_BUNDLE_ID>.voip" — Apple requires the
+    # .voip suffix for PushKit, and rejects the plain bundle id.
+    # ---------------------------------------------------------------------
+    APNS_KEY_P8: str = ""
+    APNS_KEY_ID: str = ""
+    APNS_TEAM_ID: str = ""
+    APNS_BUNDLE_ID: str = "com.yantrammedtech.nurseconnect"
+    # Apple has separate hosts for sandbox (dev builds) and production
+    # (TestFlight / App Store). A token minted for one is rejected by the
+    # other, so this must match how the installed app was signed.
+    APNS_USE_SANDBOX: bool = True
+
+
     # Mocks
     MOCK_EXTERNAL_PROVIDERS: bool = True
 

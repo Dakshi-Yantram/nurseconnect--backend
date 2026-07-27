@@ -55,6 +55,9 @@ class OtpVerifyRequest(BaseModel):
     phone_e164: str
     code: str
     role: UserRole = UserRole.consumer
+    # Optional display name, supplied when the mobile app collects it during
+    # first-time OTP signup. Only applied when creating a brand-new account.
+    full_name: Optional[str] = None
     device_id: Optional[str] = None
     device_platform: Optional[str] = None
     fcm_token: Optional[str] = None
@@ -384,6 +387,9 @@ class BookingCreate(BaseModel):
     latitude: Optional[Decimal] = None
     longitude: Optional[Decimal] = None
     special_instructions: Optional[str] = None
+    # Accepted for API compatibility but intentionally NOT used to assign the
+    # booking — see the note in bookings.create_booking. Dispatch is always by
+    # radius wave plus an explicit worker claim.
     preferred_worker_id: Optional[UUID] = None
 
 
@@ -423,6 +429,7 @@ class BookingOut(ORMModel):
     distance_km: Optional[float] = None
     patient_name: Optional[str] = None
     service_name: Optional[str] = None
+    worker_name: Optional[str] = None
 
 
 class BookingCancelRequest(BaseModel):
@@ -723,6 +730,52 @@ class NotificationOut(ORMModel):
     status: str
     read_at: Optional[datetime] = None
     created_at: datetime
+
+
+# ----- CALLING (Dyte) -----
+class CallStartResponse(BaseModel):
+    call_session_id: UUID
+    dyte_meeting_id: str
+    dyte_auth_token: str
+    dyte_org_id: str
+
+
+class CallSessionOut(ORMModel):
+    id: UUID
+    booking_id: UUID
+    dyte_meeting_id: str
+    initiated_by_role: str
+    status: str
+    started_at: datetime
+    callee_joined_at: Optional[datetime] = None
+    ended_at: Optional[datetime] = None
+    duration_seconds: Optional[int] = None
+    end_reason: Optional[str] = None
+
+
+class CallEndRequest(BaseModel):
+    end_reason: str = Field(default="completed")  # completed|no_answer|declined|failed
+
+
+class PushSubscribeRequest(BaseModel):
+    endpoint: str
+    p256dh_key: str
+    auth_key: str
+    user_agent: Optional[str] = None
+
+
+class DeviceRegisterRequest(BaseModel):
+    """Native mobile device registration for call ringing.
+
+    `device_id` identifies the physical install so re-registering updates the
+    existing session rather than piling up stale tokens. At least one of the
+    two tokens must be present; iOS supplies both (FCM for notifications,
+    APNs VoIP for PushKit ringing), Android supplies only `fcm_token`.
+    """
+    device_id: str
+    platform: str  # ios | android
+    fcm_token: Optional[str] = None
+    apns_voip_token: Optional[str] = None
 
 
 # ----- GENERIC -----

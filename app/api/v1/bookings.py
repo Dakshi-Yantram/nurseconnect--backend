@@ -1,5 +1,5 @@
 """Booking lifecycle: create, accept, cancel, list, escalate."""
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import List, Optional
 from uuid import UUID, uuid4
@@ -28,6 +28,7 @@ from app.models.enums import (
     VisitStatus,
 )
 from app.models.models import (
+    AuditLog,
     Booking,
     CarePackage,
     CarePackageBooking,
@@ -36,6 +37,7 @@ from app.models.models import (
     Patient,
     ServiceCatalogue,
     SubsidyEligibility,
+    User,
     VisitRecord,
     WorkerProfile,
 )
@@ -141,7 +143,13 @@ async def create_booking(
         booking_type=payload.booking_type,
         service_id=payload.service_id,
         package_id=payload.package_id,
-        worker_id=payload.preferred_worker_id,
+        # A booking is NEVER born assigned. `preferred_worker_id` used to be
+        # written straight into worker_id, which let any consumer hand-pick a
+        # worker and bypass the whole claim path: no accept step, no
+        # qualification/opt-in gate, no schedule-conflict check, and no consent
+        # from the worker. Assignment only ever happens through
+        # POST /bookings/{id}/accept (or an admin rematch).
+        worker_id=None,
         status=BookingStatus.pending_payment,
         scheduled_date=payload.scheduled_date,
         scheduled_start_time=payload.scheduled_start_time,
@@ -178,7 +186,53 @@ async def my_consumer_bookings(
     if status:
         conds.append(Booking.status == status)
     res = await db.execute(select(Booking).where(and_(*conds)).order_by(Booking.scheduled_date.desc(), Booking.scheduled_start_time.desc()))
-    return [BookingOut.model_validate(b) for b in res.scalars().all()]
+    items: list[Booking] = list(res.scalars().all())
+
+    # Enrich with patient_name / service_name / worker_name — mirrors the
+    # pattern in /worker (my_worker_bookings). Without this, the consumer
+    # bookings list/detail pages show a generic "Service" placeholder and a
+    # blank nurse field, since BookingOut only carries raw *_id foreign keys.
+    patient_cache: dict = {}
+    svc_cache: dict = {}
+    pkg_cache: dict = {}
+    worker_name_cache: dict = {}
+    out: list[BookingOut] = []
+    for b in items:
+        bm = BookingOut.model_validate(b)
+
+        if b.patient_id:
+            if b.patient_id not in patient_cache:
+                pres = await db.execute(select(Patient).where(Patient.id == b.patient_id))
+                patient_cache[b.patient_id] = pres.scalar_one_or_none()
+            patient = patient_cache[b.patient_id]
+            if patient:
+                bm.patient_name = patient.full_name
+
+        if b.service_id:
+            if b.service_id not in svc_cache:
+                sr = await db.execute(select(ServiceCatalogue).where(ServiceCatalogue.id == b.service_id))
+                svc_cache[b.service_id] = sr.scalar_one_or_none()
+            if svc_cache[b.service_id]:
+                bm.service_name = svc_cache[b.service_id].name
+        elif b.package_id:
+            if b.package_id not in pkg_cache:
+                pr = await db.execute(select(CarePackage).where(CarePackage.id == b.package_id))
+                pkg_cache[b.package_id] = pr.scalar_one_or_none()
+            if pkg_cache[b.package_id]:
+                bm.service_name = pkg_cache[b.package_id].name
+
+        if b.worker_id:
+            if b.worker_id not in worker_name_cache:
+                wr = await db.execute(
+                    select(User.full_name).join(WorkerProfile, WorkerProfile.user_id == User.id)
+                    .where(WorkerProfile.id == b.worker_id)
+                )
+                worker_name_cache[b.worker_id] = wr.scalar_one_or_none()
+            if worker_name_cache[b.worker_id]:
+                bm.worker_name = worker_name_cache[b.worker_id]
+
+        out.append(bm)
+    return out
 
 
 @router.get("/worker", response_model=List[BookingOut])
@@ -191,9 +245,46 @@ async def my_worker_bookings(
     if status:
         conds.append(Booking.status == status)
     res = await db.execute(select(Booking).where(and_(*conds)).order_by(Booking.scheduled_date.desc()))
-    return [BookingOut.model_validate(b) for b in res.scalars().all()]
+    items: list[Booking] = list(res.scalars().all())
+
+    # Enrich with patient_name / service_name — mirrors the logic in
+    # /worker/new-requests. Without this, "My Visits" shows blank names.
+    svc_cache: dict = {}
+    pkg_cache: dict = {}
+    patient_cache: dict = {}
+    out: list[BookingOut] = []
+    for b in items:
+        bm = BookingOut.model_validate(b)
+
+        if b.patient_id:
+            if b.patient_id not in patient_cache:
+                pres = await db.execute(select(Patient).where(Patient.id == b.patient_id))
+                patient_cache[b.patient_id] = pres.scalar_one_or_none()
+            patient = patient_cache[b.patient_id]
+            if patient:
+                bm.patient_name = patient.full_name
+
+        if b.service_id:
+            if b.service_id not in svc_cache:
+                sr = await db.execute(select(ServiceCatalogue).where(ServiceCatalogue.id == b.service_id))
+                svc_cache[b.service_id] = sr.scalar_one_or_none()
+            if svc_cache[b.service_id]:
+                bm.service_name = svc_cache[b.service_id].name
+        elif b.package_id:
+            if b.package_id not in pkg_cache:
+                pr = await db.execute(select(CarePackage).where(CarePackage.id == b.package_id))
+                pkg_cache[b.package_id] = pr.scalar_one_or_none()
+            if pkg_cache[b.package_id]:
+                bm.service_name = pkg_cache[b.package_id].name
+
+        out.append(bm)
+    return out
 
 
+# Backward-compatible alias for older frontend bundles that still call
+# /api/bookings/available. Keep it before /{booking_id}, otherwise FastAPI
+# treats "available" as a UUID path param and returns 422.
+@router.get("/available", response_model=List[BookingOut], include_in_schema=False)
 @router.get("/worker/new-requests", response_model=List[BookingOut])
 async def new_requests(profile: WorkerProfile = Depends(get_worker_profile), db: AsyncSession = Depends(get_db)):
     """Unassigned bookings the worker is qualified for, opted into, AND inside
@@ -348,11 +439,108 @@ async def get_booking(booking_id: UUID, current: CurrentUser = Depends(get_curre
             raise HTTPException(status_code=403, detail="Forbidden")
     elif not is_admin(current.role):
         raise HTTPException(status_code=403, detail="Forbidden")
-    return BookingOut.model_validate(b)
+
+    bm = BookingOut.model_validate(b)
+
+    # Enrich with patient_name / service_name / worker_name — this endpoint
+    # backs the consumer/nurse "booking detail" pages, which otherwise show
+    # blank or generic placeholder text ("Service", empty nurse field) since
+    # BookingOut only carries the raw *_id foreign keys.
+    if b.patient_id:
+        pres = await db.execute(select(Patient).where(Patient.id == b.patient_id))
+        patient = pres.scalar_one_or_none()
+        if patient:
+            bm.patient_name = patient.full_name
+
+    if b.service_id:
+        sres = await db.execute(select(ServiceCatalogue).where(ServiceCatalogue.id == b.service_id))
+        svc = sres.scalar_one_or_none()
+        if svc:
+            bm.service_name = svc.name
+    elif b.package_id:
+        pkres = await db.execute(select(CarePackage).where(CarePackage.id == b.package_id))
+        pkg = pkres.scalar_one_or_none()
+        if pkg:
+            bm.service_name = pkg.name
+
+    if b.worker_id:
+        wres2 = await db.execute(
+            select(User.full_name).join(WorkerProfile, WorkerProfile.user_id == User.id)
+            .where(WorkerProfile.id == b.worker_id)
+        )
+        worker_name = wres2.scalar_one_or_none()
+        if worker_name:
+            bm.worker_name = worker_name
+
+    return bm
+
+
+# ---------------------------------------------------------------------------
+# GET /bookings/{booking_id}/history
+#
+# The consumer/nurse "Booking history" timeline was previously rendered
+# entirely from a client-side, in-memory mock store (OrchestrationStore —
+# see src/lib/orchestration/index.tsx on the frontend) that seeds one
+# generic "Imported from operational seed" event per entity on page load
+# and is never wired to real backend data. That's why every booking showed
+# the same static/duplicated write-up regardless of what actually happened.
+#
+# This endpoint returns the real event trail from AuditLog for this
+# booking, so the frontend can render an accurate, per-booking timeline.
+# ---------------------------------------------------------------------------
+@router.get("/{booking_id}/history")
+async def get_booking_history(
+    booking_id: UUID, current: CurrentUser = Depends(get_current_user), db: AsyncSession = Depends(get_db)
+):
+    res = await db.execute(select(Booking).where(Booking.id == booking_id))
+    b = res.scalar_one_or_none()
+    if not b:
+        raise HTTPException(status_code=404, detail="Booking not found")
+    # Same ownership rules as GET /bookings/{booking_id}.
+    if current.role == UserRole.consumer:
+        cres = await db.execute(select(ConsumerProfile).where(ConsumerProfile.user_id == current.id))
+        cp = cres.scalar_one()
+        if b.consumer_id != cp.id:
+            raise HTTPException(status_code=403, detail="Forbidden")
+    elif current.role == UserRole.worker:
+        wres = await db.execute(select(WorkerProfile).where(WorkerProfile.user_id == current.id))
+        wp = wres.scalar_one()
+        if b.worker_id != wp.id:
+            raise HTTPException(status_code=403, detail="Forbidden")
+    elif not is_admin(current.role):
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+    # Booking-level events (create, accept, cancel, checklist/documentation
+    # submissions, OTP generation, etc.) are logged with entity_type="booking"
+    # and entity_id=str(booking_id). Visit-scoped events (check-in, checkout,
+    # vitals) are logged against the VisitRecord id instead, so pull those in
+    # too via the linked visit record, when one exists.
+    entity_ids = [str(booking_id)]
+    vres = await db.execute(select(VisitRecord.id).where(VisitRecord.booking_id == booking_id))
+    visit_id = vres.scalar_one_or_none()
+    if visit_id:
+        entity_ids.append(str(visit_id))
+
+    rows = await db.execute(
+        select(AuditLog)
+        .where(AuditLog.entity_type.in_(["booking", "visit"]), AuditLog.entity_id.in_(entity_ids))
+        .order_by(AuditLog.created_at.asc())
+    )
+    return [
+        {
+            "id": str(r.id),
+            "action": r.action,
+            "actor_type": r.actor_type,
+            "changes": r.changes,
+            "created_at": r.created_at.isoformat(),
+        }
+        for r in rows.scalars().all()
+    ]
 
 
 @router.post("/{booking_id}/accept")
 async def accept_booking(
+
     booking_id: UUID,
     profile: WorkerProfile = Depends(get_worker_profile),
     db: AsyncSession = Depends(get_db),
@@ -527,6 +715,17 @@ async def accept_booking(
     )
 
 
+# Neither the nurse nor the customer may cancel inside this window before
+# the scheduled visit start. Admin/ops can always cancel (support cases).
+_CANCELLATION_CUTOFF_HOURS = 6
+
+
+def _scheduled_start_utc(b: Booking) -> datetime:
+    # Same convention as dispatch._window: scheduled_date + scheduled_start_time
+    # are treated as UTC wall-clock throughout the codebase.
+    return datetime.combine(b.scheduled_date, b.scheduled_start_time, tzinfo=timezone.utc)
+
+
 @router.post("/{booking_id}/cancel", response_model=BookingOut)
 async def cancel_booking(
     booking_id: UUID,
@@ -555,6 +754,65 @@ async def cancel_booking(
     elif not is_admin(current.role):
         raise HTTPException(status_code=403, detail="Forbidden")
 
+    # 6-hour cutoff — applies to nurse and customer alike; admin is exempt
+    # so support can still intervene on emergencies.
+    if not is_admin(current.role):
+        now = datetime.now(timezone.utc)
+        cutoff = _scheduled_start_utc(b) - timedelta(hours=_CANCELLATION_CUTOFF_HOURS)
+        if now > cutoff:
+            raise HTTPException(
+                status_code=403,
+                detail={
+                    "success": False,
+                    "code": "CANCELLATION_WINDOW_CLOSED",
+                    "message": (
+                        f"Cancellations are only allowed up to {_CANCELLATION_CUTOFF_HOURS} hours "
+                        "before the scheduled visit. Please contact support for help."
+                    ),
+                },
+            )
+
+    # A nurse backing out does NOT kill the booking — it goes straight back
+    # into the dispatch pool for other qualified nurses (rematch_pending is
+    # already included in /worker/new-requests), with the wave clock reset
+    # so proximity waves start over from the rematch moment.
+    if current.role == UserRole.worker:
+        released_worker_id = b.worker_id
+        b.worker_id = None
+        b.status = BookingStatus.rematch_pending
+        b.accepted_at = None
+        b.rematch_count = (b.rematch_count or 0) + 1
+        b.assignment_wave = 1
+        b.assignment_escalated_at = None
+        b.dispatch_started_at = datetime.now(timezone.utc)
+        await audit(
+            db, current.id, current.role.value, "booking.worker_cancel_rematch", "booking", b.id,
+            {"reason": payload.reason, "released_worker_id": str(released_worker_id), "rematch_count": b.rematch_count},
+        )
+        await db.commit()
+        await db.refresh(b)
+
+        # Best-effort: tell the customer we're finding a replacement, and
+        # push the request to other nearby qualified nurses right away.
+        try:
+            cres = await db.execute(select(ConsumerProfile).where(ConsumerProfile.id == b.consumer_id))
+            cp = cres.scalar_one_or_none()
+            if cp:
+                await send_notification(
+                    db, cp.user_id, "booking_rematch", "Finding You a New Nurse",
+                    f"Your nurse had to cancel booking {b.booking_ref}. "
+                    "We're automatically matching you with another verified nurse.",
+                    {"booking_id": str(b.id)},
+                )
+            from app.services.dispatch import notify_nearby_workers
+            await notify_nearby_workers(db, b)
+            await db.commit()
+        except Exception:  # noqa: BLE001
+            await db.rollback()
+        await manager.broadcast(booking_topic(b.id), {"type": "booking.rematch", "booking_id": str(b.id)})
+        return BookingOut.model_validate(b)
+
+    # Consumer / admin cancellation — terminal.
     b.status = BookingStatus.cancelled
     b.cancelled_by = current.id
     b.cancelled_at = datetime.now(timezone.utc)
