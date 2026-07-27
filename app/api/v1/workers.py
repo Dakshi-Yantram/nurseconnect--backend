@@ -654,17 +654,12 @@ async def my_service_eligibility(
         p = pmap_svc.get(svc.id)
         q_status = q.qualification_status.value if q else WorkerQualificationStatus.NOT_QUALIFIED.value
         q_source = q.qualification_source.value if (q and q.qualification_source) else None
-<<<<<<< HEAD
         # An absent preference row means "not yet chosen", and dispatch treats
         # that as opted-in (see is_worker_opted_in_for_service). Report the
         # same default here — otherwise this screen tells a nurse they are
         # opted out of work they are in fact being offered.
         p_status = p.preference_status.value if p else WorkerPreferenceStatus.OPTED_IN.value
         willing = bool(p.willing_to_accept) if p else True
-=======
-        p_status = p.preference_status.value if p else WorkerPreferenceStatus.OPTED_OUT.value
-        willing = bool(p.willing_to_accept) if p else False
->>>>>>> origin/staging
 
         qualified, locked_reason = await is_worker_qualified_for_service(profile, svc, db)
 

@@ -286,13 +286,10 @@ CHECKLIST_TEMPLATES = [
         code="CHK-WOUND-DRESSING-V1",
         name="Wound Dressing — Visit Questionnaire",
         service_codes=["WOUND_DRESSING"],
-<<<<<<< HEAD
         # Post-op recovery visits also involve wound checks, so reuse this
         # checklist for that package until/unless a dedicated post-op
         # checklist is created.
         package_codes=["POST_OP_7D"],
-=======
->>>>>>> origin/staging
         phase=ChecklistPhase.during_visit,
         questions=[
             {
@@ -437,7 +434,6 @@ async def link_service_checklists(session) -> int:
     return linked
 
 
-<<<<<<< HEAD
 async def link_package_checklists(session) -> int:
     """Point CarePackage.checklist_template_id at the matching template.
 
@@ -476,8 +472,6 @@ async def link_package_checklists(session) -> int:
     return linked
 
 
-=======
->>>>>>> origin/staging
 async def seed_services(session) -> int:
     created = 0
     for data in SERVICES:
@@ -1084,12 +1078,9 @@ async def main():
         print("\nLinking checklist templates onto services...")
         checklists_linked = await link_service_checklists(session)
 
-<<<<<<< HEAD
         print("\nLinking checklist templates onto care packages...")
         checklists_linked += await link_package_checklists(session)
 
-=======
->>>>>>> origin/staging
         await session.commit()
 
     print("\n" + "=" * 50)
