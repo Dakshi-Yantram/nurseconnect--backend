@@ -117,6 +117,19 @@ class Settings(BaseSettings):
     APNS_USE_SANDBOX: bool = True
 
 
+    # Dyte (in-app voice/video calling)
+    DYTE_ORG_ID: str = ""
+    DYTE_API_KEY: str = ""
+    DYTE_BASE_URL: str = "https://api.dyte.io/v2"
+
+    # Web Push (VAPID) — best-effort background call ping for browser tabs.
+    # NOTE: this does NOT wake a fully force-killed app; see CallKit/PushKit
+    # notes in app/integrations/providers.py DyteClient docstring.
+    VAPID_PUBLIC_KEY: str = ""
+    VAPID_PRIVATE_KEY: str = ""
+    VAPID_SUBJECT: str = "mailto:support@nurseconnect.app"
+
+
     # Mocks
     MOCK_EXTERNAL_PROVIDERS: bool = True
 

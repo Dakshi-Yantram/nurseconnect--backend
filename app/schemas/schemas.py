@@ -764,6 +764,7 @@ class PushSubscribeRequest(BaseModel):
     user_agent: Optional[str] = None
 
 
+<<<<<<< HEAD
 class DeviceRegisterRequest(BaseModel):
     """Native mobile device registration for call ringing.
 
@@ -778,6 +779,8 @@ class DeviceRegisterRequest(BaseModel):
     apns_voip_token: Optional[str] = None
 
 
+=======
+>>>>>>> origin/staging
 # ----- GENERIC -----
 class PageMeta(BaseModel):
     page: int
