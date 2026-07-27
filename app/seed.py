@@ -286,6 +286,10 @@ CHECKLIST_TEMPLATES = [
         code="CHK-WOUND-DRESSING-V1",
         name="Wound Dressing — Visit Questionnaire",
         service_codes=["WOUND_DRESSING"],
+        # Post-op recovery visits also involve wound checks, so reuse this
+        # checklist for that package until/unless a dedicated post-op
+        # checklist is created.
+        package_codes=["POST_OP_7D"],
         phase=ChecklistPhase.during_visit,
         questions=[
             {
@@ -427,6 +431,44 @@ async def link_service_checklists(session) -> int:
             service.checklist_template_id = template.id
             linked += 1
             print(f"  + linked service {service_code} -> checklist {data['code']}")
+    return linked
+
+
+async def link_package_checklists(session) -> int:
+    """Point CarePackage.checklist_template_id at the matching template.
+
+    Mirrors link_service_checklists() but for care packages. Packages route
+    through their own checklist_template_id independently of any service
+    they're built on top of (see resolve_workflow_for_booking), so a
+    package's questionnaire has to be linked here explicitly — it is NOT
+    inherited from its primary_service automatically. Never overwrites a
+    checklist_template_id an admin already set some other way.
+    """
+    linked = 0
+    for data in CHECKLIST_TEMPLATES:
+        package_codes = data.get("package_codes") or []
+        if not package_codes:
+            continue
+        tres = await session.execute(
+            select(ChecklistTemplate).where(ChecklistTemplate.code == data["code"])
+        )
+        template = tres.scalar_one_or_none()
+        if not template:
+            continue
+        for package_code in package_codes:
+            pres = await session.execute(
+                select(CarePackage).where(CarePackage.package_code == package_code)
+            )
+            package = pres.scalar_one_or_none()
+            if not package:
+                print(f"  ! package {package_code} not found — cannot link checklist {data['code']}")
+                continue
+            if package.checklist_template_id:
+                print(f"  · package {package_code} already has a checklist template linked, skipping")
+                continue
+            package.checklist_template_id = template.id
+            linked += 1
+            print(f"  + linked package {package_code} -> checklist {data['code']}")
     return linked
 
 
@@ -993,9 +1035,30 @@ async def seed_faqs(session) -> int:
     return created
 
 
+async def _run_pending_column_migrations():
+    """Small, safe, idempotent ALTER TABLE fixes that must run before the app
+    serves traffic. Each statement uses IF NOT EXISTS / WHERE-guarded UPDATE,
+    so re-running on every startup is harmless."""
+    from sqlalchemy import text
+
+    async with engine.begin() as conn:
+        await conn.execute(text(
+            "ALTER TABLE bookings ADD COLUMN IF NOT EXISTS dispatch_started_at TIMESTAMPTZ NULL"
+        ))
+        await conn.execute(text(
+            "UPDATE bookings SET dispatch_started_at = created_at "
+            "WHERE dispatch_started_at IS NULL AND status NOT IN ('draft', 'pending_payment')"
+        ))
+    print("Column migrations: bookings.dispatch_started_at ensured")
+
+
 async def main():
     print("NurseConnect seed runner")
     print("=" * 50)
+
+    print("\nRunning pending column migrations...")
+    await _run_pending_column_migrations()
+
     async with AsyncSessionLocal() as session:
         print("\nSeeding services...")
         services_created = await seed_services(session)
@@ -1014,6 +1077,9 @@ async def main():
 
         print("\nLinking checklist templates onto services...")
         checklists_linked = await link_service_checklists(session)
+
+        print("\nLinking checklist templates onto care packages...")
+        checklists_linked += await link_package_checklists(session)
 
         await session.commit()
 

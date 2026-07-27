@@ -13,6 +13,7 @@ import hmac
 import logging
 import secrets
 import uuid
+from datetime import timedelta
 from typing import Any, Dict, Optional
 
 from app.core.config import settings
@@ -176,19 +177,316 @@ class InteraktClient:
 
 
 # ============================================================================
-# Firebase Push
+# Firebase Push (Android)
 # ============================================================================
 class FirebasePushClient:
+    """FCM sender, used for both ordinary notifications and call ringing.
+
+    Two message shapes matter here:
+
+    * ``send_to_token``    — normal notification. The OS renders it; the app
+                             does not need to be running.
+    * ``send_call_push``   — **data-only, priority=high**. Android only lets a
+                             data-only high-priority message wake an app that
+                             the user has swiped away, and only a data-only
+                             message reaches the app's own handler so it can
+                             raise a full-screen CallKeep/ConnectionService UI
+                             rather than a plain notification banner. Adding a
+                             ``notification`` block here would break that: the
+                             system tray would swallow it and the app would
+                             never be invoked.
+    """
+
     def __init__(self) -> None:
         self.mock = settings.MOCK_EXTERNAL_PROVIDERS or not settings.FIREBASE_SERVICE_ACCOUNT_JSON
         self.project_id = settings.FIREBASE_PROJECT_ID
+        self._app = None
 
-    async def send_to_token(self, fcm_token: str, title: str, body: str, data: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
+    def _get_app(self):
+        """Lazily initialise the firebase-admin app.
+
+        Done on first use rather than at import so a deployment without
+        Firebase configured still boots — push simply reports itself as
+        unconfigured instead of taking the process down.
+        """
+        if self._app is not None:
+            return self._app
+        import json as _json
+
+        import firebase_admin
+        from firebase_admin import credentials
+
+        raw = settings.FIREBASE_SERVICE_ACCOUNT_JSON.strip()
+        # Accept either the JSON blob itself or a path to the file.
+        if raw.startswith("{"):
+            cred = credentials.Certificate(_json.loads(raw))
+        else:
+            cred = credentials.Certificate(raw)
+
+        try:
+            self._app = firebase_admin.get_app("nurseconnect")
+        except ValueError:
+            self._app = firebase_admin.initialize_app(cred, name="nurseconnect")
+        return self._app
+
+    async def _send(self, message) -> Dict[str, Any]:
+        """Dispatch on a worker thread — the firebase-admin SDK is blocking."""
+        import asyncio
+
+        from firebase_admin import messaging
+
+        def _do() -> str:
+            return messaging.send(message, app=self._get_app())
+
+        try:
+            message_id = await asyncio.to_thread(_do)
+            return {"success": True, "message_id": message_id}
+        except Exception as e:  # noqa: BLE001
+            # A token goes stale whenever the app is reinstalled. Report it so
+            # the caller can prune it rather than retrying forever.
+            name = type(e).__name__
+            unregistered = name in ("UnregisteredError", "SenderIdMismatchError")
+            if not unregistered:
+                logger.exception("FCM send failed")
+            return {"success": False, "reason": name, "unregistered": unregistered}
+
+    async def send_to_token(
+        self,
+        fcm_token: str,
+        title: str,
+        body: str,
+        data: Optional[Dict[str, str]] = None,
+    ) -> Dict[str, Any]:
         if self.mock:
             logger.info("MOCK Firebase push token=%s title=%s", fcm_token[:12] if fcm_token else None, title)
             return {"success": True, "message_id": f"fcm_mock_{uuid.uuid4().hex[:10]}"}
-        # Real impl via firebase_admin
-        return {"success": False, "reason": "not_configured"}
+        if not fcm_token:
+            return {"success": False, "reason": "no_token"}
+
+        from firebase_admin import messaging
+
+        message = messaging.Message(
+            token=fcm_token,
+            notification=messaging.Notification(title=title, body=body),
+            data={k: str(v) for k, v in (data or {}).items()},
+            android=messaging.AndroidConfig(priority="high"),
+            apns=messaging.APNSConfig(
+                payload=messaging.APNSPayload(aps=messaging.Aps(sound="default")),
+            ),
+        )
+        return await self._send(message)
+
+    async def send_call_push(self, fcm_token: str, data: Dict[str, str]) -> Dict[str, Any]:
+        """Data-only, high-priority ring for Android. See the class docstring
+        for why this must not carry a ``notification`` block."""
+        if self.mock:
+            logger.info("MOCK Firebase CALL push token=%s", fcm_token[:12] if fcm_token else None)
+            return {"success": True, "message_id": f"fcm_mock_call_{uuid.uuid4().hex[:10]}"}
+        if not fcm_token:
+            return {"success": False, "reason": "no_token"}
+
+        from firebase_admin import messaging
+
+        message = messaging.Message(
+            token=fcm_token,
+            data={k: str(v) for k, v in data.items()},
+            android=messaging.AndroidConfig(
+                priority="high",
+                # A ring is worthless if it arrives late, and pointless if it
+                # arrives after the caller gave up — so never let it queue.
+                ttl=timedelta(seconds=45),
+            ),
+        )
+        return await self._send(message)
+
+
+# ============================================================================
+# APNs VoIP (iOS PushKit)
+# ============================================================================
+class ApnsVoipClient:
+    """Sends PushKit VoIP pushes so a force-killed iOS app can ring.
+
+    This is the only mechanism Apple provides for that. A few hard rules are
+    baked in below because getting them wrong fails silently or, worse, gets
+    the app's VoIP push privileges revoked:
+
+    * the topic MUST be ``<bundle-id>.voip`` — the bare bundle id is rejected;
+    * ``apns-push-type`` MUST be ``voip`` and ``apns-priority`` 10;
+    * the payload carries no ``aps.alert`` — iOS does not display a VoIP push,
+      it hands it to the app, which must then report an incoming call to
+      CallKit **immediately**. iOS terminates apps that receive a VoIP push
+      without reporting a call, and repeat offenders stop receiving them.
+
+    Sandbox and production are different hosts and a device token from one is
+    invalid on the other; ``APNS_USE_SANDBOX`` must match how the app was
+    signed (dev build vs TestFlight/App Store).
+    """
+
+    _SANDBOX_HOST = "https://api.sandbox.push.apple.com"
+    _PROD_HOST = "https://api.push.apple.com"
+
+    def __init__(self) -> None:
+        self.mock = (
+            settings.MOCK_EXTERNAL_PROVIDERS
+            or not settings.APNS_KEY_P8
+            or not settings.APNS_KEY_ID
+            or not settings.APNS_TEAM_ID
+        )
+        self.bundle_id = settings.APNS_BUNDLE_ID
+        self._jwt: Optional[str] = None
+        self._jwt_issued_at: float = 0.0
+
+    @property
+    def host(self) -> str:
+        return self._SANDBOX_HOST if settings.APNS_USE_SANDBOX else self._PROD_HOST
+
+    def _private_key(self) -> str:
+        raw = settings.APNS_KEY_P8.strip()
+        if raw.startswith("-----BEGIN"):
+            return raw
+        # Treat anything else as a path to the .p8 file.
+        with open(raw, "r", encoding="utf-8") as fh:
+            return fh.read()
+
+    def _auth_token(self) -> str:
+        """ES256 JWT for APNs.
+
+        Apple rejects tokens older than 1 hour and throttles clients that mint
+        a new one per request, so it's cached and refreshed at ~50 minutes.
+        """
+        import time
+
+        now = time.time()
+        if self._jwt and (now - self._jwt_issued_at) < 3000:
+            return self._jwt
+
+        import jwt as pyjwt
+
+        self._jwt = pyjwt.encode(
+            {"iss": settings.APNS_TEAM_ID, "iat": int(now)},
+            self._private_key(),
+            algorithm="ES256",
+            headers={"kid": settings.APNS_KEY_ID},
+        )
+        self._jwt_issued_at = now
+        return self._jwt
+
+    async def send_voip(self, device_token: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        if self.mock:
+            logger.info(
+                "MOCK APNs VoIP push token=%s payload=%s",
+                device_token[:12] if device_token else None,
+                payload.get("type"),
+            )
+            return {"success": True, "apns_id": f"apns_mock_{uuid.uuid4().hex[:10]}"}
+        if not device_token:
+            return {"success": False, "reason": "no_token"}
+
+        import httpx
+
+        try:
+            # APNs requires HTTP/2.
+            async with httpx.AsyncClient(http2=True, timeout=10.0) as client:
+                resp = await client.post(
+                    f"{self.host}/3/device/{device_token}",
+                    headers={
+                        "authorization": f"bearer {self._auth_token()}",
+                        "apns-topic": f"{self.bundle_id}.voip",
+                        "apns-push-type": "voip",
+                        "apns-priority": "10",
+                        "apns-expiration": "0",  # deliver now or drop it
+                    },
+                    json=payload,
+                )
+        except Exception as e:  # noqa: BLE001
+            logger.exception("APNs VoIP push failed to send")
+            return {"success": False, "reason": type(e).__name__}
+
+        if resp.status_code == 200:
+            return {"success": True, "apns_id": resp.headers.get("apns-id")}
+
+        reason = ""
+        try:
+            reason = resp.json().get("reason", "")
+        except Exception:  # noqa: BLE001
+            reason = resp.text[:200]
+        # BadDeviceToken/Unregistered mean the install is gone — the caller
+        # should drop the token rather than keep pushing to it.
+        stale = reason in ("BadDeviceToken", "Unregistered", "DeviceTokenNotForTopic")
+        if not stale:
+            logger.warning("APNs VoIP push rejected: %s %s", resp.status_code, reason)
+        return {"success": False, "reason": reason, "unregistered": stale}
+
+
+# ============================================================================
+# Dyte (in-app voice/video calling)
+# ============================================================================
+class DyteClient:
+    """Thin wrapper over the Dyte REST API.
+
+    Flow used by this app:
+      1. create_meeting()  -> once per booking, when the call is first started
+      2. add_participant() -> once per side (nurse / customer) each time they join,
+                               returns an authToken the frontend hands to Dyte's SDK
+    """
+
+    def __init__(self) -> None:
+        self.mock = settings.MOCK_EXTERNAL_PROVIDERS or not settings.DYTE_API_KEY or not settings.DYTE_ORG_ID
+        self.org_id = settings.DYTE_ORG_ID
+        self.api_key = settings.DYTE_API_KEY
+        self.base_url = settings.DYTE_BASE_URL
+
+    def _auth_header(self) -> str:
+        import base64
+        token = base64.b64encode(f"{self.org_id}:{self.api_key}".encode()).decode()
+        return f"Basic {token}"
+
+    async def create_meeting(self, title: str) -> Dict[str, Any]:
+        if self.mock:
+            meeting_id = f"meeting_mock_{uuid.uuid4().hex[:16]}"
+            logger.info("MOCK dyte create_meeting title=%s -> %s", title, meeting_id)
+            return {"id": meeting_id, "title": title, "status": "ACTIVE"}
+        import httpx
+        async with httpx.AsyncClient() as client:
+            resp = await client.post(
+                f"{self.base_url}/meetings",
+                headers={"Authorization": self._auth_header()},
+                json={"title": title, "record_on_start": False},
+            )
+            resp.raise_for_status()
+            return resp.json()["data"]
+
+    async def add_participant(self, meeting_id: str, participant_name: str, participant_id: str, preset_name: str = "group_call_host") -> Dict[str, Any]:
+        if self.mock:
+            auth_token = f"dyte_mock_token_{uuid.uuid4().hex}"
+            logger.info("MOCK dyte add_participant meeting=%s participant=%s", meeting_id, participant_id)
+            return {"authToken": auth_token, "id": participant_id}
+        import httpx
+        async with httpx.AsyncClient() as client:
+            resp = await client.post(
+                f"{self.base_url}/meetings/{meeting_id}/participants",
+                headers={"Authorization": self._auth_header()},
+                json={
+                    "name": participant_name,
+                    "preset_name": preset_name,
+                    "custom_participant_id": participant_id,
+                },
+            )
+            resp.raise_for_status()
+            return resp.json()["data"]
+
+    async def deactivate_meeting(self, meeting_id: str) -> Dict[str, Any]:
+        if self.mock:
+            logger.info("MOCK dyte deactivate_meeting %s", meeting_id)
+            return {"id": meeting_id, "status": "INACTIVE"}
+        import httpx
+        async with httpx.AsyncClient() as client:
+            resp = await client.delete(
+                f"{self.base_url}/meetings/{meeting_id}",
+                headers={"Authorization": self._auth_header()},
+            )
+            resp.raise_for_status()
+            return {"id": meeting_id, "status": "INACTIVE"}
 
 
 # ============================================================================
@@ -289,5 +587,9 @@ cloudinary_client = CloudinaryClient()
 msg91_client = Msg91Client()
 interakt_client = InteraktClient()
 firebase_push_client = FirebasePushClient()
+<<<<<<< HEAD
+apns_voip_client = ApnsVoipClient()
+=======
+>>>>>>> origin/staging
 abha_client = AbhaClient()
 dyte_client = DyteClient()

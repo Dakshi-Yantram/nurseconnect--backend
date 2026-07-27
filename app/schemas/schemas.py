@@ -55,6 +55,9 @@ class OtpVerifyRequest(BaseModel):
     phone_e164: str
     code: str
     role: UserRole = UserRole.consumer
+    # Optional display name, supplied when the mobile app collects it during
+    # first-time OTP signup. Only applied when creating a brand-new account.
+    full_name: Optional[str] = None
     device_id: Optional[str] = None
     device_platform: Optional[str] = None
     fcm_token: Optional[str] = None
@@ -384,6 +387,9 @@ class BookingCreate(BaseModel):
     latitude: Optional[Decimal] = None
     longitude: Optional[Decimal] = None
     special_instructions: Optional[str] = None
+    # Accepted for API compatibility but intentionally NOT used to assign the
+    # booking — see the note in bookings.create_booking. Dispatch is always by
+    # radius wave plus an explicit worker claim.
     preferred_worker_id: Optional[UUID] = None
 
 
@@ -758,6 +764,23 @@ class PushSubscribeRequest(BaseModel):
     user_agent: Optional[str] = None
 
 
+<<<<<<< HEAD
+class DeviceRegisterRequest(BaseModel):
+    """Native mobile device registration for call ringing.
+
+    `device_id` identifies the physical install so re-registering updates the
+    existing session rather than piling up stale tokens. At least one of the
+    two tokens must be present; iOS supplies both (FCM for notifications,
+    APNs VoIP for PushKit ringing), Android supplies only `fcm_token`.
+    """
+    device_id: str
+    platform: str  # ios | android
+    fcm_token: Optional[str] = None
+    apns_voip_token: Optional[str] = None
+
+
+=======
+>>>>>>> origin/staging
 # ----- GENERIC -----
 class PageMeta(BaseModel):
     page: int

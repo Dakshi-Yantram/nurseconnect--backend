@@ -544,9 +544,13 @@ async def otp_verify(payload: OtpVerifyRequest, request: Request, db: AsyncSessi
         )
 
     if not user:
+        # `full_name` is optional on the OTP signup path — leave it NULL when
+        # the client didn't collect one so the profile screen can prompt for
+        # it. (This previously stored the literal role string, e.g. the name
+        # of every OTP-registered consumer came out as "consumer".)
         user = User(
             phone_e164=phone,
-            full_name=(payload.role.value if not hasattr(payload, "full_name") else None),
+            full_name=(payload.full_name or "").strip() or None,
             role=UserRole.consumer,
             status=UserStatus.active,
             email_verified_at=datetime.now(timezone.utc),
