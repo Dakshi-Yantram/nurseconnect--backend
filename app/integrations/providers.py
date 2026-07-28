@@ -587,9 +587,6 @@ cloudinary_client = CloudinaryClient()
 msg91_client = Msg91Client()
 interakt_client = InteraktClient()
 firebase_push_client = FirebasePushClient()
-<<<<<<< HEAD
 apns_voip_client = ApnsVoipClient()
-=======
->>>>>>> origin/staging
 abha_client = AbhaClient()
 dyte_client = DyteClient()
