@@ -15,7 +15,6 @@ psycopg2-binary==2.9.9
 alembic==1.18.4
 redis==7.4.0
 celery==5.6.3
-<<<<<<< HEAD
 # The [http2] extra pulls in `h2`. APNs only speaks HTTP/2, so plain httpx
 # cannot talk to it — VoIP pushes fail at connect time without this.
 httpx[http2]==0.28.1
@@ -25,10 +24,6 @@ firebase-admin==7.1.0
 # PyJWT signs the APNs auth token with ES256, which needs `cryptography`
 # present; PyJWT itself does not depend on it.
 cryptography==46.0.3
-=======
-httpx==0.28.1
-pywebpush==2.0.3
->>>>>>> origin/staging
 websockets==16.0
 starlette==0.37.2
 python-jose==3.5.0
