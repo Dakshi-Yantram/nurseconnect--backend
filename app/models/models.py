@@ -232,6 +232,7 @@ class WorkerProfile(Base):
         SQLEnum(WorkerType, name="worker_type_enum"),
         default=WorkerType.nurse, server_default="nurse", nullable=False, index=True,
     )
+    home_address: Mapped[Optional[str]] = mapped_column(String(500))
     base_city: Mapped[Optional[str]] = mapped_column(String(100), index=True)
     service_radius_km: Mapped[int] = mapped_column(Integer, default=10)
     home_latitude: Mapped[Optional[Decimal]] = mapped_column(Numeric(10, 8))

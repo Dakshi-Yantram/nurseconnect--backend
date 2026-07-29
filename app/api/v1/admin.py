@@ -29,6 +29,7 @@ from app.models.enums import (
     VisitFrequency,
     VisitStatus,
     WorkerOnboardingStatus,
+    WorkerPayoutStatus,
     WorkerTier,
     WorkerType,
 )
@@ -1139,6 +1140,107 @@ async def get_payout_batch(
             for p in payouts
         ],
     }
+
+
+# ---------------------------------------------------------------------------
+# Individual worker payouts (pending queue + process/hold).
+# Payouts are generated per-booking at visit checkout as `pending`; these
+# endpoints are how admin reviews and settles them.
+# ---------------------------------------------------------------------------
+class PayoutHoldRequest(BaseModel):
+    release: bool = False
+    reason: Optional[str] = None
+
+
+@router.get("/worker-payouts")
+async def list_worker_payouts(
+    status: Optional[str] = None,
+    current: CurrentUser = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    stmt = select(WorkerPayout).order_by(WorkerPayout.created_at.desc())
+    if status:
+        stmt = stmt.where(WorkerPayout.status == status)
+    rows = (await db.execute(stmt)).scalars().all()
+
+    worker_ids = {p.worker_id for p in rows}
+    names: dict = {}
+    if worker_ids:
+        wres = await db.execute(
+            select(WorkerProfile, User)
+            .join(User, User.id == WorkerProfile.user_id)
+            .where(WorkerProfile.id.in_(worker_ids))
+        )
+        for wp, u in wres.all():
+            names[wp.id] = {
+                "name": u.full_name or u.email,
+                "has_bank": bool(wp.bank_account_number and wp.bank_ifsc),
+            }
+    return [
+        {
+            "id": str(p.id),
+            "worker_id": str(p.worker_id),
+            "worker_name": names.get(p.worker_id, {}).get("name"),
+            "worker_has_bank": names.get(p.worker_id, {}).get("has_bank", False),
+            "booking_id": str(p.booking_id),
+            "gross_amount": float(p.gross_amount),
+            "tds_deducted": float(p.tds_deducted),
+            "net_amount": float(p.net_amount),
+            "status": p.status.value,
+            "paid_at": p.paid_at.isoformat() if p.paid_at else None,
+            "created_at": p.created_at.isoformat(),
+        }
+        for p in rows
+    ]
+
+
+@router.post("/worker-payouts/{payout_id}/process")
+async def process_worker_payout(
+    payout_id: UUID,
+    current: CurrentUser = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Pay a pending/failed payout — via RazorpayX when configured and the
+    nurse has bank details, otherwise mark it settled manually."""
+    res = await db.execute(select(WorkerPayout).where(WorkerPayout.id == payout_id))
+    payout = res.scalar_one_or_none()
+    if not payout:
+        raise HTTPException(status_code=404, detail="Payout not found")
+
+    from app.services.payout_service import process_payout
+    result = await process_payout(db, payout)
+    if result.get("error"):
+        await db.rollback()
+        raise HTTPException(status_code=409, detail=result["error"])
+    await audit(db, current.id, current.role.value, "payout.process", "worker_payout", payout.id, result)
+    await db.commit()
+    return result
+
+
+@router.post("/worker-payouts/{payout_id}/hold")
+async def hold_worker_payout(
+    payout_id: UUID,
+    body: PayoutHoldRequest,
+    current: CurrentUser = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    res = await db.execute(select(WorkerPayout).where(WorkerPayout.id == payout_id))
+    payout = res.scalar_one_or_none()
+    if not payout:
+        raise HTTPException(status_code=404, detail="Payout not found")
+    if payout.status == WorkerPayoutStatus.paid:
+        raise HTTPException(status_code=409, detail="Already paid")
+    from datetime import datetime as _dt, timezone as _tz
+    if body.release:
+        payout.status = WorkerPayoutStatus.pending
+        payout.hold_released_at = _dt.now(_tz.utc)
+    else:
+        payout.status = WorkerPayoutStatus.on_hold
+        payout.hold_reason = body.reason
+        payout.hold_initiated_by = current.id
+        payout.hold_initiated_at = _dt.now(_tz.utc)
+    await db.commit()
+    return {"status": payout.status.value}
 
 
 # ============================================================================

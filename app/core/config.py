@@ -60,6 +60,30 @@ class Settings(BaseSettings):
     RAZORPAY_KEY_SECRET: str = ""
     RAZORPAY_WEBHOOK_SECRET: str = ""
 
+    # ---------------------------------------------------------------------
+    # Worker payouts.
+    #
+    # When a visit is completed a payout is generated for the nurse:
+    #   gross  = booking base + surge amount (the service value)
+    #   comm   = gross * commission%  (from the service/package, or the
+    #            platform default below when the offering doesn't set one)
+    #   tds    = (gross - comm) * TDS%   (India: 194O e-commerce, often 1%)
+    #   net    = gross - comm - tds
+    #
+    # The payout is created as `pending`. Admin reviews and processes it —
+    # optionally auto-transferring via RazorpayX when RAZORPAYX_* is set and
+    # the nurse has bank details on file. Nothing leaves the platform without
+    # an admin action, which is what marketplaces want for hold/dispute control.
+    # ---------------------------------------------------------------------
+    PLATFORM_COMMISSION_PCT: float = 20.0
+    PLATFORM_TDS_PCT: float = 0.0
+
+    # RazorpayX (payouts) — separate product from Razorpay payments above.
+    # Leave blank to keep payouts manual (admin marks them paid after an
+    # out-of-band bank transfer). When set, admin "process" attempts a real
+    # RazorpayX transfer to the nurse's fund account.
+    RAZORPAYX_ACCOUNT_NUMBER: str = ""
+
     # Cloudinary
     CLOUDINARY_CLOUD_NAME: str = ""
     CLOUDINARY_API_KEY: str = ""
@@ -83,10 +107,15 @@ class Settings(BaseSettings):
     ABHA_CLIENT_ID: str = ""
     ABHA_CLIENT_SECRET: str = ""
 
-    # Dyte (in-app voice/video calling)
+    # Cloudflare RealtimeKit (in-app voice calling) — replaces Dyte, now in
+    # maintenance mode after Cloudflare acquired it. The DYTE_* names remain as
+    # deprecated aliases so a pre-migration .env keeps working.
+    REALTIMEKIT_ORG_ID: str = ""
+    REALTIMEKIT_API_KEY: str = ""
+    REALTIMEKIT_BASE_URL: str = "https://api.realtime.cloudflare.com/v2"
     DYTE_ORG_ID: str = ""
     DYTE_API_KEY: str = ""
-    DYTE_BASE_URL: str = "https://api.dyte.io/v2"
+    DYTE_BASE_URL: str = ""
 
     # Web Push (VAPID) — best-effort background call ping for browser tabs.
     # NOTE: this does NOT wake a fully force-killed browser; only the native
@@ -115,20 +144,6 @@ class Settings(BaseSettings):
     # (TestFlight / App Store). A token minted for one is rejected by the
     # other, so this must match how the installed app was signed.
     APNS_USE_SANDBOX: bool = True
-
-
-    # Dyte (in-app voice/video calling)
-    DYTE_ORG_ID: str = ""
-    DYTE_API_KEY: str = ""
-    DYTE_BASE_URL: str = "https://api.dyte.io/v2"
-
-    # Web Push (VAPID) — best-effort background call ping for browser tabs.
-    # NOTE: this does NOT wake a fully force-killed app; see CallKit/PushKit
-    # notes in app/integrations/providers.py DyteClient docstring.
-    VAPID_PUBLIC_KEY: str = ""
-    VAPID_PRIVATE_KEY: str = ""
-    VAPID_SUBJECT: str = "mailto:support@nurseconnect.app"
-
 
     # Mocks
     MOCK_EXTERNAL_PROVIDERS: bool = True
