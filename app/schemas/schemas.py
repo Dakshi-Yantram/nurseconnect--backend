@@ -251,11 +251,20 @@ class WorkerProfileOut(ORMModel):
     years_of_experience: int
     languages_spoken: Optional[List[str]] = None
     specialisations: Optional[List[str]] = None
+    date_of_birth: Optional[date] = None
     registration_no: Optional[str] = None
     registration_authority: Optional[str] = None
     registration_valid_until: Optional[date] = None
+    home_address: Optional[str] = None
     base_city: Optional[str] = None
     service_radius_km: int
+    home_latitude: Optional[Decimal] = None
+    home_longitude: Optional[Decimal] = None
+    # Bank holder + IFSC are safe to echo back so the profile form can show
+    # what's on file. The account NUMBER is intentionally never returned —
+    # it's write-only, so the form shows a blank field to re-enter.
+    bank_account_holder: Optional[str] = None
+    bank_ifsc: Optional[str] = None
     rating_average: Decimal
     rating_count: int
     completed_visits_count: int

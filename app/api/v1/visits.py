@@ -493,6 +493,19 @@ async def checkout(
         coverage_summary = None
 
     await audit(db, profile.user_id, "worker", "visit.checkout", "visit", visit.id, {"duration_min": visit.actual_duration_minutes, "coverage": coverage_summary})
+
+    # Generate the nurse's payout for this completed visit. Idempotent, so a
+    # retried/replayed checkout never pays twice. A payout glitch must never
+    # block the nurse from completing the visit, so it's best-effort and logged.
+    try:
+        from app.services.payout_service import create_payout_for_booking
+        await create_payout_for_booking(db, booking)
+    except Exception as exc:  # noqa: BLE001
+        import logging as _logging
+        _logging.getLogger(__name__).warning(
+            "payout generation failed for booking %s: %s", booking.id, exc
+        )
+
     await db.commit()
     await db.refresh(visit)
     await manager.broadcast(booking_topic(booking_id), {"type": "visit.completed", "booking_id": str(booking_id), "coverage": coverage_summary})

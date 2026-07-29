@@ -571,6 +571,48 @@ async def my_earnings(profile: WorkerProfile = Depends(get_worker_profile), db: 
     }
 
 
+@router.get("/me/badges")
+async def my_badges(
+    profile: WorkerProfile = Depends(get_worker_profile),
+    db: AsyncSession = Depends(get_db),
+):
+    """Skill badges for the signed-in worker.
+
+    Badges are created elsewhere (tier badge on approval, assessment badge on
+    a passed assessment). This endpoint was missing entirely, so the nurse
+    dashboard's /workers/me/badges fetch always 404'd and showed "No badges
+    yet" — even for a worker who had genuinely passed an assessment.
+
+    Two guarantees enforced here:
+      * Everyone has at least their current-tier badge. If a worker never got
+        one (e.g. created before the tier-badge award existed, or self-signup
+        that skipped admin approval) it is granted on read, so the floor is
+        always Tier 1.
+      * Higher tiers show as higher badges automatically, because the tier
+        badge label is derived from WorkerProfile.tier, which admin raises as
+        the worker clears more assessments.
+    """
+    from app.models.models import WorkerBadge
+    from app.services.badges import award_tier_badge, serialize_badge
+
+    res = await db.execute(
+        select(WorkerBadge)
+        .where(WorkerBadge.worker_id == profile.id, WorkerBadge.revoked_at.is_(None))
+        .order_by(WorkerBadge.awarded_at.desc())
+    )
+    badges = list(res.scalars().all())
+
+    # Self-heal the tier-badge floor so every worker has a minimum Tier 1 badge.
+    has_tier_badge = any(b.source == "tier" for b in badges)
+    if not has_tier_badge:
+        awarded = await award_tier_badge(db, profile)
+        if awarded is not None:
+            await db.commit()
+            badges.insert(0, awarded)
+
+    return [serialize_badge(b) for b in badges]
+
+
 # ============================================================================
 # Patch 2 — Service eligibility + preference management
 # ============================================================================
@@ -924,6 +966,7 @@ async def request_service_qualification(
 
 
 class ServiceAreaRequest(BaseModel):
+    home_address: Optional[str] = None
     base_city: Optional[str] = None
     latitude: Optional[float] = None
     longitude: Optional[float] = None
@@ -936,6 +979,8 @@ async def set_service_area(
     profile: WorkerProfile = Depends(get_worker_profile),
     db: AsyncSession = Depends(get_db),
 ):
+    if payload.home_address is not None:
+        profile.home_address = payload.home_address.strip() or None
     if payload.base_city is not None:
         profile.base_city = payload.base_city.strip() or None
     if payload.latitude is not None and payload.longitude is not None:
@@ -945,6 +990,7 @@ async def set_service_area(
         profile.service_radius_km = max(1, min(int(payload.service_radius_km), 100))
     await db.commit()
     return {
+        "home_address": profile.home_address,
         "base_city": profile.base_city,
         "home_latitude": float(profile.home_latitude) if profile.home_latitude is not None else None,
         "home_longitude": float(profile.home_longitude) if profile.home_longitude is not None else None,
