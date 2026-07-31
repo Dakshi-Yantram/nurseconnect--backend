@@ -93,18 +93,7 @@ def _effective_risk(service: Optional[ServiceCatalogue], package: Optional[CareP
         return package.risk_level
     if service and service.risk_level:
         return service.risk_level
-    # No risk_level configured anywhere on the booking's package/service.
-    # This used to default to LOW, which silently skips the checklist/
-    # documentation requirement below (only MEDIUM+ enforces a template).
-    # That let any clinically unconfigured package — e.g. "Diabetes
-    # Management" with no risk_level and no template assigned — check out
-    # with zero vitals/notes and no warning, because the app had nothing
-    # to render. Defaulting to MEDIUM instead means an unconfigured
-    # service fails safe: it now requires a template (and 422s with
-    # CLINICAL_TEMPLATE_MISSING if none exists) instead of silently
-    # requiring nothing. Mark a service LOW explicitly in the catalogue
-    # if it genuinely has no clinical documentation needs.
-    return ServiceRiskLevel.MEDIUM
+    return ServiceRiskLevel.LOW
 
 
 async def resolve_workflow_for_booking(booking_id: UUID, db: AsyncSession) -> ResolvedWorkflow:
