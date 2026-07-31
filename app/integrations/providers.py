@@ -113,7 +113,11 @@ class CloudinaryClient:
         payload = b64_payload
         if not payload.startswith("data:") and not payload.startswith("http"):
             payload = f"data:application/octet-stream;base64,{payload}"
-        return cloudinary.uploader.upload(payload, folder=folder, resource_type=resource_type)
+        try:
+            return cloudinary.uploader.upload(payload, folder=folder, resource_type=resource_type)
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("Cloudinary upload failed")
+            raise ExternalProviderError("Document storage is temporarily unavailable") from exc
 
     async def delete(self, public_id: str) -> Dict[str, Any]:
         if self.mock:

@@ -16,6 +16,7 @@ from app.core.deps import (
     require_roles,
 )
 from app.integrations import cloudinary_client
+from app.integrations.providers import ExternalProviderError
 from app.models.enums import (
     UserRole,
     WorkerAvailability,
@@ -92,8 +93,16 @@ def _all_allowed_docs(profile) -> set:
 
 def _doc_catalogue(profile) -> list:
     req, opt = _required_docs(profile), _optional_docs(profile)
-    out = [{"type": t, "label": DOCUMENT_LABELS.get(t, t), "required": True} for t in sorted(req)]
-    out += [{"type": t, "label": DOCUMENT_LABELS.get(t, t), "required": False} for t in sorted(opt)]
+    # Keep both keys for app compatibility: older mobile builds read `type`,
+    # newer screens read `document_type`.
+    out = [
+        {"type": t, "document_type": t, "label": DOCUMENT_LABELS.get(t, t), "required": True}
+        for t in sorted(req)
+    ]
+    out += [
+        {"type": t, "document_type": t, "label": DOCUMENT_LABELS.get(t, t), "required": False}
+        for t in sorted(opt)
+    ]
     return out
 
 
@@ -442,11 +451,16 @@ async def upload_document_file(
             status_code=400,
             detail=f"Unsupported document type. Allowed: {sorted(_all_allowed_docs(profile))}",
         )
-    upload = await cloudinary_client.upload_base64(
-        payload.data_base64,
-        folder=f"nurseconnect/workers/{profile.id}",
-        resource_type="auto",
-    )
+    if not payload.data_base64.strip():
+        raise HTTPException(status_code=400, detail="No document file was attached")
+    try:
+        upload = await cloudinary_client.upload_base64(
+            payload.data_base64,
+            folder=f"nurseconnect/workers/{profile.id}",
+            resource_type="auto",
+        )
+    except ExternalProviderError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
     doc = WorkerDocument(
         worker_id=profile.id,
         document_type=payload.document_type,
