@@ -479,8 +479,11 @@ class RealtimeKitClient:
                 headers=self._headers(),
                 json={"title": title, "record_on_start": False},
             )
+            if resp.status_code >= 400:
+                logger.error("realtimekit create_meeting failed status=%s body=%s", resp.status_code, resp.text)
             resp.raise_for_status()
-            return resp.json()["result"]
+            body = resp.json()
+            return body.get("result") or body.get("data")
 
     async def add_participant(self, meeting_id: str, participant_name: str, participant_id: str, preset_name: str = "group_call_host") -> Dict[str, Any]:
         if self.mock:
@@ -498,8 +501,11 @@ class RealtimeKitClient:
                     "custom_participant_id": participant_id,
                 },
             )
+            if resp.status_code >= 400:
+                logger.error("realtimekit add_participant failed status=%s body=%s", resp.status_code, resp.text)
             resp.raise_for_status()
-            data = resp.json()["result"]
+            data = resp.json()
+            data = data.get("result") or data.get("data")
             # Normalise so callers can rely on `authToken` regardless of the
             # exact key the API returns (`token` on some responses).
             if "authToken" not in data and "token" in data:
