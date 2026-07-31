@@ -167,12 +167,16 @@ async def start_call(booking_id: UUID, current: CurrentUser = Depends(get_curren
         raise HTTPException(status_code=403, detail="Not a party to this booking")
 
     # Reuse an existing meeting for this booking if one was already created
-    # (e.g. redial), otherwise create a fresh Dyte meeting.
+    # (e.g. redial), otherwise create a fresh RealtimeKit meeting. A meeting
+    # ID created back when MOCK_EXTERNAL_PROVIDERS was true (prefixed
+    # "meeting_mock_") is not a real Cloudflare meeting and must not be
+    # reused once we're talking to the real API — Cloudflare will 400 on it.
     res = await db.execute(
         select(CallSession).where(CallSession.booking_id == booking.id).order_by(CallSession.created_at.desc()).limit(1)
     )
     prior = res.scalar_one_or_none()
-    if prior:
+    stale_mock_meeting = bool(prior) and prior.dyte_meeting_id.startswith("meeting_mock_") and not realtimekit_client.mock
+    if prior and not stale_mock_meeting:
         meeting_id = prior.dyte_meeting_id
     else:
         meeting = await realtimekit_client.create_meeting(title=f"NurseConnect booking {booking.booking_ref}")
