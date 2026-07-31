@@ -21,6 +21,10 @@ from app.core.config import settings
 logger = logging.getLogger(__name__)
 
 
+class ExternalProviderError(RuntimeError):
+    """Raised when an upstream provider is unavailable or rejects a request."""
+
+
 # ============================================================================
 # Razorpay
 # ============================================================================
@@ -467,50 +471,65 @@ class RealtimeKitClient:
     def _kit_url(self, path: str) -> str:
         return f"{self.base_url}/accounts/{self.account_id}/realtime/kit/{self.app_id}{path}"
 
+    async def _post(self, path: str, payload: Dict[str, Any], operation: str) -> Dict[str, Any]:
+        import httpx
+
+        try:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(15.0, connect=5.0)) as client:
+                resp = await client.post(
+                    self._kit_url(path),
+                    headers=self._headers(),
+                    json=payload,
+                )
+        except httpx.TimeoutException as exc:
+            logger.exception("realtimekit %s timed out", operation)
+            raise ExternalProviderError("RealtimeKit request timed out") from exc
+        except httpx.RequestError as exc:
+            logger.exception("realtimekit %s request failed", operation)
+            raise ExternalProviderError("RealtimeKit is unreachable") from exc
+
+        if resp.status_code >= 400:
+            logger.error("realtimekit %s failed status=%s body=%s", operation, resp.status_code, resp.text)
+            raise ExternalProviderError(f"RealtimeKit rejected {operation}")
+
+        body = resp.json()
+        data = body.get("result") or body.get("data") or body
+        if not isinstance(data, dict):
+            raise ExternalProviderError(f"RealtimeKit returned an invalid {operation} response")
+        return data
+
     async def create_meeting(self, title: str) -> Dict[str, Any]:
         if self.mock:
             meeting_id = f"meeting_mock_{uuid.uuid4().hex[:16]}"
             logger.info("MOCK realtimekit create_meeting title=%s -> %s", title, meeting_id)
             return {"id": meeting_id, "title": title, "status": "ACTIVE"}
-        import httpx
-        async with httpx.AsyncClient() as client:
-            resp = await client.post(
-                self._kit_url("/meetings"),
-                headers=self._headers(),
-                json={"title": title, "record_on_start": False},
-            )
-            if resp.status_code >= 400:
-                logger.error("realtimekit create_meeting failed status=%s body=%s", resp.status_code, resp.text)
-            resp.raise_for_status()
-            body = resp.json()
-            return body.get("result") or body.get("data")
+        return await self._post(
+            "/meetings",
+            {"title": title, "record_on_start": False},
+            "create_meeting",
+        )
 
     async def add_participant(self, meeting_id: str, participant_name: str, participant_id: str, preset_name: str = "group_call_host") -> Dict[str, Any]:
         if self.mock:
             auth_token = f"rtk_mock_token_{uuid.uuid4().hex}"
             logger.info("MOCK realtimekit add_participant meeting=%s participant=%s", meeting_id, participant_id)
             return {"token": auth_token, "authToken": auth_token, "id": participant_id}
-        import httpx
-        async with httpx.AsyncClient() as client:
-            resp = await client.post(
-                self._kit_url(f"/meetings/{meeting_id}/participants"),
-                headers=self._headers(),
-                json={
-                    "name": participant_name,
-                    "preset_name": preset_name,
-                    "custom_participant_id": participant_id,
-                },
-            )
-            if resp.status_code >= 400:
-                logger.error("realtimekit add_participant failed status=%s body=%s", resp.status_code, resp.text)
-            resp.raise_for_status()
-            data = resp.json()
-            data = data.get("result") or data.get("data")
-            # Normalise so callers can rely on `authToken` regardless of the
-            # exact key the API returns (`token` on some responses).
-            if "authToken" not in data and "token" in data:
-                data["authToken"] = data["token"]
-            return data
+        data = await self._post(
+            f"/meetings/{meeting_id}/participants",
+            {
+                "name": participant_name,
+                "preset_name": preset_name,
+                "custom_participant_id": participant_id,
+            },
+            "add_participant",
+        )
+        # Normalise so callers can rely on `authToken` regardless of the
+        # exact key the API returns (`token` on some responses).
+        if "authToken" not in data and "token" in data:
+            data["authToken"] = data["token"]
+        if not data.get("authToken"):
+            raise ExternalProviderError("RealtimeKit did not return an auth token")
+        return data
 
     async def deactivate_meeting(self, meeting_id: str) -> Dict[str, Any]:
         if self.mock:
