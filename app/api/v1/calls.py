@@ -198,7 +198,7 @@ async def start_call(booking_id: UUID, current: CurrentUser = Depends(get_curren
         call_session_id=call_session.id,
         dyte_meeting_id=meeting_id,
         dyte_auth_token=participant["authToken"],
-        dyte_org_id=realtimekit_client.org_id,
+        dyte_org_id=realtimekit_client.account_id,
     )
 
 
@@ -224,7 +224,7 @@ async def join_call(booking_id: UUID, call_session_id: UUID, current: CurrentUse
         call_session_id=call_session.id,
         dyte_meeting_id=call_session.dyte_meeting_id,
         dyte_auth_token=participant["authToken"],
-        dyte_org_id=realtimekit_client.org_id,
+        dyte_org_id=realtimekit_client.account_id,
     )
 
 

@@ -428,7 +428,16 @@ class ApnsVoipClient:
 # over base64(orgId:apiKey), same as before.
 # ============================================================================
 class RealtimeKitClient:
-    """Thin wrapper over the Cloudflare RealtimeKit REST API.
+    """Thin wrapper over the Cloudflare-native RealtimeKit REST API.
+
+    Cloudflare retired the old Dyte-style developer portal (org_id + api_key,
+    Basic auth, api.realtime.cloudflare.com/v2). RealtimeKit now lives under
+    the standard Cloudflare API, scoped to an account and a RealtimeKit "app":
+
+        https://api.cloudflare.com/client/v4/accounts/{account_id}/realtime/kit/{app_id}/...
+
+    authenticated with a Cloudflare API Token (Bearer) that has the
+    "Realtime / Realtime Admin" permission.
 
     Flow used by this app:
       1. create_meeting()  -> once per booking, when the call is first started
@@ -438,21 +447,25 @@ class RealtimeKitClient:
     """
 
     def __init__(self) -> None:
-        # Prefer REALTIMEKIT_*; fall back to the deprecated DYTE_* names so a
-        # pre-migration .env keeps working without edits.
-        self.org_id = settings.REALTIMEKIT_ORG_ID or settings.DYTE_ORG_ID
-        self.api_key = settings.REALTIMEKIT_API_KEY or settings.DYTE_API_KEY
-        self.base_url = (
-            settings.REALTIMEKIT_BASE_URL
-            or settings.DYTE_BASE_URL
-            or "https://api.realtime.cloudflare.com/v2"
+        self.account_id = settings.REALTIMEKIT_ACCOUNT_ID
+        self.app_id = settings.REALTIMEKIT_APP_ID
+        self.api_token = settings.REALTIMEKIT_API_TOKEN
+        self.base_url = settings.REALTIMEKIT_BASE_URL or "https://api.cloudflare.com/client/v4"
+        self.mock = (
+            settings.MOCK_EXTERNAL_PROVIDERS
+            or not self.account_id
+            or not self.app_id
+            or not self.api_token
         )
-        self.mock = settings.MOCK_EXTERNAL_PROVIDERS or not self.api_key or not self.org_id
 
-    def _auth_header(self) -> str:
-        import base64
-        token = base64.b64encode(f"{self.org_id}:{self.api_key}".encode()).decode()
-        return f"Basic {token}"
+    def _headers(self) -> Dict[str, str]:
+        return {
+            "Authorization": f"Bearer {self.api_token}",
+            "Content-Type": "application/json",
+        }
+
+    def _kit_url(self, path: str) -> str:
+        return f"{self.base_url}/accounts/{self.account_id}/realtime/kit/{self.app_id}{path}"
 
     async def create_meeting(self, title: str) -> Dict[str, Any]:
         if self.mock:
@@ -462,12 +475,12 @@ class RealtimeKitClient:
         import httpx
         async with httpx.AsyncClient() as client:
             resp = await client.post(
-                f"{self.base_url}/meetings",
-                headers={"Authorization": self._auth_header()},
+                self._kit_url("/meetings"),
+                headers=self._headers(),
                 json={"title": title, "record_on_start": False},
             )
             resp.raise_for_status()
-            return resp.json()["data"]
+            return resp.json()["result"]
 
     async def add_participant(self, meeting_id: str, participant_name: str, participant_id: str, preset_name: str = "group_call_host") -> Dict[str, Any]:
         if self.mock:
@@ -477,8 +490,8 @@ class RealtimeKitClient:
         import httpx
         async with httpx.AsyncClient() as client:
             resp = await client.post(
-                f"{self.base_url}/meetings/{meeting_id}/participants",
-                headers={"Authorization": self._auth_header()},
+                self._kit_url(f"/meetings/{meeting_id}/participants"),
+                headers=self._headers(),
                 json={
                     "name": participant_name,
                     "preset_name": preset_name,
@@ -486,9 +499,9 @@ class RealtimeKitClient:
                 },
             )
             resp.raise_for_status()
-            data = resp.json()["data"]
-            # RealtimeKit returns the token as `token`; older Dyte responses
-            # used `authToken`. Normalise so callers can rely on both keys.
+            data = resp.json()["result"]
+            # Normalise so callers can rely on `authToken` regardless of the
+            # exact key the API returns (`token` on some responses).
             if "authToken" not in data and "token" in data:
                 data["authToken"] = data["token"]
             return data
@@ -500,8 +513,8 @@ class RealtimeKitClient:
         import httpx
         async with httpx.AsyncClient() as client:
             resp = await client.delete(
-                f"{self.base_url}/meetings/{meeting_id}",
-                headers={"Authorization": self._auth_header()},
+                self._kit_url(f"/meetings/{meeting_id}"),
+                headers=self._headers(),
             )
             resp.raise_for_status()
             return {"id": meeting_id, "status": "INACTIVE"}

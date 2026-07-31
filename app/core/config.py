@@ -107,12 +107,23 @@ class Settings(BaseSettings):
     ABHA_CLIENT_ID: str = ""
     ABHA_CLIENT_SECRET: str = ""
 
-    # Cloudflare RealtimeKit (in-app voice calling) — replaces Dyte, now in
-    # maintenance mode after Cloudflare acquired it. The DYTE_* names remain as
-    # deprecated aliases so a pre-migration .env keeps working.
+    # Cloudflare RealtimeKit (in-app voice calling) — replaces Dyte.
+    #
+    # As of the Cloudflare-native integration, the old Dyte-style
+    # "org_id : api_key" Basic-auth scheme against api.realtime.cloudflare.com/v2
+    # no longer applies to new accounts (that developer portal has been
+    # retired). RealtimeKit now lives under the standard Cloudflare API:
+    #   https://api.cloudflare.com/client/v4/accounts/{account_id}/realtime/kit/{app_id}/...
+    # authenticated with a Cloudflare API Token (Bearer), scoped to the
+    # "Realtime / Realtime Admin" permission.
+    REALTIMEKIT_ACCOUNT_ID: str = ""
+    REALTIMEKIT_APP_ID: str = ""
+    REALTIMEKIT_API_TOKEN: str = ""
+    REALTIMEKIT_BASE_URL: str = "https://api.cloudflare.com/client/v4"
+    # Deprecated Dyte-era fields — kept only so a pre-migration .env doesn't
+    # crash on load. No longer read by RealtimeKitClient.
     REALTIMEKIT_ORG_ID: str = ""
     REALTIMEKIT_API_KEY: str = ""
-    REALTIMEKIT_BASE_URL: str = "https://api.realtime.cloudflare.com/v2"
     DYTE_ORG_ID: str = ""
     DYTE_API_KEY: str = ""
     DYTE_BASE_URL: str = ""
