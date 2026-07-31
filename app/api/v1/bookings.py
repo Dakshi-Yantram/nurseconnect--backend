@@ -46,10 +46,11 @@ from app.schemas.schemas import (
     BookingCreate,
     BookingOut,
     EscalationCreateRequest,
+    SOSCreateRequest,
 )
 from app.services.clinical_engine import compute_sla_breach, get_escalation_metadata
-from app.services.common_services import audit, notify_parties, send_notification
-from app.websockets.manager import booking_topic, manager
+from app.services.common_services import audit, notify_admins, notify_parties, send_notification
+from app.websockets.manager import booking_topic, manager, user_topic
 
 router = APIRouter(prefix="/bookings", tags=["bookings"])
 
@@ -882,3 +883,121 @@ async def escalate_booking(
     await db.commit()
     await manager.broadcast(booking_topic(b.id), {"type": "escalation.created", "level": payload.level.value, "escalation_id": str(esc.id)})
     return {"id": str(esc.id), "level": esc.level.value, "status": esc.status.value, "sla_breach_at": esc.sla_breach_at.isoformat() if esc.sla_breach_at else None}
+
+
+@router.post("/{booking_id}/sos")
+async def trigger_sos(
+    booking_id: UUID,
+    payload: SOSCreateRequest,
+    current: CurrentUser = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Personal-safety panic button.
+
+    Either the consumer or the assigned worker on a booking can fire this
+    when they feel unsafe — e.g. a worker fears the customer, or a customer
+    fears the worker. Unlike /escalate (clinical, worker-only), this is
+    identity-agnostic and always treated as the highest severity: it opens
+    an `emergency` Escalation with a short SLA and auto_call_112 set, and
+    alerts admins immediately (in-app + a live WebSocket push), without
+    ever notifying the other party on the booking — the point is to get the
+    person who's scared to safety quietly, not to alert who they're scared of.
+    """
+    res = await db.execute(select(Booking).where(Booking.id == booking_id))
+    b = res.scalar_one_or_none()
+    if not b:
+        raise HTTPException(status_code=404, detail="Booking not found")
+
+    # Caller must be a party to this booking (the consumer or the assigned
+    # worker) — admins can also trigger it on someone's behalf if needed.
+    triggered_by_role: str
+    if current.role == UserRole.consumer:
+        cres = await db.execute(select(ConsumerProfile).where(ConsumerProfile.user_id == current.id))
+        cp = cres.scalar_one_or_none()
+        if not cp or cp.id != b.consumer_id:
+            raise HTTPException(status_code=403, detail="Not a party to this booking")
+        triggered_by_role = "consumer"
+    elif current.role == UserRole.worker:
+        wres = await db.execute(select(WorkerProfile).where(WorkerProfile.user_id == current.id))
+        wp = wres.scalar_one_or_none()
+        if not wp or wp.id != b.worker_id:
+            raise HTTPException(status_code=403, detail="Not a party to this booking")
+        triggered_by_role = "worker"
+    elif is_admin(current.role):
+        triggered_by_role = "admin"
+    else:
+        raise HTTPException(status_code=403, detail="Not authorized")
+
+    if not b.worker_id:
+        raise HTTPException(status_code=400, detail="No nurse assigned to this booking yet")
+
+    vres = await db.execute(select(VisitRecord).where(VisitRecord.booking_id == b.id))
+    visit = vres.scalar_one_or_none()
+
+    esc = Escalation(
+        booking_id=b.id,
+        visit_record_id=visit.id if visit else None,
+        worker_id=b.worker_id,
+        patient_id=b.patient_id,
+        level=EscalationLevel.emergency,
+        status=EscalationStatus.open,
+        trigger_type="safety_sos",
+        trigger_details={
+            "triggered_by_role": triggered_by_role,
+            "triggered_by_user_id": str(current.id),
+            "latitude": payload.latitude,
+            "longitude": payload.longitude,
+        },
+        notes=payload.notes or f"Safety SOS raised by {triggered_by_role}.",
+        notified_parties=["ops", "admin"],
+        sla_minutes=5,
+        sla_breach_at=compute_sla_breach(5),
+        auto_call_112=True,
+        priority="critical",
+    )
+    db.add(esc)
+    if visit:
+        visit.escalation_triggered = True
+    await audit(
+        db, current.id, current.role.value, "escalation.sos", "escalation", esc.id,
+        {"booking_id": str(b.id), "triggered_by_role": triggered_by_role},
+    )
+    await db.commit()
+    await db.refresh(esc)
+
+    # Notify admins — in-app/push, AND a live WebSocket push to each admin's
+    # existing /ws/user connection so it lands instantly rather than waiting
+    # on the support dashboard's poll interval.
+    admin_ids = await notify_admins(
+        db,
+        template_code="sos_alert",
+        title="🆘 Safety SOS triggered",
+        body=payload.notes or f"A {triggered_by_role} raised a safety SOS on booking {b.booking_ref}.",
+        context={"booking_id": str(b.id), "escalation_id": str(esc.id)},
+    )
+    await db.commit()
+
+    sos_event = {
+        "type": "sos.alert",
+        "escalation_id": str(esc.id),
+        "booking_id": str(b.id),
+        "booking_ref": b.booking_ref,
+        "triggered_by_role": triggered_by_role,
+        "latitude": payload.latitude,
+        "longitude": payload.longitude,
+        "notes": esc.notes,
+        "created_at": esc.created_at.isoformat() if esc.created_at else None,
+    }
+    for admin_id in admin_ids:
+        await manager.broadcast(user_topic(admin_id), sos_event)
+    # Also drop it on the booking's own channel in case anyone (e.g. an
+    # admin already viewing that specific booking) is subscribed there.
+    await manager.broadcast(booking_topic(b.id), {"type": "escalation.created", "level": "emergency", "escalation_id": str(esc.id)})
+
+    return {
+        "id": str(esc.id),
+        "level": esc.level.value,
+        "status": esc.status.value,
+        "auto_call_112": esc.auto_call_112,
+        "sla_breach_at": esc.sla_breach_at.isoformat() if esc.sla_breach_at else None,
+    }

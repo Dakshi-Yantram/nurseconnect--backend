@@ -559,6 +559,16 @@ class EscalationCreateRequest(BaseModel):
     trigger_details: Optional[Dict[str, Any]] = None
 
 
+class SOSCreateRequest(BaseModel):
+    """Personal-safety panic button — either party on a booking can fire this
+    when they feel unsafe (e.g. worker fears the customer, or customer fears
+    the worker). Deliberately minimal: in a real emergency people won't want
+    to fill out a form. Everything is optional except a way to locate them."""
+    notes: Optional[str] = None
+    latitude: Optional[float] = None
+    longitude: Optional[float] = None
+
+
 class EscalationResolveRequest(BaseModel):
     resolution_notes: str
 
