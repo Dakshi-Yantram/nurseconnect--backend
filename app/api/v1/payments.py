@@ -1,6 +1,7 @@
 """Payments: Razorpay order creation, signature verification, webhook, history, refunds."""
 import json
 import logging
+from datetime import datetime, timezone
 from decimal import Decimal
 from typing import List
 from uuid import UUID
@@ -125,6 +126,8 @@ async def verify_payment(
         booking.razorpay_payment_id = payload.razorpay_payment_id
         booking.payment_status = PaymentStatus.captured
         booking.status = BookingStatus.confirmed
+        if booking.dispatch_started_at is None:
+            booking.dispatch_started_at = datetime.now(timezone.utc)
         await db.commit()
         return {
             "verified": True,
@@ -136,6 +139,10 @@ async def verify_payment(
     booking.razorpay_payment_id = payload.razorpay_payment_id
     booking.payment_status = PaymentStatus.captured
     booking.status = BookingStatus.confirmed
+    # Start the dispatch wave clock now — workers only see the booking from
+    # this moment, so waves must not count time spent on the payment screen.
+    if booking.dispatch_started_at is None:
+        booking.dispatch_started_at = datetime.now(timezone.utc)
     # Ledger: payment_collected, commission_retained
     # The post_ledger_entry calls below issue db.flush(), which is where the
     # partial unique index ux_financial_ledger_payment_collected_per_pid
@@ -262,6 +269,8 @@ async def razorpay_webhook(request: Request, x_razorpay_signature: str = Header(
             b.payment_status = PaymentStatus.captured
             b.razorpay_payment_id = razorpay_payment_id
             b.status = BookingStatus.confirmed
+            if b.dispatch_started_at is None:
+                b.dispatch_started_at = datetime.now(timezone.utc)
             # post_ledger_entry flushes immediately; wrap to catch the partial
             # unique-index violation when /verify won the race.
             try:
@@ -347,10 +356,25 @@ async def issue_refund(
                     "current_id": str(current.id),
                 },
             )
-
-
-
-
+        # A consumer-initiated refund IS the "cancel booking" action (the UI
+        # button is literally "Cancel booking & request refund"), so the same
+        # cancellation policy applies: not allowed inside the 6-hour window
+        # before the scheduled visit. Admin refunds stay exempt for support.
+        from app.api.v1.bookings import _CANCELLATION_CUTOFF_HOURS, _scheduled_start_utc
+        if b.status not in (BookingStatus.completed, BookingStatus.cancelled):
+            now = datetime.now(timezone.utc)
+            if now > _scheduled_start_utc(b) - timedelta(hours=_CANCELLATION_CUTOFF_HOURS):
+                raise HTTPException(
+                    status_code=403,
+                    detail={
+                        "success": False,
+                        "code": "CANCELLATION_WINDOW_CLOSED",
+                        "message": (
+                            f"Cancellations are only allowed up to {_CANCELLATION_CUTOFF_HOURS} hours "
+                            "before the scheduled visit. Please contact support for help."
+                        ),
+                    },
+                )
 
     if b.payment_status not in {PaymentStatus.captured, PaymentStatus.partially_refunded}:
         raise HTTPException(status_code=400, detail="Booking is not in a refundable payment state")
@@ -374,6 +398,14 @@ async def issue_refund(
         created_by=current.id,
         is_system_entry=False,
     )
+    # A consumer refund cancels the booking itself — previously only the
+    # money moved and the booking stayed live, so a nurse could still be
+    # dispatched to (or show up for) a visit the customer had "cancelled".
+    if not is_staff and b.status not in (BookingStatus.completed, BookingStatus.cancelled):
+        b.status = BookingStatus.cancelled
+        b.cancelled_by = current.id
+        b.cancelled_at = datetime.now(timezone.utc)
+        b.cancellation_reason = reason or "Consumer cancelled with refund"
     await audit(db, current.id, current.role.value, "payment.refund", "booking", b.id, {"amount": amount, "reason": reason})
     await db.commit()
     return {"refund_id": refund.get("id"), "status": refund.get("status"), "amount": amount}

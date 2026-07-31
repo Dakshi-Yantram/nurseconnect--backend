@@ -8,7 +8,10 @@ import sys
 from decimal import Decimal
 
 from app.core.database import AsyncSessionLocal, engine, Base
-from app.models.models import ServiceCatalogue, CarePackage, TrainingModule, AssessmentModule, Faq
+from app.models.models import (
+    ServiceCatalogue, CarePackage, TrainingModule, AssessmentModule, Faq,
+    ChecklistTemplate,
+)
 from app.models.enums import (
     ServiceCategory,
     WorkerTier,
@@ -16,6 +19,7 @@ from app.models.enums import (
     ContentStatus,
     GenderRestriction,
     VisitFrequency,
+    ChecklistPhase,
 )
 from sqlalchemy import select
 
@@ -266,6 +270,205 @@ async def link_package_services(session) -> int:
         package.included_service_ids = resolved_ids
         linked += 1
         print(f"  + linked package {package_code} -> {service_codes}")
+    return linked
+
+
+# ---------------------------------------------------------------------------
+# In-visit questionnaires (ChecklistTemplate) — previously missing entirely,
+# which left the nurse's in-visit questionnaire screen blank for every
+# service/package. Seeded here + linked onto the matching ServiceCatalogue
+# rows via link_service_checklists() below, which (unlike seed_services)
+# updates already-existing rows so this works on a DB that was seeded
+# before this fix shipped.
+# ---------------------------------------------------------------------------
+CHECKLIST_TEMPLATES = [
+    dict(
+        code="CHK-WOUND-DRESSING-V1",
+        name="Wound Dressing — Visit Questionnaire",
+        service_codes=["WOUND_DRESSING"],
+        # Post-op recovery visits also involve wound checks, so reuse this
+        # checklist for that package until/unless a dedicated post-op
+        # checklist is created.
+        package_codes=["POST_OP_7D"],
+        phase=ChecklistPhase.during_visit,
+        questions=[
+            {
+                "id": "wound_photo_captured",
+                "type": "photo",
+                "text": "Photo of the wound before dressing",
+                "required": True,
+                "phase": "during_visit",
+            },
+            {
+                "id": "wound_condition",
+                "type": "single_select",
+                "text": "Current wound condition",
+                "options": ["Healing well", "No change", "Signs of infection", "Worsening"],
+                "required": True,
+                "phase": "during_visit",
+            },
+            {
+                "id": "pain_level",
+                "type": "number",
+                "text": "Patient-reported pain level (0–10)",
+                "required": True,
+                "phase": "during_visit",
+            },
+            {
+                "id": "dressing_type_used",
+                "type": "text",
+                "text": "Dressing material used",
+                "required": True,
+                "phase": "during_visit",
+            },
+            {
+                "id": "signs_of_infection_notes",
+                "type": "textarea",
+                "text": "Notes on any signs of infection (redness, discharge, odour, swelling)",
+                "required": False,
+                "phase": "during_visit",
+            },
+            {
+                "id": "photo_after_dressing",
+                "type": "photo",
+                "text": "Photo of the wound after fresh dressing applied",
+                "required": True,
+                "phase": "post_visit",
+            },
+            {
+                "id": "patient_consent",
+                "type": "consent_confirmation",
+                "text": "Patient/family consented to the procedure and photos",
+                "required": True,
+                "phase": "pre_visit",
+            },
+        ],
+    ),
+    dict(
+        code="CHK-VITALS-CHECK-V1",
+        name="Vitals Monitoring — Visit Questionnaire",
+        service_codes=["VITALS_CHECK"],
+        phase=ChecklistPhase.during_visit,
+        questions=[
+            {
+                "id": "vitals_reading",
+                "type": "vitals_entry",
+                "text": "Record vitals (BP, pulse, SpO2, temperature, blood sugar)",
+                "required": True,
+                "phase": "during_visit",
+            },
+            {
+                "id": "vitals_notes",
+                "type": "textarea",
+                "text": "Any observations to flag for the care team",
+                "required": False,
+                "phase": "during_visit",
+            },
+            {
+                "id": "patient_consent",
+                "type": "consent_confirmation",
+                "text": "Patient/family consented to the check",
+                "required": True,
+                "phase": "pre_visit",
+            },
+        ],
+    ),
+]
+
+
+async def seed_checklist_templates(session) -> int:
+    """Create the ChecklistTemplate rows themselves (idempotent by code)."""
+    created = 0
+    for data in CHECKLIST_TEMPLATES:
+        exists = await session.execute(
+            select(ChecklistTemplate).where(ChecklistTemplate.code == data["code"])
+        )
+        if exists.scalar_one_or_none():
+            print(f"  · checklist template {data['code']} already exists, skipping")
+            continue
+        session.add(ChecklistTemplate(
+            code=data["code"],
+            name=data["name"],
+            service_codes=data["service_codes"],
+            phase=data["phase"],
+            version=1,
+            is_active=True,
+            status=ContentStatus.published,
+            questions=data["questions"],
+        ))
+        created += 1
+        print(f"  + created checklist template {data['code']}")
+    return created
+
+
+async def link_service_checklists(session) -> int:
+    """Point ServiceCatalogue.checklist_template_id at the matching template.
+
+    Unlike seed_services(), this DOES touch already-existing service rows —
+    that's the whole point, since production already has WOUND_DRESSING /
+    VITALS_CHECK seeded from before this fix existed. Never overwrites a
+    checklist_template_id an admin already set some other way.
+    """
+    linked = 0
+    for data in CHECKLIST_TEMPLATES:
+        tres = await session.execute(
+            select(ChecklistTemplate).where(ChecklistTemplate.code == data["code"])
+        )
+        template = tres.scalar_one_or_none()
+        if not template:
+            continue
+        for service_code in data["service_codes"]:
+            sres = await session.execute(
+                select(ServiceCatalogue).where(ServiceCatalogue.service_code == service_code)
+            )
+            service = sres.scalar_one_or_none()
+            if not service:
+                print(f"  ! service {service_code} not found — cannot link checklist {data['code']}")
+                continue
+            if service.checklist_template_id:
+                print(f"  · service {service_code} already has a checklist template linked, skipping")
+                continue
+            service.checklist_template_id = template.id
+            linked += 1
+            print(f"  + linked service {service_code} -> checklist {data['code']}")
+    return linked
+
+
+async def link_package_checklists(session) -> int:
+    """Point CarePackage.checklist_template_id at the matching template.
+
+    Mirrors link_service_checklists() but for care packages. Packages route
+    through their own checklist_template_id independently of any service
+    they're built on top of (see resolve_workflow_for_booking), so a
+    package's questionnaire has to be linked here explicitly — it is NOT
+    inherited from its primary_service automatically. Never overwrites a
+    checklist_template_id an admin already set some other way.
+    """
+    linked = 0
+    for data in CHECKLIST_TEMPLATES:
+        package_codes = data.get("package_codes") or []
+        if not package_codes:
+            continue
+        tres = await session.execute(
+            select(ChecklistTemplate).where(ChecklistTemplate.code == data["code"])
+        )
+        template = tres.scalar_one_or_none()
+        if not template:
+            continue
+        for package_code in package_codes:
+            pres = await session.execute(
+                select(CarePackage).where(CarePackage.package_code == package_code)
+            )
+            package = pres.scalar_one_or_none()
+            if not package:
+                print(f"  ! package {package_code} not found — cannot link checklist {data['code']}")
+                continue
+            if package.checklist_template_id:
+                print(f"  · package {package_code} already has a checklist template linked, skipping")
+                continue
+            package.checklist_template_id = template.id
+            linked += 1
+            print(f"  + linked package {package_code} -> checklist {data['code']}")
     return linked
 
 
@@ -832,9 +1035,30 @@ async def seed_faqs(session) -> int:
     return created
 
 
+async def _run_pending_column_migrations():
+    """Small, safe, idempotent ALTER TABLE fixes that must run before the app
+    serves traffic. Each statement uses IF NOT EXISTS / WHERE-guarded UPDATE,
+    so re-running on every startup is harmless."""
+    from sqlalchemy import text
+
+    async with engine.begin() as conn:
+        await conn.execute(text(
+            "ALTER TABLE bookings ADD COLUMN IF NOT EXISTS dispatch_started_at TIMESTAMPTZ NULL"
+        ))
+        await conn.execute(text(
+            "UPDATE bookings SET dispatch_started_at = created_at "
+            "WHERE dispatch_started_at IS NULL AND status NOT IN ('draft', 'pending_payment')"
+        ))
+    print("Column migrations: bookings.dispatch_started_at ensured")
+
+
 async def main():
     print("NurseConnect seed runner")
     print("=" * 50)
+
+    print("\nRunning pending column migrations...")
+    await _run_pending_column_migrations()
+
     async with AsyncSessionLocal() as session:
         print("\nSeeding services...")
         services_created = await seed_services(session)
@@ -848,11 +1072,28 @@ async def main():
         print("\nSeeding FAQs...")
         faqs_created = await seed_faqs(session)
 
+        print("\nSeeding in-visit questionnaires (checklist templates)...")
+        checklists_created = await seed_checklist_templates(session)
+
+        print("\nLinking checklist templates onto services...")
+        checklists_linked = await link_service_checklists(session)
+
+        print("\nLinking checklist templates onto care packages...")
+        checklists_linked += await link_package_checklists(session)
+
         await session.commit()
 
     print("\n" + "=" * 50)
-    print(f"Done. {services_created} services, {packages_created} packages, {training_created} training modules, {faqs_created} FAQs created.")
-    if services_created == 0 and packages_created == 0 and training_created == 0 and faqs_created == 0:
+    print(
+        f"Done. {services_created} services, {packages_created} packages, "
+        f"{training_created} training modules, {faqs_created} FAQs, "
+        f"{checklists_created} checklist templates created, "
+        f"{checklists_linked} service-checklist links created."
+    )
+    if (
+        services_created == 0 and packages_created == 0 and training_created == 0
+        and faqs_created == 0 and checklists_created == 0 and checklists_linked == 0
+    ):
         print("(Everything already existed — database was already seeded.)")
 
     await engine.dispose()

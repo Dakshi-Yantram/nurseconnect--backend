@@ -571,6 +571,48 @@ async def my_earnings(profile: WorkerProfile = Depends(get_worker_profile), db: 
     }
 
 
+@router.get("/me/badges")
+async def my_badges(
+    profile: WorkerProfile = Depends(get_worker_profile),
+    db: AsyncSession = Depends(get_db),
+):
+    """Skill badges for the signed-in worker.
+
+    Badges are created elsewhere (tier badge on approval, assessment badge on
+    a passed assessment). This endpoint was missing entirely, so the nurse
+    dashboard's /workers/me/badges fetch always 404'd and showed "No badges
+    yet" — even for a worker who had genuinely passed an assessment.
+
+    Two guarantees enforced here:
+      * Everyone has at least their current-tier badge. If a worker never got
+        one (e.g. created before the tier-badge award existed, or self-signup
+        that skipped admin approval) it is granted on read, so the floor is
+        always Tier 1.
+      * Higher tiers show as higher badges automatically, because the tier
+        badge label is derived from WorkerProfile.tier, which admin raises as
+        the worker clears more assessments.
+    """
+    from app.models.models import WorkerBadge
+    from app.services.badges import award_tier_badge, serialize_badge
+
+    res = await db.execute(
+        select(WorkerBadge)
+        .where(WorkerBadge.worker_id == profile.id, WorkerBadge.revoked_at.is_(None))
+        .order_by(WorkerBadge.awarded_at.desc())
+    )
+    badges = list(res.scalars().all())
+
+    # Self-heal the tier-badge floor so every worker has a minimum Tier 1 badge.
+    has_tier_badge = any(b.source == "tier" for b in badges)
+    if not has_tier_badge:
+        awarded = await award_tier_badge(db, profile)
+        if awarded is not None:
+            await db.commit()
+            badges.insert(0, awarded)
+
+    return [serialize_badge(b) for b in badges]
+
+
 # ============================================================================
 # Patch 2 — Service eligibility + preference management
 # ============================================================================
@@ -609,14 +651,26 @@ async def my_service_eligibility(
     profile: WorkerProfile = Depends(get_worker_profile),
     db: AsyncSession = Depends(get_db),
 ):
-    """List every active care package (admin-managed, no standalone
-    services) with the worker's current qualification + preference status
-    and whether they may opt in. No price is ever included here — nurses
-    see packages purely as opt-in offerings gated by training/assessments."""
+    """List every active care package AND standalone service (admin-managed)
+    with the worker's current qualification + preference status and whether
+    they may opt in. No price is ever included here — nurses see offerings
+    purely as opt-in items gated by training/assessments.
+
+    BUGFIX: this used to only return CarePackage rows, so standalone
+    micro-visit services (Wound Dressing, Injection, Vitals Monitoring,
+    etc.) never appeared here and workers had no way to opt in to them —
+    even though the PUT /me/service-preferences endpoint already fully
+    supported target_type="service". Booking dispatch (new-requests) filters
+    on opt-in for both services and packages, so without this fix standalone
+    services could never be surfaced to any worker.
+    """
     items: List[ServiceEligibilityItem] = []
 
     pres = await db.execute(select(CarePackage).where(CarePackage.is_active.is_(True)))
     packages = list(pres.scalars().all())
+
+    sres = await db.execute(select(ServiceCatalogue).where(ServiceCatalogue.is_active.is_(True)))
+    services = list(sres.scalars().all())
 
     # Pre-fetch qualifications & preferences for this worker (single-pass).
     qres = await db.execute(
@@ -624,22 +678,61 @@ async def my_service_eligibility(
             WorkerServiceQualification.worker_id == profile.id
         )
     )
-    qmap_pkg = {q.package_id: q for q in qres.scalars().all() if q.package_id is not None}
+    all_quals = list(qres.scalars().all())
+    qmap_pkg = {q.package_id: q for q in all_quals if q.package_id is not None}
+    qmap_svc = {q.service_id: q for q in all_quals if q.service_id is not None}
 
     prres = await db.execute(
         select(WorkerServicePreference).where(
             WorkerServicePreference.worker_id == profile.id
         )
     )
-    pmap_pkg = {p.package_id: p for p in prres.scalars().all() if p.package_id is not None}
+    all_prefs = list(prres.scalars().all())
+    pmap_pkg = {p.package_id: p for p in all_prefs if p.package_id is not None}
+    pmap_svc = {p.service_id: p for p in all_prefs if p.service_id is not None}
+
+    for svc in services:
+        q = qmap_svc.get(svc.id)
+        p = pmap_svc.get(svc.id)
+        q_status = q.qualification_status.value if q else WorkerQualificationStatus.NOT_QUALIFIED.value
+        q_source = q.qualification_source.value if (q and q.qualification_source) else None
+        # An absent preference row means "not yet chosen", and dispatch treats
+        # that as opted-in (see is_worker_opted_in_for_service). Report the
+        # same default here — otherwise this screen tells a nurse they are
+        # opted out of work they are in fact being offered.
+        p_status = p.preference_status.value if p else WorkerPreferenceStatus.OPTED_IN.value
+        willing = bool(p.willing_to_accept) if p else True
+
+        qualified, locked_reason = await is_worker_qualified_for_service(profile, svc, db)
+
+        items.append(ServiceEligibilityItem(
+            target_type="service",
+            id=svc.id,
+            code=svc.service_code,
+            name=svc.name,
+            category=svc.category.value if svc.category else None,
+            min_tier=svc.min_tier.value if svc.min_tier else None,
+            risk_level=svc.risk_level.value if getattr(svc, "risk_level", None) else None,
+            qualification_status=q_status,
+            qualification_source=q_source,
+            preference_status=p_status,
+            willing_to_accept=willing,
+            can_opt_in=qualified,
+            locked_reason=None if qualified else locked_reason,
+            requires_admin_skill_approval=bool(getattr(svc, "requires_admin_skill_approval", False)),
+        ))
 
     for pkg in packages:
         q = qmap_pkg.get(pkg.id)
         p = pmap_pkg.get(pkg.id)
         q_status = q.qualification_status.value if q else WorkerQualificationStatus.NOT_QUALIFIED.value
         q_source = q.qualification_source.value if (q and q.qualification_source) else None
-        p_status = p.preference_status.value if p else WorkerPreferenceStatus.OPTED_OUT.value
-        willing = bool(p.willing_to_accept) if p else False
+        # An absent preference row means "not yet chosen", and dispatch treats
+        # that as opted-in (see is_worker_opted_in_for_service). Report the
+        # same default here — otherwise this screen tells a nurse they are
+        # opted out of work they are in fact being offered.
+        p_status = p.preference_status.value if p else WorkerPreferenceStatus.OPTED_IN.value
+        willing = bool(p.willing_to_accept) if p else True
 
         qualified, locked_reason = await is_worker_qualified_for_service(profile, pkg, db)
 
@@ -873,6 +966,7 @@ async def request_service_qualification(
 
 
 class ServiceAreaRequest(BaseModel):
+    home_address: Optional[str] = None
     base_city: Optional[str] = None
     latitude: Optional[float] = None
     longitude: Optional[float] = None
@@ -885,6 +979,8 @@ async def set_service_area(
     profile: WorkerProfile = Depends(get_worker_profile),
     db: AsyncSession = Depends(get_db),
 ):
+    if payload.home_address is not None:
+        profile.home_address = payload.home_address.strip() or None
     if payload.base_city is not None:
         profile.base_city = payload.base_city.strip() or None
     if payload.latitude is not None and payload.longitude is not None:
@@ -894,6 +990,7 @@ async def set_service_area(
         profile.service_radius_km = max(1, min(int(payload.service_radius_km), 100))
     await db.commit()
     return {
+        "home_address": profile.home_address,
         "base_city": profile.base_city,
         "home_latitude": float(profile.home_latitude) if profile.home_latitude is not None else None,
         "home_longitude": float(profile.home_longitude) if profile.home_longitude is not None else None,
