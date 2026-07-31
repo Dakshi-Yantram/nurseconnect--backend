@@ -37,7 +37,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.config import settings
 from app.core.database import get_db
 from app.core.deps import CurrentUser, get_current_user
-from app.integrations.providers import apns_voip_client, realtimekit_client, firebase_push_client
+from app.integrations.providers import ExternalProviderError, apns_voip_client, realtimekit_client, firebase_push_client
 from app.models.enums import UserRole
 from app.models.models import (
     Booking,
@@ -176,11 +176,14 @@ async def start_call(booking_id: UUID, current: CurrentUser = Depends(get_curren
     )
     prior = res.scalar_one_or_none()
     stale_mock_meeting = bool(prior) and prior.dyte_meeting_id.startswith("meeting_mock_") and not realtimekit_client.mock
-    if prior and not stale_mock_meeting:
-        meeting_id = prior.dyte_meeting_id
-    else:
-        meeting = await realtimekit_client.create_meeting(title=f"NurseConnect booking {booking.booking_ref}")
-        meeting_id = meeting["id"]
+    try:
+        if prior and not stale_mock_meeting:
+            meeting_id = prior.dyte_meeting_id
+        else:
+            meeting = await realtimekit_client.create_meeting(title=f"NurseConnect booking {booking.booking_ref}")
+            meeting_id = meeting["id"]
+    except ExternalProviderError as exc:
+        raise HTTPException(status_code=502, detail="Calling service is temporarily unavailable. Please try again.") from exc
 
     call_session = CallSession(
         booking_id=booking.id,
@@ -194,7 +197,14 @@ async def start_call(booking_id: UUID, current: CurrentUser = Depends(get_curren
     await db.commit()
     await db.refresh(call_session)
 
-    participant = await realtimekit_client.add_participant(meeting_id, participant_name=caller.full_name or caller_role, participant_id=str(caller.id))
+    try:
+        participant = await realtimekit_client.add_participant(meeting_id, participant_name=caller.full_name or caller_role, participant_id=str(caller.id))
+    except ExternalProviderError as exc:
+        call_session.status = "failed"
+        call_session.ended_at = datetime.now(timezone.utc)
+        call_session.end_reason = "provider_unavailable"
+        await db.commit()
+        raise HTTPException(status_code=502, detail="Calling service is temporarily unavailable. Please try again.") from exc
 
     await _ring_callee(db, callee, booking, call_session, caller_name=caller.full_name or caller_role)
 
@@ -222,7 +232,14 @@ async def join_call(booking_id: UUID, call_session_id: UUID, current: CurrentUse
 
     res = await db.execute(select(User).where(User.id == current.id))
     user = res.scalar_one()
-    participant = await realtimekit_client.add_participant(call_session.dyte_meeting_id, participant_name=user.full_name or "participant", participant_id=str(user.id))
+    try:
+        participant = await realtimekit_client.add_participant(call_session.dyte_meeting_id, participant_name=user.full_name or "participant", participant_id=str(user.id))
+    except ExternalProviderError as exc:
+        call_session.status = "failed"
+        call_session.ended_at = datetime.now(timezone.utc)
+        call_session.end_reason = "provider_unavailable"
+        await db.commit()
+        raise HTTPException(status_code=502, detail="Calling service is temporarily unavailable. Please try again.") from exc
 
     return CallStartResponse(
         call_session_id=call_session.id,
