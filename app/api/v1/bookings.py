@@ -42,6 +42,8 @@ from app.models.models import (
     WorkerProfile,
 )
 from app.schemas.schemas import (
+    AddressSnapshot,
+    BookingAddressUpdate,
     BookingCancelRequest,
     BookingCreate,
     BookingOut,
@@ -59,6 +61,47 @@ def _gen_booking_ref() -> str:
     return f"NC{datetime.now().strftime('%y%m%d')}{uuid4().hex[:6].upper()}"
 
 
+async def _resolve_service_address(
+    db: AsyncSession,
+    profile: ConsumerProfile,
+    *,
+    address_id: Optional[UUID],
+    address: Optional[AddressSnapshot],
+    latitude: Optional[Decimal],
+    longitude: Optional[Decimal],
+) -> tuple[dict, Decimal, Decimal]:
+    """Resolve the patient service location into a booking-safe snapshot."""
+    from app.models.models import ConsumerAddress
+
+    resolved_snapshot = None
+    resolved_lat = latitude
+    resolved_lng = longitude
+    if address_id:
+        ares = await db.execute(
+            select(ConsumerAddress).where(
+                ConsumerAddress.id == address_id,
+                ConsumerAddress.consumer_id == profile.id,
+            )
+        )
+        addr = ares.scalar_one_or_none()
+        if not addr:
+            raise HTTPException(status_code=404, detail="Address not found")
+        resolved_snapshot = {
+            "line1": addr.line1, "line2": addr.line2, "city": addr.city,
+            "state": addr.state, "pincode": addr.pincode, "landmark": addr.landmark,
+            "recipient_name": addr.recipient_name, "recipient_phone": addr.recipient_phone,
+        }
+        resolved_lat = addr.latitude
+        resolved_lng = addr.longitude
+    elif address is not None:
+        resolved_snapshot = address.model_dump()
+
+    if resolved_snapshot is None or resolved_lat is None or resolved_lng is None:
+        raise HTTPException(status_code=400, detail="Provide address_id or address + latitude/longitude")
+
+    return resolved_snapshot, resolved_lat, resolved_lng
+
+
 @router.post("/", response_model=BookingOut)
 async def create_booking(
     payload: BookingCreate,
@@ -74,32 +117,14 @@ async def create_booking(
     if not patient:
         raise HTTPException(status_code=404, detail="Patient not found")
 
-    # Resolve the service address: prefer a saved address_id, else inline fields.
-    from app.models.models import ConsumerAddress
-    resolved_snapshot = None
-    resolved_lat = payload.latitude
-    resolved_lng = payload.longitude
-    if payload.address_id:
-        ares = await db.execute(
-            select(ConsumerAddress).where(
-                ConsumerAddress.id == payload.address_id,
-                ConsumerAddress.consumer_id == profile.id,
-            )
-        )
-        addr = ares.scalar_one_or_none()
-        if not addr:
-            raise HTTPException(status_code=404, detail="Address not found")
-        resolved_snapshot = {
-            "line1": addr.line1, "line2": addr.line2, "city": addr.city,
-            "state": addr.state, "pincode": addr.pincode, "landmark": addr.landmark,
-            "recipient_name": addr.recipient_name, "recipient_phone": addr.recipient_phone,
-        }
-        resolved_lat = addr.latitude
-        resolved_lng = addr.longitude
-    elif payload.address is not None:
-        resolved_snapshot = payload.address.model_dump()
-    if resolved_snapshot is None or resolved_lat is None or resolved_lng is None:
-        raise HTTPException(status_code=400, detail="Provide address_id or address + latitude/longitude")
+    resolved_snapshot, resolved_lat, resolved_lng = await _resolve_service_address(
+        db,
+        profile,
+        address_id=payload.address_id,
+        address=payload.address,
+        latitude=payload.latitude,
+        longitude=payload.longitude,
+    )
 
     service: Optional[ServiceCatalogue] = None
     package: Optional[CarePackage] = None
@@ -419,6 +444,69 @@ async def new_requests(profile: WorkerProfile = Depends(get_worker_profile), db:
             bm.distance_km = round(dist, 2)
         out.append(bm)
     return out
+
+
+@router.put("/{booking_id}/address", response_model=BookingOut)
+async def update_booking_address(
+    booking_id: UUID,
+    payload: BookingAddressUpdate,
+    profile: ConsumerProfile = Depends(get_consumer_profile),
+    db: AsyncSession = Depends(get_db),
+):
+    """Let a family correct the patient service location before confirmation."""
+    res = await db.execute(
+        select(Booking).where(Booking.id == booking_id, Booking.consumer_id == profile.id)
+    )
+    b = res.scalar_one_or_none()
+    if not b:
+        raise HTTPException(status_code=404, detail="Booking not found")
+
+    editable_statuses = {BookingStatus.draft, BookingStatus.pending_payment}
+    if b.status not in editable_statuses:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "success": False,
+                "code": "BOOKING_LOCATION_LOCKED",
+                "message": "Location can be changed only before the booking is confirmed.",
+            },
+        )
+
+    resolved_snapshot, resolved_lat, resolved_lng = await _resolve_service_address(
+        db,
+        profile,
+        address_id=payload.address_id,
+        address=payload.address,
+        latitude=payload.latitude,
+        longitude=payload.longitude,
+    )
+
+    old_snapshot = b.address_snapshot
+    old_lat = b.latitude
+    old_lng = b.longitude
+    b.address_snapshot = resolved_snapshot
+    b.latitude = resolved_lat
+    b.longitude = resolved_lng
+    await audit(
+        db,
+        profile.user_id,
+        "consumer",
+        "booking.address_update",
+        "booking",
+        b.id,
+        {
+            "old_address": old_snapshot,
+            "new_address": resolved_snapshot,
+            "old_latitude": str(old_lat) if old_lat is not None else None,
+            "old_longitude": str(old_lng) if old_lng is not None else None,
+            "new_latitude": str(resolved_lat),
+            "new_longitude": str(resolved_lng),
+        },
+    )
+    await db.commit()
+    await db.refresh(b)
+    await manager.broadcast(booking_topic(b.id), {"type": "booking.address_updated", "booking_id": str(b.id)})
+    return BookingOut.model_validate(b)
 
 
 @router.get("/{booking_id}", response_model=BookingOut)
