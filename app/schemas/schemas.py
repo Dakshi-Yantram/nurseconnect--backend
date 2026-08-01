@@ -402,6 +402,15 @@ class BookingCreate(BaseModel):
     preferred_worker_id: Optional[UUID] = None
 
 
+class BookingAddressUpdate(BaseModel):
+    # Same address contract as booking creation, but scoped to location edits
+    # before a booking is confirmed/dispatched.
+    address_id: Optional[UUID] = None
+    address: Optional[AddressSnapshot] = None
+    latitude: Optional[Decimal] = None
+    longitude: Optional[Decimal] = None
+
+
 class BookingOut(ORMModel):
     id: UUID
     booking_ref: str
