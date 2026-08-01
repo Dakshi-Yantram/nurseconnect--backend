@@ -63,6 +63,14 @@ async def _get_reviewer_profile(user_id: UUID, db: AsyncSession) -> ReviewerProf
     return rp
 
 
+async def _get_reviewer_profile_or_none(user_id: UUID, db: AsyncSession) -> Optional[ReviewerProfile]:
+    """Like _get_reviewer_profile but returns None instead of 404ing — used on
+    endpoints where an admin (who has no ReviewerProfile of their own) is
+    allowed to act on any ticket regardless of assignment."""
+    res = await db.execute(select(ReviewerProfile).where(ReviewerProfile.user_id == user_id))
+    return res.scalar_one_or_none()
+
+
 async def _ticket_or_404(ticket_id: UUID, db: AsyncSession) -> NurseReviewTicket:
     res = await db.execute(select(NurseReviewTicket).where(NurseReviewTicket.id == ticket_id))
     t = res.scalar_one_or_none()
@@ -161,10 +169,12 @@ async def get_ticket(
     current: CurrentUser = Depends(require_reviewer),
     db: AsyncSession = Depends(get_db),
 ):
-    rp = await _get_reviewer_profile(current.id, db)
+    from app.core.deps import is_admin
+    rp = await _get_reviewer_profile_or_none(current.id, db)
+    if not rp and not is_admin(current.role):
+        raise HTTPException(status_code=404, detail="Reviewer profile not found for your account")
     t = await _ticket_or_404(ticket_id, db)
     # Admin can see any; reviewer can only see their own.
-    from app.core.deps import is_admin
     if not is_admin(current.role) and t.assigned_reviewer_id != rp.id:
         raise HTTPException(status_code=403, detail="This ticket is not assigned to you")
     return serialize_ticket(t)
@@ -182,10 +192,13 @@ async def update_ticket_status(
     current: CurrentUser = Depends(require_reviewer),
     db: AsyncSession = Depends(get_db),
 ):
-    """Reviewer updates the status of a ticket assigned to them."""
-    rp = await _get_reviewer_profile(current.id, db)
-    t = await _ticket_or_404(ticket_id, db)
+    """Reviewer updates the status of a ticket assigned to them. Admins can
+    update any ticket even without a ReviewerProfile of their own."""
     from app.core.deps import is_admin
+    rp = await _get_reviewer_profile_or_none(current.id, db)
+    if not rp and not is_admin(current.role):
+        raise HTTPException(status_code=404, detail="Reviewer profile not found for your account")
+    t = await _ticket_or_404(ticket_id, db)
     if not is_admin(current.role) and t.assigned_reviewer_id != rp.id:
         raise HTTPException(status_code=403, detail="Not your ticket")
     new_status = payload.status.upper()
