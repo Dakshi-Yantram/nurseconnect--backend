@@ -98,17 +98,38 @@ async def my_queue(
     current: CurrentUser = Depends(require_reviewer),
     db: AsyncSession = Depends(get_db),
 ):
-    """All tickets currently assigned to the logged-in reviewer, newest SLA first."""
-    rp = await _get_reviewer_profile(current.id, db)
-    stmt = (
-        select(NurseReviewTicket)
-        .where(NurseReviewTicket.assigned_reviewer_id == rp.id)
-        .order_by(
-            NurseReviewTicket.priority.desc(),
-            NurseReviewTicket.sla_due_at.asc().nullslast(),
-            NurseReviewTicket.created_at.asc(),
+    """All tickets currently assigned to the logged-in reviewer, newest SLA first.
+    Admins have no ReviewerProfile of their own — for them this returns every
+    open ticket (regardless of who it's assigned to) instead of an empty list,
+    so the onboarding-review screen isn't silently empty for admin users."""
+    from app.core.deps import is_admin
+
+    res = await db.execute(select(ReviewerProfile).where(ReviewerProfile.user_id == current.id))
+    rp = res.scalar_one_or_none()
+    if not rp:
+        if not is_admin(current.role):
+            # A non-admin reviewer-tier user with no reviewer profile genuinely
+            # has no queue.
+            return []
+        stmt = (
+            select(NurseReviewTicket)
+            .where(NurseReviewTicket.status.in_(OPEN_STATUSES))
+            .order_by(
+                NurseReviewTicket.priority.desc(),
+                NurseReviewTicket.sla_due_at.asc().nullslast(),
+                NurseReviewTicket.created_at.asc(),
+            )
         )
-    )
+    else:
+        stmt = (
+            select(NurseReviewTicket)
+            .where(NurseReviewTicket.assigned_reviewer_id == rp.id)
+            .order_by(
+                NurseReviewTicket.priority.desc(),
+                NurseReviewTicket.sla_due_at.asc().nullslast(),
+                NurseReviewTicket.created_at.asc(),
+            )
+        )
     if status:
         stmt = stmt.where(NurseReviewTicket.status == status.upper())
     if priority:
