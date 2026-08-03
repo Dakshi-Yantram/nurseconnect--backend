@@ -126,6 +126,25 @@ async def notify_parties(
         await send_notification(db, rid, template_code, title, body, context)
 
 
+async def notify_admins(
+    db: AsyncSession,
+    template_code: str,
+    title: str,
+    body: str,
+    context: Optional[Dict[str, Any]] = None,
+) -> List[UUID]:
+    """Push an in-app/push notification to every admin account and return
+    their user ids (so the caller can also fan the same event out over the
+    live /ws/user WebSocket for near-instant delivery, e.g. SOS alerts)."""
+    from app.models.enums import UserRole
+
+    ares = await db.execute(select(User).where(User.role == UserRole.admin))
+    admin_ids = [u.id for u in ares.scalars().all()]
+    for aid in admin_ids:
+        await send_notification(db, aid, template_code, title, body, context or {})
+    return admin_ids
+
+
 # ============================================================================
 # Audit log
 # ============================================================================
