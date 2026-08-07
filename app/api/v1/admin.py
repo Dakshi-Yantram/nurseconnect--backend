@@ -8,12 +8,13 @@ from decimal import Decimal
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
-from sqlalchemy import func, select
+from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
 from app.core.deps import CurrentUser, get_current_user, is_admin, require_admin, require_operations, require_reviewer, require_roles
 from app.core.security import hash_password
+from app.services.common_services import audit
 from app.models.enums import (
     BookingStatus,
     ComplaintStatus,
@@ -39,6 +40,7 @@ from app.models.models import (
     Booking,
     CarePackage,
     CarePackageBooking,
+    CareNote,
     ClinicalRuleSet,
     Complaint,
     ConsentRecord,
@@ -47,16 +49,24 @@ from app.models.models import (
     Dispute,
     Escalation,
     FinancialLedger,
+    InsuranceCoverageAssessment,
+    MedicationAdministration,
+    Message,
     NurseReviewTicket,
+    OfflineSyncQueue,
     Patient,
     PayoutBatch,
+    Prescription,
     ReviewerProfile,
     RoleDefinition,
     ServiceCatalogue,
     SubsidyEligibility,
+    SupportTicket,
     User,
     VisitRecord,
+    VitalSignReading,
     WorkerDocument,
+    WorkerLocationLog,
     WorkerPayout,
     WorkerProfile,
 )
@@ -818,6 +828,116 @@ async def delete_care_package(
     pkg.deleted_by = current.id
     await db.commit()
     return {"id": str(pkg.id), "is_deleted": True}
+
+
+# ============================================================================
+# Booking / visit report — permanent delete.
+# Admin-only. Unlike the care-package delete above, this is a real, hard
+# DELETE from the database (not a soft/is_deleted flag) — the visit report
+# and everything tied to it must stop existing, not just stop showing up.
+# The frontend is expected to gate this behind an explicit "are you sure you
+# want to delete it permanently?" confirmation before calling this endpoint;
+# the server does not ask for confirmation itself, it just executes on call,
+# so nothing else in the product should expose a path to this.
+#
+# Booking.id is the parent FK for VisitRecord / VisitChecklistResponse /
+# VisitDocumentationItem, all declared ondelete="CASCADE" in the schema, so
+# deleting the Booking row cascades the visit report, checklist answers, and
+# documentation items with it at the DB level — no orphaned rows left behind.
+# ============================================================================
+@router.delete("/bookings/{booking_id}")
+async def delete_booking_permanently(
+    booking_id: UUID,
+    current: CurrentUser = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Permanently deletes a booking and its visit report (and any
+    checklist/documentation rows under it) from the database. Admin-only —
+    there is no equivalent action available to any other role, and this
+    should never be surfaced on any non-admin page.
+
+    Blocked if the booking has real financial or dispute history attached
+    (ledger entries, a worker payout, or an open dispute/complaint) — those
+    are records the business needs to keep even after the booking itself is
+    gone, so hard-deleting the booking underneath them would either orphan
+    them or silently destroy financial/audit history. Everything else that
+    points at this booking without ON DELETE CASCADE (vitals, prescriptions,
+    medication administration, escalations, messages, offline sync rows,
+    location logs, insurance assessments, care notes, resolved support
+    tickets, resolved complaints/disputes) is deleted explicitly first.
+    """
+    res = await db.execute(select(Booking).where(Booking.id == booking_id))
+    booking = res.scalar_one_or_none()
+    if not booking:
+        raise HTTPException(status_code=404, detail="Booking not found")
+
+    ledger_count = (await db.execute(
+        select(func.count(FinancialLedger.id)).where(FinancialLedger.booking_id == booking_id)
+    )).scalar_one()
+    if ledger_count > 0:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Can't permanently delete — {ledger_count} financial ledger entr(y/ies) reference this "
+                   "booking and must be retained for accounting records.",
+        )
+
+    payout_count = (await db.execute(
+        select(func.count(WorkerPayout.id)).where(WorkerPayout.booking_id == booking_id)
+    )).scalar_one()
+    if payout_count > 0:
+        raise HTTPException(
+            status_code=409,
+            detail="Can't permanently delete — a worker payout is recorded against this booking.",
+        )
+
+    open_dispute_count = (await db.execute(
+        select(func.count(Dispute.id)).where(
+            Dispute.booking_id == booking_id, Dispute.status != DisputeStatus.resolved
+        )
+    )).scalar_one()
+    if open_dispute_count > 0:
+        raise HTTPException(
+            status_code=409,
+            detail="Can't permanently delete — this booking has an open dispute. Resolve it first.",
+        )
+
+    open_complaint_count = (await db.execute(
+        select(func.count(Complaint.id)).where(
+            Complaint.booking_id == booking_id, Complaint.status != ComplaintStatus.resolved
+        )
+    )).scalar_one()
+    if open_complaint_count > 0:
+        raise HTTPException(
+            status_code=409,
+            detail="Can't permanently delete — this booking has an open complaint. Resolve it first.",
+        )
+
+    # Record the audit entry before deleting — AuditLog.entity_id is a plain
+    # string column (no FK to bookings), so the log entry survives the
+    # booking's deletion and stays as the permanent record that this
+    # happened, who did it, and what was removed.
+    snapshot = {
+        "booking_ref": booking.booking_ref,
+        "status": booking.status.value,
+        "scheduled_date": booking.scheduled_date.isoformat(),
+        "consumer_id": str(booking.consumer_id),
+        "patient_id": str(booking.patient_id),
+        "worker_id": str(booking.worker_id) if booking.worker_id else None,
+    }
+    await audit(db, current.id, current.role.value, "booking.delete_permanent", "booking", booking.id, snapshot)
+
+    # Explicitly clear child rows that don't cascade at the DB level before
+    # deleting the booking itself, so the FK constraint doesn't reject it.
+    for model in (
+        VitalSignReading, Prescription, MedicationAdministration, Escalation,
+        Message, OfflineSyncQueue, WorkerLocationLog, InsuranceCoverageAssessment,
+        CareNote, SupportTicket, Complaint, Dispute,
+    ):
+        await db.execute(delete(model).where(model.booking_id == booking_id))
+
+    await db.delete(booking)
+    await db.commit()
+    return {"id": str(booking_id), "deleted": True}
 
 
 # ============================================================================
