@@ -494,6 +494,31 @@ async def checkout(
 
     await audit(db, profile.user_id, "worker", "visit.checkout", "visit", visit.id, {"duration_min": visit.actual_duration_minutes, "coverage": coverage_summary})
 
+    # Bug fix: the family/consumer was never actually notified that the
+    # visit report was ready — checkout only broadcast over the live
+    # websocket (booking_topic), which only reaches a client that happens to
+    # be connected at that exact moment, and persisted nothing to the
+    # notification center. Send a real notification (in-app + push, so it
+    # survives even if the family isn't looking at the app right now) with
+    # the family summary itself, not just a "something happened" ping.
+    try:
+        await notify_parties(
+            db,
+            ["family"],
+            {"booking_id": str(booking_id), "visit_id": str(visit.id)},
+            "visit.completed.report_ready",
+            "Visit report is ready",
+            family_summary,
+        )
+    except Exception as exc:  # noqa: BLE001
+        # Never block checkout on a notification-delivery glitch — the
+        # report itself is already saved on the visit record and viewable
+        # in-app either way. Just don't let it silently vanish from logs.
+        import logging as _logging
+        _logging.getLogger(__name__).warning(
+            "family notification failed for booking %s: %s", booking.id, exc
+        )
+
     # Generate the nurse's payout for this completed visit. Idempotent, so a
     # retried/replayed checkout never pays twice. A payout glitch must never
     # block the nurse from completing the visit, so it's best-effort and logged.
