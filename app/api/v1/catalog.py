@@ -86,10 +86,12 @@ async def list_care_packages(
     active_only: bool = True,
     db: AsyncSession = Depends(get_db),
 ):
-    conds = []
+    # Deleted packages never appear in any list — admin's active_only=false
+    # is only meant to surface disabled-but-not-deleted packages.
+    conds = [CarePackage.is_deleted.is_(False)]
     if active_only:
         conds.append(CarePackage.is_active.is_(True))
-    res = await db.execute(select(CarePackage).where(and_(*conds)) if conds else select(CarePackage))
+    res = await db.execute(select(CarePackage).where(and_(*conds)))
     items = res.scalars().all()
     if city:
         items = [p for p in items if not p.available_cities or city in p.available_cities]

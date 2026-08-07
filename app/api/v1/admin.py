@@ -21,6 +21,7 @@ from app.models.enums import (
     EscalationLevel,
     EscalationStatus,
     GenderRestriction,
+    PackageBookingStatus,
     PaymentStatus,
     PayoutBatchStatus,
     QualificationGate,
@@ -37,6 +38,7 @@ from app.models.models import (
     AuditLog,
     Booking,
     CarePackage,
+    CarePackageBooking,
     ClinicalRuleSet,
     Complaint,
     ConsentRecord,
@@ -575,9 +577,10 @@ async def admin_list_consumers(
 # ============================================================================
 # PATCH 3 — Admin Care Package endpoints
 # Backs the admin Care Packages page (_app.care-packages.tsx):
-#   POST   /api/admin/care-packages              create
-#   PUT    /api/admin/care-packages/{id}          update
-#   PATCH  /api/admin/care-packages/{id}/toggle   activate/deactivate
+#   POST   /api/admin/care-packages               create
+#   PUT    /api/admin/care-packages/{id}           update
+#   PATCH  /api/admin/care-packages/{id}/toggle    enable/disable (still listed, greyed out)
+#   DELETE /api/admin/care-packages/{id}           soft-delete (removed from every list)
 # ============================================================================
 class CarePackageCreateRequest(BaseModel):
     name: str
@@ -628,6 +631,8 @@ def _serialize_care_package(pkg: CarePackage) -> dict:
         "requires_prescription": pkg.requires_prescription,
         "insurance_covered": pkg.insurance_covered,
         "is_active": pkg.is_active,
+        "is_deleted": pkg.is_deleted,
+        "deleted_at": pkg.deleted_at.isoformat() if pkg.deleted_at else None,
         "version": pkg.version,
         "available_cities": pkg.available_cities,
         "gate": pkg.gate.value if pkg.gate else None,
@@ -760,9 +765,59 @@ async def toggle_care_package(
     pkg = res.scalar_one_or_none()
     if not pkg:
         raise HTTPException(status_code=404, detail="Care package not found")
+    if pkg.is_deleted:
+        raise HTTPException(status_code=409, detail="This package has been deleted and can't be toggled")
     pkg.is_active = not pkg.is_active
     await db.commit()
     return {"id": str(pkg.id), "is_active": pkg.is_active}
+
+
+@router.delete("/care-packages/{package_id}")
+async def delete_care_package(
+    package_id: UUID,
+    current: CurrentUser = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Soft-delete only. Never hard-deletes: existing CarePackageBooking rows
+    reference this package, so a real DELETE would break that history.
+    Blocked while any booking on this package is still active/paused/pending
+    a rematch — those need to be resolved (or the package deactivated to stop
+    new bookings) before it can be removed for good."""
+    res = await db.execute(select(CarePackage).where(CarePackage.id == package_id))
+    pkg = res.scalar_one_or_none()
+    if not pkg:
+        raise HTTPException(status_code=404, detail="Care package not found")
+    if pkg.is_deleted:
+        raise HTTPException(status_code=409, detail="Package already deleted")
+
+    open_statuses = (
+        PackageBookingStatus.active,
+        PackageBookingStatus.paused,
+        PackageBookingStatus.rematch_pending,
+    )
+    open_count_res = await db.execute(
+        select(func.count(CarePackageBooking.id)).where(
+            CarePackageBooking.package_id == package_id,
+            CarePackageBooking.status.in_(open_statuses),
+        )
+    )
+    open_count = open_count_res.scalar_one()
+    if open_count > 0:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Can't delete — {open_count} booking(s) on this package are still "
+                "active, paused, or awaiting rematch. Resolve or complete them first, "
+                "or disable the package instead to stop new bookings."
+            ),
+        )
+
+    pkg.is_deleted = True
+    pkg.is_active = False
+    pkg.deleted_at = datetime.now(timezone.utc)
+    pkg.deleted_by = current.id
+    await db.commit()
+    return {"id": str(pkg.id), "is_deleted": True}
 
 
 # ============================================================================
