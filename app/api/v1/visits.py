@@ -349,10 +349,9 @@ async def verify_visit_start_otp(
             },
         )
 
-    # OTP verified — delete keys immediately
-    await redis_client.delete(_otp_key(booking_id))
-    await redis_client.delete(_attempts_key(booking_id))
-
+    # OTP matches — but don't consume it yet. If a downstream check (consent,
+    # already-checked-in) fails, the nurse/consumer shouldn't have to
+    # generate a brand new code for something unrelated to the code itself.
     vres = await db.execute(select(VisitRecord).where(VisitRecord.booking_id == booking_id))
     visit = vres.scalar_one_or_none()
     if visit and visit.check_in_at:
@@ -371,6 +370,12 @@ async def verify_visit_start_otp(
             status_code=403,
             detail={"code": ce.code, "message": ce.message, "consent_type": ce.consent_type.value},
         ) from None
+
+    # All checks passed — the code is now spent, whether or not the rest of
+    # the check-in succeeds (matches the original all-or-nothing behavior
+    # for genuine check-in failures past this point).
+    await redis_client.delete(_otp_key(booking_id))
+    await redis_client.delete(_attempts_key(booking_id))
 
     if not visit:
         visit = VisitRecord(
@@ -488,6 +493,44 @@ async def checkout(
         coverage_summary = None
 
     await audit(db, profile.user_id, "worker", "visit.checkout", "visit", visit.id, {"duration_min": visit.actual_duration_minutes, "coverage": coverage_summary})
+
+    # Bug fix: the family/consumer was never actually notified that the
+    # visit report was ready — checkout only broadcast over the live
+    # websocket (booking_topic), which only reaches a client that happens to
+    # be connected at that exact moment, and persisted nothing to the
+    # notification center. Send a real notification (in-app + push, so it
+    # survives even if the family isn't looking at the app right now) with
+    # the family summary itself, not just a "something happened" ping.
+    try:
+        await notify_parties(
+            db,
+            ["family"],
+            {"booking_id": str(booking_id), "visit_id": str(visit.id)},
+            "visit.completed.report_ready",
+            "Visit report is ready",
+            family_summary,
+        )
+    except Exception as exc:  # noqa: BLE001
+        # Never block checkout on a notification-delivery glitch — the
+        # report itself is already saved on the visit record and viewable
+        # in-app either way. Just don't let it silently vanish from logs.
+        import logging as _logging
+        _logging.getLogger(__name__).warning(
+            "family notification failed for booking %s: %s", booking.id, exc
+        )
+
+    # Generate the nurse's payout for this completed visit. Idempotent, so a
+    # retried/replayed checkout never pays twice. A payout glitch must never
+    # block the nurse from completing the visit, so it's best-effort and logged.
+    try:
+        from app.services.payout_service import create_payout_for_booking
+        await create_payout_for_booking(db, booking)
+    except Exception as exc:  # noqa: BLE001
+        import logging as _logging
+        _logging.getLogger(__name__).warning(
+            "payout generation failed for booking %s: %s", booking.id, exc
+        )
+
     await db.commit()
     await db.refresh(visit)
     await manager.broadcast(booking_topic(booking_id), {"type": "visit.completed", "booking_id": str(booking_id), "coverage": coverage_summary})
