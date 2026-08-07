@@ -472,6 +472,12 @@ class CarePackage(Base):
     version: Mapped[int] = mapped_column(Integer, default=1)
     previous_version_id: Mapped[Optional[UUID]] = mapped_column(PG_UUID(as_uuid=True), ForeignKey("care_packages.id"))
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
+    # Soft-delete. Distinct from is_active: a disabled (is_active=False) package
+    # is still listed (greyed out, read-only) — a deleted one is gone from every
+    # list. Never hard-delete: existing CarePackageBooking rows reference this row.
+    is_deleted: Mapped[bool] = mapped_column(Boolean, default=False, index=True, server_default="false")
+    deleted_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    deleted_by: Mapped[Optional[UUID]] = mapped_column(PG_UUID(as_uuid=True), ForeignKey("users.id"))
     available_cities: Mapped[Optional[list]] = mapped_column(ARRAY(String))
     created_by: Mapped[Optional[UUID]] = mapped_column(PG_UUID(as_uuid=True), ForeignKey("users.id"))
     # Patch 2 — package-level qualification gating
