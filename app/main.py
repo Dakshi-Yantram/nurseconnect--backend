@@ -34,6 +34,7 @@ from app.api.v1 import (
     training,
     users,
     visits,
+    whatsapp_webhooks,
     workers,
 )
 from app.api.v1.training import assessments_router as training_assessments_router
@@ -178,6 +179,7 @@ for r in [
     messaging.router,
     calls.router,
     calls.push_router,
+    whatsapp_webhooks.router,
 ]:
     app.include_router(r, prefix=_API_PREFIX)
 

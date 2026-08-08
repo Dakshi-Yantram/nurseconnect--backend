@@ -97,6 +97,15 @@ class Settings(BaseSettings):
     # Interakt
     INTERAKT_API_KEY: str = ""
     INTERAKT_BASE_URL: str = "https://api.interakt.ai"
+    # Shared secret configured in the Interakt dashboard (Settings > Webhooks)
+    # so we can verify inbound webhook calls actually come from Interakt.
+    INTERAKT_WEBHOOK_SECRET: str = ""
+    # WhatsApp template used to ask the family for feedback right after a
+    # visit is checked out. Must be a pre-approved template on Interakt.
+    INTERAKT_FEEDBACK_TEMPLATE: str = "service_feedback_request"
+
+    # Deep link base the family taps from the WhatsApp feedback message.
+    FEEDBACK_LINK_BASE_URL: str = "https://app.nurseconnect.in/feedback"
 
     # Firebase
     FIREBASE_PROJECT_ID: str = ""
