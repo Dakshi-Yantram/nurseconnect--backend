@@ -20,6 +20,13 @@ from app.models.enums import (
     GenderRestriction,
     VisitFrequency,
     ChecklistPhase,
+    QualificationGate,
+)
+from app.seed_question_bank import (
+    GENERATED_ASSESSMENT_MODULES,
+    GENERATED_COMPETENCIES_BY_ID,
+    GENERATED_PACKAGE_REQUIREMENTS,
+    GENERATED_TRAINING_MODULES,
 )
 from sqlalchemy import select
 
@@ -502,6 +509,88 @@ async def seed_packages(session) -> int:
     return created
 
 
+def _enum_value(enum_cls, value, default):
+    try:
+        return enum_cls(value)
+    except ValueError:
+        return default
+
+
+async def seed_workbook_package_requirements(session) -> int:
+    """Upsert care packages from the workbook's grouped package mapping.
+
+    The source sheet has many rows per package because it maps each package to
+    many questions and competencies. Keeping that shape in application code is
+    hard to read, so seed_question_bank.py groups each package into one record
+    with required module codes, assessment codes, question IDs, and competency
+    IDs.
+    """
+    changed = 0
+    for data in GENERATED_PACKAGE_REQUIREMENTS:
+        res = await session.execute(
+            select(CarePackage).where(CarePackage.package_code == data["package_code"])
+        )
+        package = res.scalar_one_or_none()
+        payload = {
+            "name": data["name"],
+            "tagline": data.get("tagline"),
+            "description": data.get("description"),
+            "target_condition": data.get("target_condition"),
+            "min_tier": _enum_value(WorkerTier, data.get("min_tier"), WorkerTier.tier2),
+            "gender_restriction": GenderRestriction.any,
+            "visit_frequency": _enum_value(
+                VisitFrequency,
+                data.get("visit_frequency"),
+                VisitFrequency.as_needed,
+            ),
+            "visits_per_cycle": data.get("visits_per_cycle") or 1,
+            "cycle_duration_days": data.get("cycle_duration_days") or 1,
+            "package_price": Decimal(str(data.get("package_price") or "0")),
+            "per_visit_price": Decimal(str(data.get("per_visit_price") or "0")),
+            "subsidy_eligible": bool(data.get("subsidy_eligible")),
+            "commission_pct": Decimal(str(data.get("commission_pct") or "20")),
+            "requires_prescription": bool(data.get("requires_prescription")),
+            "insurance_covered": bool(data.get("insurance_covered", True)),
+            "gate": _enum_value(
+                QualificationGate,
+                data.get("gate"),
+                QualificationGate.theory_verified,
+            ),
+            "required_training_module_codes": data.get("required_training_module_codes") or [],
+            "required_assessment_codes": data.get("required_assessment_codes") or [],
+            # Store workbook competency IDs as specialty tags for reporting/search
+            # without making them a hard qualification blocker.
+            "required_specialty_tags": data.get("workbook_competency_ids") or [],
+            "practical_checklist_items": [
+                competency["description"]
+                for competency_id in data.get("workbook_competency_ids", [])
+                if (
+                    (competency := GENERATED_COMPETENCIES_BY_ID.get(competency_id))
+                    and competency.get("practical_assessment") == "Mandatory"
+                    and competency.get("description")
+                )
+            ][:20],
+            "is_active": True,
+        }
+        if package is None:
+            session.add(CarePackage(package_code=data["package_code"], **payload))
+            changed += 1
+            print(f"  + created workbook package {data['package_code']}")
+            continue
+
+        updated = False
+        for key, value in payload.items():
+            if getattr(package, key) != value:
+                setattr(package, key, value)
+                updated = True
+        if updated:
+            changed += 1
+            print(f"  + updated workbook package {data['package_code']}")
+        else:
+            print(f"  · workbook package {data['package_code']} already up to date")
+    return changed
+
+
 # ---------------------------------------------------------------------------
 # Training modules with adaptive MCQ questions
 # Sources: ICMR guidelines, NHS UK (NICE/NPSA), AHA/CDC/JAMA best practices
@@ -971,7 +1060,8 @@ TRAINING_MODULES = [
 async def seed_training_modules(session) -> int:
     """Seed training modules with MCQ questions — idempotent."""
     created = 0
-    for data in TRAINING_MODULES:
+    for source in [*TRAINING_MODULES, *GENERATED_TRAINING_MODULES]:
+        data = dict(source)
         exists = await session.execute(
             select(TrainingModule).where(TrainingModule.code == data["code"])
         )
@@ -990,6 +1080,35 @@ async def seed_training_modules(session) -> int:
         session.add(module)
         created += 1
         print(f"  + created training module {data['code']} ({len(assessment)} questions)")
+    return created
+
+
+async def seed_assessment_modules(session) -> int:
+    """Seed workbook assessment modules grouped from Questionnaire to Package."""
+    created = 0
+    for source in GENERATED_ASSESSMENT_MODULES:
+        data = dict(source)
+        exists = await session.execute(
+            select(AssessmentModule).where(AssessmentModule.code == data["code"])
+        )
+        if exists.scalar_one_or_none():
+            print(f"  · assessment module {data['code']} already exists, skipping")
+            continue
+        session.add(AssessmentModule(
+            code=data["code"],
+            title=data["title"],
+            description=data.get("description"),
+            pass_score=data.get("pass_score", 80),
+            questions=data.get("questions") or [],
+            linked_training_module_code=data.get("linked_training_module_code"),
+            questions_per_attempt=data.get("questions_per_attempt"),
+            status=ContentStatus.published,
+            is_active=True,
+            version=1,
+            published_version=1,
+        ))
+        created += 1
+        print(f"  + created assessment module {data['code']}")
     return created
 
 
@@ -1069,6 +1188,12 @@ async def main():
         print("\nSeeding training modules...")
         training_created = await seed_training_modules(session)
 
+        print("\nSeeding workbook assessment modules...")
+        assessments_created = await seed_assessment_modules(session)
+
+        print("\nUpserting workbook care-package eligibility mapping...")
+        workbook_packages_changed = await seed_workbook_package_requirements(session)
+
         print("\nSeeding FAQs...")
         faqs_created = await seed_faqs(session)
 
@@ -1086,12 +1211,14 @@ async def main():
     print("\n" + "=" * 50)
     print(
         f"Done. {services_created} services, {packages_created} packages, "
-        f"{training_created} training modules, {faqs_created} FAQs, "
+        f"{training_created} training modules, {assessments_created} assessments, "
+        f"{workbook_packages_changed} workbook package mappings, {faqs_created} FAQs, "
         f"{checklists_created} checklist templates created, "
         f"{checklists_linked} service-checklist links created."
     )
     if (
         services_created == 0 and packages_created == 0 and training_created == 0
+        and assessments_created == 0 and workbook_packages_changed == 0
         and faqs_created == 0 and checklists_created == 0 and checklists_linked == 0
     ):
         print("(Everything already existed — database was already seeded.)")

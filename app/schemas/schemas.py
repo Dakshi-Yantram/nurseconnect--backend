@@ -362,6 +362,11 @@ class CarePackageOut(ORMModel):
     available_cities: Optional[List[str]] = None
     is_active: bool
     primary_service_id: Optional[UUID] = None
+    gate: Optional[str] = None
+    required_training_module_codes: Optional[List[str]] = None
+    required_assessment_codes: Optional[List[str]] = None
+    required_specialty_tags: Optional[List[str]] = None
+    practical_checklist_items: Optional[List[str]] = None
     # Full set of service ids included in this package (primary + any
     # additional ones). Populated by the catalog API from
     # CarePackage.included_service_ids (falling back to primary_service_id).

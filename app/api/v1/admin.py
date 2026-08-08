@@ -612,6 +612,7 @@ class CarePackageCreateRequest(BaseModel):
     available_cities: Optional[List[str]] = None
     # Three-gate qualification model
     gate: str = "credential_only"  # credential_only | theory_verified | practical_verified
+    required_training_module_codes: Optional[List[str]] = None
     required_assessment_codes: Optional[List[str]] = None
     practical_checklist_items: Optional[List[str]] = None
 
@@ -646,7 +647,9 @@ def _serialize_care_package(pkg: CarePackage) -> dict:
         "version": pkg.version,
         "available_cities": pkg.available_cities,
         "gate": pkg.gate.value if pkg.gate else None,
+        "required_training_module_codes": pkg.required_training_module_codes,
         "required_assessment_codes": pkg.required_assessment_codes,
+        "required_specialty_tags": pkg.required_specialty_tags,
         "practical_checklist_items": pkg.practical_checklist_items,
         "created_at": pkg.created_at.isoformat() if pkg.created_at else None,
     }
@@ -701,6 +704,7 @@ async def create_care_package(
         insurance_covered=payload.insurance_covered,
         available_cities=payload.available_cities,
         gate=gate or QualificationGate.credential_only,
+        required_training_module_codes=payload.required_training_module_codes,
         required_assessment_codes=payload.required_assessment_codes,
         practical_checklist_items=payload.practical_checklist_items,
         is_active=True,
@@ -756,6 +760,7 @@ async def update_care_package(
     pkg.insurance_covered = payload.insurance_covered
     pkg.available_cities = payload.available_cities
     pkg.gate = gate or pkg.gate
+    pkg.required_training_module_codes = payload.required_training_module_codes
     pkg.required_assessment_codes = payload.required_assessment_codes
     pkg.practical_checklist_items = payload.practical_checklist_items
     pkg.version = (pkg.version or 1) + 1
