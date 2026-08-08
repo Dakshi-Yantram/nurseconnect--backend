@@ -17,6 +17,7 @@ from app.core.deps import (
     get_worker_profile,
     is_admin,
 )
+from app.core.config import settings
 from app.core.redis_client import redis_client
 from app.integrations.providers import msg91_client
 from app.models.enums import (
@@ -24,6 +25,7 @@ from app.models.enums import (
     ConsentType,
     EscalationLevel,
     EscalationStatus,
+    NotificationChannel,
     UserRole,
     VisitStatus,
 )
@@ -517,6 +519,33 @@ async def checkout(
         import logging as _logging
         _logging.getLogger(__name__).warning(
             "family notification failed for booking %s: %s", booking.id, exc
+        )
+
+    # WhatsApp feedback request — fired the moment the visit is checked out,
+    # separate from the in-app/push "report ready" notification above so it
+    # reaches the family even if they never open the app. Uses the Interakt
+    # WhatsApp provider (see app/integrations/providers.py). Delivery/read
+    # status for this message comes back asynchronously on
+    # POST /api/webhooks/whatsapp/interakt and updates the NotificationLog
+    # row by provider_message_id.
+    try:
+        feedback_link = f"{settings.FEEDBACK_LINK_BASE_URL}/{booking_id}"
+        await notify_parties(
+            db,
+            ["family"],
+            {"booking_id": str(booking_id), "visit_id": str(visit.id), "feedback_link": feedback_link},
+            settings.INTERAKT_FEEDBACK_TEMPLATE,
+            "How was the visit?",
+            f"The visit is complete. We'd love to hear how it went — please share your feedback: {feedback_link}",
+            channels=[NotificationChannel.whatsapp],
+        )
+    except Exception as exc:  # noqa: BLE001
+        # Never block checkout on a WhatsApp delivery glitch — the visit is
+        # already saved and the family can still be reached via the in-app
+        # notification sent above.
+        import logging as _logging
+        _logging.getLogger(__name__).warning(
+            "whatsapp feedback request failed for booking %s: %s", booking.id, exc
         )
 
     # Generate the nurse's payout for this completed visit. Idempotent, so a
