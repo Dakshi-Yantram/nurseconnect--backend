@@ -8,12 +8,13 @@ from decimal import Decimal
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
-from sqlalchemy import func, select
+from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
 from app.core.deps import CurrentUser, get_current_user, is_admin, require_admin, require_operations, require_reviewer, require_roles
 from app.core.security import hash_password
+from app.services.common_services import audit
 from app.models.enums import (
     BookingStatus,
     ComplaintStatus,
@@ -21,6 +22,7 @@ from app.models.enums import (
     EscalationLevel,
     EscalationStatus,
     GenderRestriction,
+    PackageBookingStatus,
     PaymentStatus,
     PayoutBatchStatus,
     QualificationGate,
@@ -29,6 +31,7 @@ from app.models.enums import (
     VisitFrequency,
     VisitStatus,
     WorkerOnboardingStatus,
+    WorkerPayoutStatus,
     WorkerTier,
     WorkerType,
 )
@@ -36,6 +39,8 @@ from app.models.models import (
     AuditLog,
     Booking,
     CarePackage,
+    CarePackageBooking,
+    CareNote,
     ClinicalRuleSet,
     Complaint,
     ConsentRecord,
@@ -44,15 +49,24 @@ from app.models.models import (
     Dispute,
     Escalation,
     FinancialLedger,
+    InsuranceCoverageAssessment,
+    MedicationAdministration,
+    Message,
     NurseReviewTicket,
+    OfflineSyncQueue,
     Patient,
     PayoutBatch,
+    Prescription,
+    ReviewerProfile,
     RoleDefinition,
     ServiceCatalogue,
     SubsidyEligibility,
+    SupportTicket,
     User,
     VisitRecord,
+    VitalSignReading,
     WorkerDocument,
+    WorkerLocationLog,
     WorkerPayout,
     WorkerProfile,
 )
@@ -573,9 +587,10 @@ async def admin_list_consumers(
 # ============================================================================
 # PATCH 3 — Admin Care Package endpoints
 # Backs the admin Care Packages page (_app.care-packages.tsx):
-#   POST   /api/admin/care-packages              create
-#   PUT    /api/admin/care-packages/{id}          update
-#   PATCH  /api/admin/care-packages/{id}/toggle   activate/deactivate
+#   POST   /api/admin/care-packages               create
+#   PUT    /api/admin/care-packages/{id}           update
+#   PATCH  /api/admin/care-packages/{id}/toggle    enable/disable (still listed, greyed out)
+#   DELETE /api/admin/care-packages/{id}           soft-delete (removed from every list)
 # ============================================================================
 class CarePackageCreateRequest(BaseModel):
     name: str
@@ -597,6 +612,7 @@ class CarePackageCreateRequest(BaseModel):
     available_cities: Optional[List[str]] = None
     # Three-gate qualification model
     gate: str = "credential_only"  # credential_only | theory_verified | practical_verified
+    required_training_module_codes: Optional[List[str]] = None
     required_assessment_codes: Optional[List[str]] = None
     practical_checklist_items: Optional[List[str]] = None
 
@@ -626,10 +642,14 @@ def _serialize_care_package(pkg: CarePackage) -> dict:
         "requires_prescription": pkg.requires_prescription,
         "insurance_covered": pkg.insurance_covered,
         "is_active": pkg.is_active,
+        "is_deleted": pkg.is_deleted,
+        "deleted_at": pkg.deleted_at.isoformat() if pkg.deleted_at else None,
         "version": pkg.version,
         "available_cities": pkg.available_cities,
         "gate": pkg.gate.value if pkg.gate else None,
+        "required_training_module_codes": pkg.required_training_module_codes,
         "required_assessment_codes": pkg.required_assessment_codes,
+        "required_specialty_tags": pkg.required_specialty_tags,
         "practical_checklist_items": pkg.practical_checklist_items,
         "created_at": pkg.created_at.isoformat() if pkg.created_at else None,
     }
@@ -684,6 +704,7 @@ async def create_care_package(
         insurance_covered=payload.insurance_covered,
         available_cities=payload.available_cities,
         gate=gate or QualificationGate.credential_only,
+        required_training_module_codes=payload.required_training_module_codes,
         required_assessment_codes=payload.required_assessment_codes,
         practical_checklist_items=payload.practical_checklist_items,
         is_active=True,
@@ -739,6 +760,7 @@ async def update_care_package(
     pkg.insurance_covered = payload.insurance_covered
     pkg.available_cities = payload.available_cities
     pkg.gate = gate or pkg.gate
+    pkg.required_training_module_codes = payload.required_training_module_codes
     pkg.required_assessment_codes = payload.required_assessment_codes
     pkg.practical_checklist_items = payload.practical_checklist_items
     pkg.version = (pkg.version or 1) + 1
@@ -758,9 +780,169 @@ async def toggle_care_package(
     pkg = res.scalar_one_or_none()
     if not pkg:
         raise HTTPException(status_code=404, detail="Care package not found")
+    if pkg.is_deleted:
+        raise HTTPException(status_code=409, detail="This package has been deleted and can't be toggled")
     pkg.is_active = not pkg.is_active
     await db.commit()
     return {"id": str(pkg.id), "is_active": pkg.is_active}
+
+
+@router.delete("/care-packages/{package_id}")
+async def delete_care_package(
+    package_id: UUID,
+    current: CurrentUser = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Soft-delete only. Never hard-deletes: existing CarePackageBooking rows
+    reference this package, so a real DELETE would break that history.
+    Blocked while any booking on this package is still active/paused/pending
+    a rematch — those need to be resolved (or the package deactivated to stop
+    new bookings) before it can be removed for good."""
+    res = await db.execute(select(CarePackage).where(CarePackage.id == package_id))
+    pkg = res.scalar_one_or_none()
+    if not pkg:
+        raise HTTPException(status_code=404, detail="Care package not found")
+    if pkg.is_deleted:
+        raise HTTPException(status_code=409, detail="Package already deleted")
+
+    open_statuses = (
+        PackageBookingStatus.active,
+        PackageBookingStatus.paused,
+        PackageBookingStatus.rematch_pending,
+    )
+    open_count_res = await db.execute(
+        select(func.count(CarePackageBooking.id)).where(
+            CarePackageBooking.package_id == package_id,
+            CarePackageBooking.status.in_(open_statuses),
+        )
+    )
+    open_count = open_count_res.scalar_one()
+    if open_count > 0:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Can't delete — {open_count} booking(s) on this package are still "
+                "active, paused, or awaiting rematch. Resolve or complete them first, "
+                "or disable the package instead to stop new bookings."
+            ),
+        )
+
+    pkg.is_deleted = True
+    pkg.is_active = False
+    pkg.deleted_at = datetime.now(timezone.utc)
+    pkg.deleted_by = current.id
+    await db.commit()
+    return {"id": str(pkg.id), "is_deleted": True}
+
+
+# ============================================================================
+# Booking / visit report — permanent delete.
+# Admin-only. Unlike the care-package delete above, this is a real, hard
+# DELETE from the database (not a soft/is_deleted flag) — the visit report
+# and everything tied to it must stop existing, not just stop showing up.
+# The frontend is expected to gate this behind an explicit "are you sure you
+# want to delete it permanently?" confirmation before calling this endpoint;
+# the server does not ask for confirmation itself, it just executes on call,
+# so nothing else in the product should expose a path to this.
+#
+# Booking.id is the parent FK for VisitRecord / VisitChecklistResponse /
+# VisitDocumentationItem, all declared ondelete="CASCADE" in the schema, so
+# deleting the Booking row cascades the visit report, checklist answers, and
+# documentation items with it at the DB level — no orphaned rows left behind.
+# ============================================================================
+@router.delete("/bookings/{booking_id}")
+async def delete_booking_permanently(
+    booking_id: UUID,
+    current: CurrentUser = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Permanently deletes a booking and its visit report (and any
+    checklist/documentation rows under it) from the database. Admin-only —
+    there is no equivalent action available to any other role, and this
+    should never be surfaced on any non-admin page.
+
+    Blocked if the booking has real financial or dispute history attached
+    (ledger entries, a worker payout, or an open dispute/complaint) — those
+    are records the business needs to keep even after the booking itself is
+    gone, so hard-deleting the booking underneath them would either orphan
+    them or silently destroy financial/audit history. Everything else that
+    points at this booking without ON DELETE CASCADE (vitals, prescriptions,
+    medication administration, escalations, messages, offline sync rows,
+    location logs, insurance assessments, care notes, resolved support
+    tickets, resolved complaints/disputes) is deleted explicitly first.
+    """
+    res = await db.execute(select(Booking).where(Booking.id == booking_id))
+    booking = res.scalar_one_or_none()
+    if not booking:
+        raise HTTPException(status_code=404, detail="Booking not found")
+
+    ledger_count = (await db.execute(
+        select(func.count(FinancialLedger.id)).where(FinancialLedger.booking_id == booking_id)
+    )).scalar_one()
+    if ledger_count > 0:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Can't permanently delete — {ledger_count} financial ledger entr(y/ies) reference this "
+                   "booking and must be retained for accounting records.",
+        )
+
+    payout_count = (await db.execute(
+        select(func.count(WorkerPayout.id)).where(WorkerPayout.booking_id == booking_id)
+    )).scalar_one()
+    if payout_count > 0:
+        raise HTTPException(
+            status_code=409,
+            detail="Can't permanently delete — a worker payout is recorded against this booking.",
+        )
+
+    open_dispute_count = (await db.execute(
+        select(func.count(Dispute.id)).where(
+            Dispute.booking_id == booking_id, Dispute.status != DisputeStatus.resolved
+        )
+    )).scalar_one()
+    if open_dispute_count > 0:
+        raise HTTPException(
+            status_code=409,
+            detail="Can't permanently delete — this booking has an open dispute. Resolve it first.",
+        )
+
+    open_complaint_count = (await db.execute(
+        select(func.count(Complaint.id)).where(
+            Complaint.booking_id == booking_id, Complaint.status != ComplaintStatus.resolved
+        )
+    )).scalar_one()
+    if open_complaint_count > 0:
+        raise HTTPException(
+            status_code=409,
+            detail="Can't permanently delete — this booking has an open complaint. Resolve it first.",
+        )
+
+    # Record the audit entry before deleting — AuditLog.entity_id is a plain
+    # string column (no FK to bookings), so the log entry survives the
+    # booking's deletion and stays as the permanent record that this
+    # happened, who did it, and what was removed.
+    snapshot = {
+        "booking_ref": booking.booking_ref,
+        "status": booking.status.value,
+        "scheduled_date": booking.scheduled_date.isoformat(),
+        "consumer_id": str(booking.consumer_id),
+        "patient_id": str(booking.patient_id),
+        "worker_id": str(booking.worker_id) if booking.worker_id else None,
+    }
+    await audit(db, current.id, current.role.value, "booking.delete_permanent", "booking", booking.id, snapshot)
+
+    # Explicitly clear child rows that don't cascade at the DB level before
+    # deleting the booking itself, so the FK constraint doesn't reject it.
+    for model in (
+        VitalSignReading, Prescription, MedicationAdministration, Escalation,
+        Message, OfflineSyncQueue, WorkerLocationLog, InsuranceCoverageAssessment,
+        CareNote, SupportTicket, Complaint, Dispute,
+    ):
+        await db.execute(delete(model).where(model.booking_id == booking_id))
+
+    await db.delete(booking)
+    await db.commit()
+    return {"id": str(booking_id), "deleted": True}
 
 
 # ============================================================================
@@ -1138,6 +1320,107 @@ async def get_payout_batch(
             for p in payouts
         ],
     }
+
+
+# ---------------------------------------------------------------------------
+# Individual worker payouts (pending queue + process/hold).
+# Payouts are generated per-booking at visit checkout as `pending`; these
+# endpoints are how admin reviews and settles them.
+# ---------------------------------------------------------------------------
+class PayoutHoldRequest(BaseModel):
+    release: bool = False
+    reason: Optional[str] = None
+
+
+@router.get("/worker-payouts")
+async def list_worker_payouts(
+    status: Optional[str] = None,
+    current: CurrentUser = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    stmt = select(WorkerPayout).order_by(WorkerPayout.created_at.desc())
+    if status:
+        stmt = stmt.where(WorkerPayout.status == status)
+    rows = (await db.execute(stmt)).scalars().all()
+
+    worker_ids = {p.worker_id for p in rows}
+    names: dict = {}
+    if worker_ids:
+        wres = await db.execute(
+            select(WorkerProfile, User)
+            .join(User, User.id == WorkerProfile.user_id)
+            .where(WorkerProfile.id.in_(worker_ids))
+        )
+        for wp, u in wres.all():
+            names[wp.id] = {
+                "name": u.full_name or u.email,
+                "has_bank": bool(wp.bank_account_number and wp.bank_ifsc),
+            }
+    return [
+        {
+            "id": str(p.id),
+            "worker_id": str(p.worker_id),
+            "worker_name": names.get(p.worker_id, {}).get("name"),
+            "worker_has_bank": names.get(p.worker_id, {}).get("has_bank", False),
+            "booking_id": str(p.booking_id),
+            "gross_amount": float(p.gross_amount),
+            "tds_deducted": float(p.tds_deducted),
+            "net_amount": float(p.net_amount),
+            "status": p.status.value,
+            "paid_at": p.paid_at.isoformat() if p.paid_at else None,
+            "created_at": p.created_at.isoformat(),
+        }
+        for p in rows
+    ]
+
+
+@router.post("/worker-payouts/{payout_id}/process")
+async def process_worker_payout(
+    payout_id: UUID,
+    current: CurrentUser = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Pay a pending/failed payout — via RazorpayX when configured and the
+    nurse has bank details, otherwise mark it settled manually."""
+    res = await db.execute(select(WorkerPayout).where(WorkerPayout.id == payout_id))
+    payout = res.scalar_one_or_none()
+    if not payout:
+        raise HTTPException(status_code=404, detail="Payout not found")
+
+    from app.services.payout_service import process_payout
+    result = await process_payout(db, payout)
+    if result.get("error"):
+        await db.rollback()
+        raise HTTPException(status_code=409, detail=result["error"])
+    await audit(db, current.id, current.role.value, "payout.process", "worker_payout", payout.id, result)
+    await db.commit()
+    return result
+
+
+@router.post("/worker-payouts/{payout_id}/hold")
+async def hold_worker_payout(
+    payout_id: UUID,
+    body: PayoutHoldRequest,
+    current: CurrentUser = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    res = await db.execute(select(WorkerPayout).where(WorkerPayout.id == payout_id))
+    payout = res.scalar_one_or_none()
+    if not payout:
+        raise HTTPException(status_code=404, detail="Payout not found")
+    if payout.status == WorkerPayoutStatus.paid:
+        raise HTTPException(status_code=409, detail="Already paid")
+    from datetime import datetime as _dt, timezone as _tz
+    if body.release:
+        payout.status = WorkerPayoutStatus.pending
+        payout.hold_released_at = _dt.now(_tz.utc)
+    else:
+        payout.status = WorkerPayoutStatus.on_hold
+        payout.hold_reason = body.reason
+        payout.hold_initiated_by = current.id
+        payout.hold_initiated_at = _dt.now(_tz.utc)
+    await db.commit()
+    return {"status": payout.status.value}
 
 
 # ============================================================================
@@ -1610,6 +1893,38 @@ async def create_operations_account(
     if payload.role != UserRole.operations.value:
         raise HTTPException(status_code=400, detail="This endpoint only creates operations accounts")
     user = await _create_staff_user(payload, db)
+    return _serialize_staff_user(user)
+
+
+@router.post("/staff/reviewer")
+async def create_reviewer_account(
+    payload: StaffCreateRequest,
+    current: CurrentUser = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Only admin can create reviewer accounts. Reviewers review nurse
+    onboarding documents and background checks — separate from the
+    support/clinical_training_lead/clinical_trainer roles operations
+    manages via /staff, so this gets its own admin-only endpoint (same
+    shape as /staff/operations)."""
+    if payload.role != UserRole.reviewer.value:
+        raise HTTPException(status_code=400, detail="This endpoint only creates reviewer accounts")
+    user = await _create_staff_user(payload, db)
+
+    # Without a ReviewerProfile row, the auto-assignment engine never sees
+    # this reviewer as eligible, so nurse review tickets would never reach
+    # them. Create one automatically, active and ready to review.
+    db.add(
+        ReviewerProfile(
+            user_id=user.id,
+            is_active=True,
+            can_review_nurse_documents=True,
+            max_open_tickets=20,
+            specialization="nursing",
+        )
+    )
+    await db.commit()
+
     return _serialize_staff_user(user)
 
 
