@@ -19,6 +19,7 @@ from app.api.v1 import (
     admin,
     auth,
     bookings,
+    calls,
     care,
     care_workflow,
     catalog,
@@ -33,6 +34,7 @@ from app.api.v1 import (
     training,
     users,
     visits,
+    whatsapp_webhooks,
     workers,
 )
 from app.api.v1.training import assessments_router as training_assessments_router
@@ -175,6 +177,9 @@ for r in [
     admin.router,
     support.router,
     messaging.router,
+    calls.router,
+    calls.push_router,
+    whatsapp_webhooks.router,
 ]:
     app.include_router(r, prefix=_API_PREFIX)
 

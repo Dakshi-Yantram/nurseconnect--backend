@@ -63,6 +63,14 @@ async def _get_reviewer_profile(user_id: UUID, db: AsyncSession) -> ReviewerProf
     return rp
 
 
+async def _get_reviewer_profile_or_none(user_id: UUID, db: AsyncSession) -> Optional[ReviewerProfile]:
+    """Like _get_reviewer_profile but returns None instead of 404ing — used on
+    endpoints where an admin (who has no ReviewerProfile of their own) is
+    allowed to act on any ticket regardless of assignment."""
+    res = await db.execute(select(ReviewerProfile).where(ReviewerProfile.user_id == user_id))
+    return res.scalar_one_or_none()
+
+
 async def _ticket_or_404(ticket_id: UUID, db: AsyncSession) -> NurseReviewTicket:
     res = await db.execute(select(NurseReviewTicket).where(NurseReviewTicket.id == ticket_id))
     t = res.scalar_one_or_none()
@@ -98,17 +106,38 @@ async def my_queue(
     current: CurrentUser = Depends(require_reviewer),
     db: AsyncSession = Depends(get_db),
 ):
-    """All tickets currently assigned to the logged-in reviewer, newest SLA first."""
-    rp = await _get_reviewer_profile(current.id, db)
-    stmt = (
-        select(NurseReviewTicket)
-        .where(NurseReviewTicket.assigned_reviewer_id == rp.id)
-        .order_by(
-            NurseReviewTicket.priority.desc(),
-            NurseReviewTicket.sla_due_at.asc().nullslast(),
-            NurseReviewTicket.created_at.asc(),
+    """All tickets currently assigned to the logged-in reviewer, newest SLA first.
+    Admins have no ReviewerProfile of their own — for them this returns every
+    open ticket (regardless of who it's assigned to) instead of an empty list,
+    so the onboarding-review screen isn't silently empty for admin users."""
+    from app.core.deps import is_admin
+
+    res = await db.execute(select(ReviewerProfile).where(ReviewerProfile.user_id == current.id))
+    rp = res.scalar_one_or_none()
+    if not rp:
+        if not is_admin(current.role):
+            # A non-admin reviewer-tier user with no reviewer profile genuinely
+            # has no queue.
+            return []
+        stmt = (
+            select(NurseReviewTicket)
+            .where(NurseReviewTicket.status.in_(OPEN_STATUSES))
+            .order_by(
+                NurseReviewTicket.priority.desc(),
+                NurseReviewTicket.sla_due_at.asc().nullslast(),
+                NurseReviewTicket.created_at.asc(),
+            )
         )
-    )
+    else:
+        stmt = (
+            select(NurseReviewTicket)
+            .where(NurseReviewTicket.assigned_reviewer_id == rp.id)
+            .order_by(
+                NurseReviewTicket.priority.desc(),
+                NurseReviewTicket.sla_due_at.asc().nullslast(),
+                NurseReviewTicket.created_at.asc(),
+            )
+        )
     if status:
         stmt = stmt.where(NurseReviewTicket.status == status.upper())
     if priority:
@@ -140,10 +169,12 @@ async def get_ticket(
     current: CurrentUser = Depends(require_reviewer),
     db: AsyncSession = Depends(get_db),
 ):
-    rp = await _get_reviewer_profile(current.id, db)
+    from app.core.deps import is_admin
+    rp = await _get_reviewer_profile_or_none(current.id, db)
+    if not rp and not is_admin(current.role):
+        raise HTTPException(status_code=404, detail="Reviewer profile not found for your account")
     t = await _ticket_or_404(ticket_id, db)
     # Admin can see any; reviewer can only see their own.
-    from app.core.deps import is_admin
     if not is_admin(current.role) and t.assigned_reviewer_id != rp.id:
         raise HTTPException(status_code=403, detail="This ticket is not assigned to you")
     return serialize_ticket(t)
@@ -161,17 +192,38 @@ async def update_ticket_status(
     current: CurrentUser = Depends(require_reviewer),
     db: AsyncSession = Depends(get_db),
 ):
-    """Reviewer updates the status of a ticket assigned to them."""
-    rp = await _get_reviewer_profile(current.id, db)
-    t = await _ticket_or_404(ticket_id, db)
+    """Reviewer updates the status of a ticket assigned to them. Admins can
+    update any ticket even without a ReviewerProfile of their own."""
     from app.core.deps import is_admin
+    rp = await _get_reviewer_profile_or_none(current.id, db)
+    if not rp and not is_admin(current.role):
+        raise HTTPException(status_code=404, detail="Reviewer profile not found for your account")
+    t = await _ticket_or_404(ticket_id, db)
     if not is_admin(current.role) and t.assigned_reviewer_id != rp.id:
         raise HTTPException(status_code=403, detail="Not your ticket")
     new_status = payload.status.upper()
     if new_status not in VALID_REVIEWER_STATUSES:
         raise HTTPException(status_code=400, detail=f"Invalid status. Choose: {VALID_REVIEWER_STATUSES}")
-    t.status = new_status
+
+    # BUGFIX: this endpoint used to only flip `t.status` on the ticket row.
+    # That drives the reviewer/admin queue UI (the "Stage Progression" /
+    # "Escalate" screen), but it never touched WorkerProfile.onboarding_status
+    # or User.status — so a reviewer could move a ticket all the way to
+    # APPROVED while the worker's own account (and the nurse app's "under
+    # review" banner) stayed on pending_review, and the worker never became
+    # eligible for booking dispatch. APPROVED/REJECTED now go through the
+    # same shared service as the admin worker-approval endpoints, so both
+    # sides always agree.
+    if new_status == "APPROVED":
+        from app.services.worker_approval import approve_worker_profile
+        await approve_worker_profile(db, t.nurse_id)
+    elif new_status == "REJECTED":
+        from app.services.worker_approval import reject_worker_profile
+        await reject_worker_profile(db, t.nurse_id, payload.note)
+    else:
+        t.status = new_status
     await db.commit()
+    await db.refresh(t)
     return serialize_ticket(t)
 
 
