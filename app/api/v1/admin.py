@@ -83,23 +83,15 @@ REQUIRED_DOCUMENTS_BY_WORKER_TYPE = {
 }
 
 
-async def _sync_ticket_status(db: AsyncSession, worker_id: UUID, new_status: str) -> None:
-    """Keep the reviewer-queue ticket (NurseReviewTicket) in sync with worker
-    onboarding / document review actions taken from the admin endpoints below.
-
-    Without this, WorkerDocument/WorkerProfile get updated but the ticket that
-    actually drives the reviewer's queue UI (/api/review/my-queue) never
-    changes, so cards stay stuck on "PENDING REVIEW" forever.
-    """
-    res = await db.execute(
-        select(NurseReviewTicket).where(
-            NurseReviewTicket.nurse_id == worker_id,
-            NurseReviewTicket.status.in_(_OPEN_TICKET_STATUSES),
-        )
-    )
-    ticket = res.scalar_one_or_none()
-    if ticket:
-        ticket.status = new_status
+# NOTE: worker approve/reject logic now lives in
+# app/services/worker_approval.py so both this admin router AND the
+# reviewer-ticket router (app/api/v1/review_tickets.py) share one
+# implementation and can never drift out of sync with each other.
+from app.services.worker_approval import (
+    approve_worker_profile,
+    reject_worker_profile,
+    sync_ticket_status as _sync_ticket_status,
+)
 
 
 class DocumentReviewRequest(BaseModel):
@@ -231,51 +223,10 @@ async def approve_worker(
     current: CurrentUser = Depends(require_reviewer),
     db: AsyncSession = Depends(get_db),
 ):
-    res = await db.execute(select(WorkerProfile).where(WorkerProfile.id == worker_id))
-    wp = res.scalar_one_or_none()
-    if not wp:
-        raise HTTPException(status_code=404, detail="Worker not found")
-    if wp.onboarding_status != WorkerOnboardingStatus.pending_review:
-        raise HTTPException(status_code=409, detail="Worker has not submitted onboarding for review")
-    docs_res = await db.execute(select(WorkerDocument).where(WorkerDocument.worker_id == wp.id))
-    docs = list(docs_res.scalars().all())
-    required = REQUIRED_DOCUMENTS_BY_WORKER_TYPE.get(
-        getattr(wp, "worker_type", WorkerType.nurse),
-        REQUIRED_DOCUMENTS_BY_WORKER_TYPE[WorkerType.nurse],
-    )
-    verified_types = {
-        d.document_type
-        for d in docs
-        if d.verification_status == "verified"
-        and (d.valid_until is None or d.valid_until >= date.today())
-    }
-    missing_verified = sorted(required - verified_types)
-    if missing_verified:
-        raise HTTPException(
-            status_code=409,
-            detail={"message": "Required documents are not verified", "documents": missing_verified},
-        )
-    if wp.background_check_status != "passed":
-        raise HTTPException(status_code=409, detail="Background check has not passed")
-    wp.onboarding_status = WorkerOnboardingStatus.approved
-    wp.onboarding_reviewed_at = datetime.now(timezone.utc)
-    wp.onboarding_rejection_reason = None
-    # ACTIVATE the account: the worker was held in `onboarding` until now.
-    ures = await db.execute(select(User).where(User.id == wp.user_id))
-    wuser = ures.scalar_one_or_none()
-    if wuser and wuser.status == UserStatus.onboarding:
-        wuser.status = UserStatus.active
-    # Award the worker's tier badge on first approval (skill-based badge).
-    from app.services.badges import award_tier_badge
-    await award_tier_badge(db, wp)
-    # BUGFIX: approval used to never create WorkerServiceQualification rows,
-    # so any service/package gated only by tier (no training/cert/assessment)
-    # stayed permanently locked with locked_reason=QUALIFICATION_RECORD_MISSING
-    # and no way for the worker to opt in or request access.
-    from app.services.qualification import sync_tier_qualifications
-    await sync_tier_qualifications(db, wp)
-    # Keep the reviewer-queue ticket in sync so the card leaves "PENDING REVIEW".
-    await _sync_ticket_status(db, wp.id, "APPROVED")
+    # Delegates to the shared approve/reject service (app/services/worker_approval.py)
+    # so this endpoint and the reviewer-ticket "APPROVED" status update
+    # (app/api/v1/review_tickets.py) can never fall out of sync again.
+    await approve_worker_profile(db, worker_id)
     await db.commit()
     return {"approved": True}
 
@@ -343,16 +294,7 @@ async def reject_worker(
     current: CurrentUser = Depends(require_reviewer),
     db: AsyncSession = Depends(get_db),
 ):
-    res = await db.execute(select(WorkerProfile).where(WorkerProfile.id == worker_id))
-    wp = res.scalar_one_or_none()
-    if not wp:
-        raise HTTPException(status_code=404, detail="Worker not found")
-    wp.onboarding_status = WorkerOnboardingStatus.rejected
-    wp.onboarding_reviewed_at = datetime.now(timezone.utc)
-    wp.onboarding_rejection_reason = payload.reason.strip()
-    wp.availability = "offline"
-    # Keep the reviewer-queue ticket in sync so the card leaves the queue.
-    await _sync_ticket_status(db, wp.id, "REJECTED")
+    await reject_worker_profile(db, worker_id, payload.reason.strip())
     await db.commit()
     return {"rejected": True}
 

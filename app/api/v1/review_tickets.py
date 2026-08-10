@@ -204,8 +204,26 @@ async def update_ticket_status(
     new_status = payload.status.upper()
     if new_status not in VALID_REVIEWER_STATUSES:
         raise HTTPException(status_code=400, detail=f"Invalid status. Choose: {VALID_REVIEWER_STATUSES}")
-    t.status = new_status
+
+    # BUGFIX: this endpoint used to only flip `t.status` on the ticket row.
+    # That drives the reviewer/admin queue UI (the "Stage Progression" /
+    # "Escalate" screen), but it never touched WorkerProfile.onboarding_status
+    # or User.status — so a reviewer could move a ticket all the way to
+    # APPROVED while the worker's own account (and the nurse app's "under
+    # review" banner) stayed on pending_review, and the worker never became
+    # eligible for booking dispatch. APPROVED/REJECTED now go through the
+    # same shared service as the admin worker-approval endpoints, so both
+    # sides always agree.
+    if new_status == "APPROVED":
+        from app.services.worker_approval import approve_worker_profile
+        await approve_worker_profile(db, t.nurse_id)
+    elif new_status == "REJECTED":
+        from app.services.worker_approval import reject_worker_profile
+        await reject_worker_profile(db, t.nurse_id, payload.note)
+    else:
+        t.status = new_status
     await db.commit()
+    await db.refresh(t)
     return serialize_ticket(t)
 
 
