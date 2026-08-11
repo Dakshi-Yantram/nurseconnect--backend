@@ -39,7 +39,7 @@ from app.core.deps import (
     require_roles,
 )
 from app.core.redis_client import redis_client
-from app.integrations.providers import msg91_client
+from app.integrations.providers import ExternalProviderError, cloudinary_client, msg91_client
 from app.models.enums import (
     BookingStatus,
     BookingType,
@@ -130,6 +130,22 @@ async def create_composite_booking(
     if not package_fee:
         raise HTTPException(status_code=400, detail="Package has no configured price")
 
+    prescription_url = payload.prescription_cloudinary_url
+    prescription_public_id = payload.prescription_cloudinary_public_id
+    if payload.prescription_base64:
+        try:
+            upload = await cloudinary_client.upload_base64(
+                payload.prescription_base64,
+                folder=f"nurseconnect/prescriptions/{profile.id}",
+                resource_type="auto",
+            )
+        except ExternalProviderError as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+        prescription_url = upload.get("secure_url") or upload.get("url")
+        prescription_public_id = upload.get("public_id")
+    if not prescription_url:
+        raise HTTPException(status_code=400, detail="Attach a prescription (photo or file) before booking")
+
     booking = Booking(
         booking_ref=_gen_booking_ref(),
         consumer_id=profile.id,
@@ -160,8 +176,8 @@ async def create_composite_booking(
         patient_id=patient.id,
         booking_id=booking.id,
         uploaded_by=profile.user_id,
-        cloudinary_url=payload.prescription_cloudinary_url,
-        cloudinary_public_id=payload.prescription_cloudinary_public_id,
+        cloudinary_url=prescription_url,
+        cloudinary_public_id=prescription_public_id,
         status=PrescriptionStatus.pending_review,
     )
     db.add(prescription)
@@ -431,7 +447,21 @@ async def submit_pre_procedure_photo(
             detail={"code": "QUALITY_DISCREPANCY_ALERT", "message": "This booking is flagged for supervisor review."},
         )
 
-    visit.pre_procedure_photo_url = payload.photo_url
+    photo_url = payload.photo_url
+    if payload.photo_base64:
+        try:
+            upload = await cloudinary_client.upload_base64(
+                payload.photo_base64,
+                folder=f"nurseconnect/visits/{visit.id}/pre-procedure",
+                resource_type="image",
+            )
+        except ExternalProviderError as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+        photo_url = upload.get("secure_url") or upload.get("url")
+    if not photo_url:
+        raise HTTPException(status_code=400, detail="Attach the pre-procedure photo")
+
+    visit.pre_procedure_photo_url = photo_url
     visit.pre_procedure_photo_meta = {
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "latitude": float(payload.latitude),
@@ -468,7 +498,21 @@ async def submit_post_procedure_photo(
     if not visit.pre_procedure_photo_url:
         raise HTTPException(status_code=400, detail="Pre-procedure photo must be captured first")
 
-    visit.post_procedure_photo_url = payload.photo_url
+    photo_url = payload.photo_url
+    if payload.photo_base64:
+        try:
+            upload = await cloudinary_client.upload_base64(
+                payload.photo_base64,
+                folder=f"nurseconnect/visits/{visit.id}/post-procedure",
+                resource_type="image",
+            )
+        except ExternalProviderError as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+        photo_url = upload.get("secure_url") or upload.get("url")
+    if not photo_url:
+        raise HTTPException(status_code=400, detail="Attach the post-procedure photo")
+
+    visit.post_procedure_photo_url = photo_url
     visit.post_procedure_photo_meta = {
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "latitude": float(payload.latitude),

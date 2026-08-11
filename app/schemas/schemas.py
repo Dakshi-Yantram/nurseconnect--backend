@@ -582,15 +582,18 @@ class SafetyChecklistStatusOut(BaseModel):
 
 class PreProcedurePhotoSubmit(BaseModel):
     """One live-camera photo showing the sealed, unopened kit + the Rx.
-    photo_url should already point at uploaded storage (e.g. Cloudinary);
-    this endpoint just records it with the required metadata overlay."""
-    photo_url: str
+    Either pass an already-hosted `photo_url`, OR pass `photo_base64`
+    (a data: URI or raw base64 string straight from the camera) and the
+    endpoint will upload it to Cloudinary itself."""
+    photo_url: Optional[str] = None
+    photo_base64: Optional[str] = None
     latitude: Decimal
     longitude: Decimal
 
 
 class PostProcedurePhotoSubmit(BaseModel):
-    photo_url: str
+    photo_url: Optional[str] = None
+    photo_base64: Optional[str] = None
     latitude: Decimal
     longitude: Decimal
 
@@ -632,8 +635,12 @@ class CompositeBookingCreate(BaseModel):
     latitude: Decimal
     longitude: Decimal
     special_instructions: Optional[str] = None
-    prescription_cloudinary_url: str
-    prescription_cloudinary_public_id: str
+    # Either pass an already-hosted URL+public_id, OR pass
+    # prescription_base64 (data: URI or raw base64) and the endpoint will
+    # upload it to Cloudinary itself.
+    prescription_cloudinary_url: Optional[str] = None
+    prescription_cloudinary_public_id: Optional[str] = None
+    prescription_base64: Optional[str] = None
 
 
 class VisitRecordOut(ORMModel):
