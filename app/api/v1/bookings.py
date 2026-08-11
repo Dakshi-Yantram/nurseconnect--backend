@@ -332,7 +332,9 @@ async def new_requests(profile: WorkerProfile = Depends(get_worker_profile), db:
     res = await db.execute(
         select(Booking).where(
             Booking.worker_id.is_(None),
-            Booking.status.in_([BookingStatus.confirmed, BookingStatus.rematch_pending]),
+            # searching_nurse == Workflow 1 composite bookings post-Rx-approval,
+            # dispatchable the same way as a normal confirmed booking.
+            Booking.status.in_([BookingStatus.confirmed, BookingStatus.rematch_pending, BookingStatus.searching_nurse]),
         ).order_by(Booking.scheduled_date.asc()).limit(50)
     )
     items: list[Booking] = list(res.scalars().all())
@@ -645,7 +647,10 @@ async def accept_booking(
     """
     worker_id = profile.id
     now = datetime.now(timezone.utc)
-    claimable_statuses = (BookingStatus.confirmed, BookingStatus.rematch_pending)
+    # searching_nurse == Workflow 1 (Composite Care Package) dispatch state,
+    # entered once the pharmacist has approved the Rx — claimable exactly
+    # like a normal confirmed booking.
+    claimable_statuses = (BookingStatus.confirmed, BookingStatus.rematch_pending, BookingStatus.searching_nurse)
 
     # Patch 2 — qualification + opt-in re-check before claim. Fetch booking
     # (without locking it) to identify the target service/package.

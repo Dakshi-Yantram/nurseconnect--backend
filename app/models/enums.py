@@ -112,6 +112,16 @@ class BookingStatus(str, Enum):
     missed = "missed"
     rematch_pending = "rematch_pending"
     disputed = "disputed"
+    # ── Workflow 1: Composite Care Package (material_included bookings) ──
+    prescription_pending = "prescription_pending"     # Rx uploaded, awaiting pharmacist review
+    searching_nurse = "searching_nurse"                # Rx approved, dispatch engine searching
+    quality_discrepancy_alert = "quality_discrepancy_alert"  # nurse/patient safety-check mismatch
+
+
+class FulfillmentRoute(str, Enum):
+    """How the procedural kit reaches the nurse for a material_included booking."""
+    pouch_stock = "pouch_stock"
+    partner_pickup = "partner_pickup"
 
 
 class BookingType(str, Enum):
