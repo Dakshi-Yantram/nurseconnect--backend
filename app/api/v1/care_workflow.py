@@ -355,7 +355,11 @@ async def submit_documentation_item(
         fid = it.get("field_id")
         fdef = next((f for f in (wf.documentation_template.mandatory_fields or []) if f.get("field_id") == fid), None)
         ftype = (fdef or {}).get("type") if fdef else None
-        if ftype == "photo" or it.get("file_url"):
+        item_value = it.get("value") if isinstance(it.get("value"), dict) else {}
+        has_material_rx_photo = ftype == "material_check" and bool(
+            item_value.get("prescription_file_url") or it.get("prescription_file_url")
+        )
+        if ftype in ("photo", "packaging_integrity_check") or has_material_rx_photo or it.get("file_url"):
             item_has_photo = True
             break
     if template_requires_photo_consent or item_has_photo:
