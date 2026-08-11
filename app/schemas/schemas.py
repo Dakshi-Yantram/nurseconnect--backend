@@ -55,6 +55,9 @@ class OtpVerifyRequest(BaseModel):
     phone_e164: str
     code: str
     role: UserRole = UserRole.consumer
+    # Optional display name, supplied when the mobile app collects it during
+    # first-time OTP signup. Only applied when creating a brand-new account.
+    full_name: Optional[str] = None
     device_id: Optional[str] = None
     device_platform: Optional[str] = None
     fcm_token: Optional[str] = None
@@ -248,11 +251,20 @@ class WorkerProfileOut(ORMModel):
     years_of_experience: int
     languages_spoken: Optional[List[str]] = None
     specialisations: Optional[List[str]] = None
+    date_of_birth: Optional[date] = None
     registration_no: Optional[str] = None
     registration_authority: Optional[str] = None
     registration_valid_until: Optional[date] = None
+    home_address: Optional[str] = None
     base_city: Optional[str] = None
     service_radius_km: int
+    home_latitude: Optional[Decimal] = None
+    home_longitude: Optional[Decimal] = None
+    # Bank holder + IFSC are safe to echo back so the profile form can show
+    # what's on file. The account NUMBER is intentionally never returned —
+    # it's write-only, so the form shows a blank field to re-enter.
+    bank_account_holder: Optional[str] = None
+    bank_ifsc: Optional[str] = None
     rating_average: Decimal
     rating_count: int
     completed_visits_count: int
@@ -350,6 +362,11 @@ class CarePackageOut(ORMModel):
     available_cities: Optional[List[str]] = None
     is_active: bool
     primary_service_id: Optional[UUID] = None
+    gate: Optional[str] = None
+    required_training_module_codes: Optional[List[str]] = None
+    required_assessment_codes: Optional[List[str]] = None
+    required_specialty_tags: Optional[List[str]] = None
+    practical_checklist_items: Optional[List[str]] = None
     # Full set of service ids included in this package (primary + any
     # additional ones). Populated by the catalog API from
     # CarePackage.included_service_ids (falling back to primary_service_id).
@@ -384,7 +401,19 @@ class BookingCreate(BaseModel):
     latitude: Optional[Decimal] = None
     longitude: Optional[Decimal] = None
     special_instructions: Optional[str] = None
+    # Accepted for API compatibility but intentionally NOT used to assign the
+    # booking — see the note in bookings.create_booking. Dispatch is always by
+    # radius wave plus an explicit worker claim.
     preferred_worker_id: Optional[UUID] = None
+
+
+class BookingAddressUpdate(BaseModel):
+    # Same address contract as booking creation, but scoped to location edits
+    # before a booking is confirmed/dispatched.
+    address_id: Optional[UUID] = None
+    address: Optional[AddressSnapshot] = None
+    latitude: Optional[Decimal] = None
+    longitude: Optional[Decimal] = None
 
 
 class BookingOut(ORMModel):
@@ -423,6 +452,7 @@ class BookingOut(ORMModel):
     distance_km: Optional[float] = None
     patient_name: Optional[str] = None
     service_name: Optional[str] = None
+    worker_name: Optional[str] = None
 
 
 class BookingCancelRequest(BaseModel):
@@ -507,6 +537,112 @@ class ChecklistSubmit(BaseModel):
     is_offline_submitted: bool = False
 
 
+# ============================================================================
+# Workflow 1 — Composite Care Package (material_included bookings)
+# ============================================================================
+NURSE_SAFETY_CHECKLIST_ITEMS = (
+    "hand_hygiene",                    # Sanitized hands in front of patient/family
+    "sterile_gloves",                  # Donned fresh, sterile gloves
+    "identity_and_wellbeing_check",    # Verified patient identity & asked how they're feeling
+    "allergy_and_complaint_history",   # Assessed allergy history & current chief complaints
+    "prescription_and_expiry_check",   # Verified doctor's prescription & drug expiry date
+)
+
+
+class NurseSafetyChecklistSubmit(BaseModel):
+    """Nurse's side of Step 4 — pre-procedure clinical & intake questionnaire.
+    All five items are required; each is a plain yes/no."""
+    hand_hygiene: bool
+    sterile_gloves: bool
+    identity_and_wellbeing_check: bool
+    allergy_and_complaint_history: bool
+    prescription_and_expiry_check: bool
+    notes: Optional[str] = None
+
+
+class PatientSafetyVerificationSubmit(BaseModel):
+    """Patient/family's mirrored safety verification card. Same five items,
+    answered independently — mismatches against the nurse's answers are
+    what the anti-cheat logic checks for."""
+    hand_hygiene: bool
+    sterile_gloves: bool
+    identity_and_wellbeing_check: bool
+    allergy_and_complaint_history: bool
+    prescription_and_expiry_check: bool
+
+
+class SafetyChecklistStatusOut(BaseModel):
+    nurse_checklist: Optional[Dict[str, Any]] = None
+    nurse_submitted_at: Optional[datetime] = None
+    patient_verification: Optional[Dict[str, Any]] = None
+    patient_submitted_at: Optional[datetime] = None
+    quality_discrepancy: bool = False
+    both_submitted: bool = False
+
+
+class PreProcedurePhotoSubmit(BaseModel):
+    """One live-camera photo showing the sealed, unopened kit + the Rx.
+    Either pass an already-hosted `photo_url`, OR pass `photo_base64`
+    (a data: URI or raw base64 string straight from the camera) and the
+    endpoint will upload it to Cloudinary itself."""
+    photo_url: Optional[str] = None
+    photo_base64: Optional[str] = None
+    latitude: Decimal
+    longitude: Decimal
+
+
+class PostProcedurePhotoSubmit(BaseModel):
+    photo_url: Optional[str] = None
+    photo_base64: Optional[str] = None
+    latitude: Decimal
+    longitude: Decimal
+
+
+class CompletionOtpVerifyRequest(BaseModel):
+    otp: str
+    latitude: Decimal
+    longitude: Decimal
+    family_summary: Optional[str] = None
+    care_notes: Optional[str] = None
+
+
+class InvoiceLineItem(BaseModel):
+    description: str
+    amount: Decimal
+
+
+class InvoiceOut(ORMModel):
+    id: UUID
+    booking_id: UUID
+    invoice_number: str
+    invoice_type: str
+    gst_percent: Decimal
+    subtotal_amount: Decimal
+    tax_amount: Decimal
+    total_amount: Decimal
+    line_items: List[Dict[str, Any]]
+    pdf_url: Optional[str] = None
+    generated_at: datetime
+
+
+class CompositeBookingCreate(BaseModel):
+    """Step 1 — patient books a Composite Care Package."""
+    package_id: UUID
+    patient_id: UUID
+    scheduled_date: date
+    scheduled_start_time: time
+    address_snapshot: Dict[str, Any]
+    latitude: Decimal
+    longitude: Decimal
+    special_instructions: Optional[str] = None
+    # Either pass an already-hosted URL+public_id, OR pass
+    # prescription_base64 (data: URI or raw base64) and the endpoint will
+    # upload it to Cloudinary itself.
+    prescription_cloudinary_url: Optional[str] = None
+    prescription_cloudinary_public_id: Optional[str] = None
+    prescription_base64: Optional[str] = None
+
+
 class VisitRecordOut(ORMModel):
     id: UUID
     booking_id: UUID
@@ -541,6 +677,16 @@ class EscalationCreateRequest(BaseModel):
     trigger_type: str = "manual"
     notes: str
     trigger_details: Optional[Dict[str, Any]] = None
+
+
+class SOSCreateRequest(BaseModel):
+    """Personal-safety panic button — either party on a booking can fire this
+    when they feel unsafe (e.g. worker fears the customer, or customer fears
+    the worker). Deliberately minimal: in a real emergency people won't want
+    to fill out a form. Everything is optional except a way to locate them."""
+    notes: Optional[str] = None
+    latitude: Optional[float] = None
+    longitude: Optional[float] = None
 
 
 class EscalationResolveRequest(BaseModel):
@@ -724,6 +870,52 @@ class NotificationOut(ORMModel):
     read_at: Optional[datetime] = None
     created_at: datetime
 
+
+# ----- CALLING (Dyte) -----
+class CallStartResponse(BaseModel):
+    call_session_id: UUID
+    dyte_meeting_id: str
+    dyte_auth_token: str
+    dyte_org_id: str
+
+
+class CallSessionOut(ORMModel):
+    id: UUID
+    booking_id: UUID
+    dyte_meeting_id: str
+    initiated_by_role: str
+    status: str
+    started_at: datetime
+    callee_joined_at: Optional[datetime] = None
+    ended_at: Optional[datetime] = None
+    duration_seconds: Optional[int] = None
+    end_reason: Optional[str] = None
+
+
+class CallEndRequest(BaseModel):
+    end_reason: str = Field(default="completed")  # completed|no_answer|declined|failed
+
+
+class PushSubscribeRequest(BaseModel):
+    endpoint: str
+    p256dh_key: str
+    auth_key: str
+    user_agent: Optional[str] = None
+
+
+
+class DeviceRegisterRequest(BaseModel):
+    """Native mobile device registration for call ringing.
+
+    `device_id` identifies the physical install so re-registering updates the
+    existing session rather than piling up stale tokens. At least one of the
+    two tokens must be present; iOS supplies both (FCM for notifications,
+    APNs VoIP for PushKit ringing), Android supplies only `fcm_token`.
+    """
+    device_id: str
+    platform: str  # ios | android
+    fcm_token: Optional[str] = None
+    apns_voip_token: Optional[str] = None
 
 # ----- GENERIC -----
 class PageMeta(BaseModel):

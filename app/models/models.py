@@ -44,6 +44,7 @@ from app.models.enums import (
     DisputeRaiserType,
     DisputeStatus,
     DisputeType,
+    FulfillmentRoute,
     DrugAllergyEscalation,
     EscalationLevel,
     EscalationStatus,
@@ -118,6 +119,10 @@ class UserSession(Base):
     device_id: Mapped[Optional[str]] = mapped_column(String(255))
     device_platform: Mapped[Optional[str]] = mapped_column(String(50))
     fcm_token: Mapped[Optional[str]] = mapped_column(Text)
+    # iOS PushKit token. Deliberately separate from fcm_token: Apple issues a
+    # different token for VoIP pushes than for ordinary notifications, and
+    # sending a VoIP push to the standard token silently fails.
+    apns_voip_token: Mapped[Optional[str]] = mapped_column(Text)
     ip_address: Mapped[Optional[str]] = mapped_column(String(50))
     user_agent: Mapped[Optional[str]] = mapped_column(Text)
     revoked: Mapped[bool] = mapped_column(Boolean, default=False)
@@ -228,6 +233,7 @@ class WorkerProfile(Base):
         SQLEnum(WorkerType, name="worker_type_enum"),
         default=WorkerType.nurse, server_default="nurse", nullable=False, index=True,
     )
+    home_address: Mapped[Optional[str]] = mapped_column(String(500))
     base_city: Mapped[Optional[str]] = mapped_column(String(100), index=True)
     service_radius_km: Mapped[int] = mapped_column(Integer, default=10)
     home_latitude: Mapped[Optional[Decimal]] = mapped_column(Numeric(10, 8))
@@ -459,6 +465,9 @@ class CarePackage(Base):
     documentation_template_id: Mapped[Optional[UUID]] = mapped_column(PG_UUID(as_uuid=True), ForeignKey("documentation_templates.id"))
     requires_prescription: Mapped[bool] = mapped_column(Boolean, default=False)
     prescription_review_required: Mapped[bool] = mapped_column(Boolean, default=False)
+    # Workflow 1 — true for Composite Care Packages that bundle the nursing
+    # visit fee together with a procedural kit (single bundled Package_Fee).
+    material_included: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false")
     missed_visit_policy_id: Mapped[Optional[UUID]] = mapped_column(PG_UUID(as_uuid=True), ForeignKey("missed_visit_policies.id"))
     family_summary_template: Mapped[Optional[str]] = mapped_column(Text)
     family_report_frequency: Mapped[FamilyReportFrequency] = mapped_column(SQLEnum(FamilyReportFrequency, name="family_report_frequency"), default=FamilyReportFrequency.per_visit)
@@ -467,6 +476,12 @@ class CarePackage(Base):
     version: Mapped[int] = mapped_column(Integer, default=1)
     previous_version_id: Mapped[Optional[UUID]] = mapped_column(PG_UUID(as_uuid=True), ForeignKey("care_packages.id"))
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
+    # Soft-delete. Distinct from is_active: a disabled (is_active=False) package
+    # is still listed (greyed out, read-only) — a deleted one is gone from every
+    # list. Never hard-delete: existing CarePackageBooking rows reference this row.
+    is_deleted: Mapped[bool] = mapped_column(Boolean, default=False, index=True, server_default="false")
+    deleted_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    deleted_by: Mapped[Optional[UUID]] = mapped_column(PG_UUID(as_uuid=True), ForeignKey("users.id"))
     available_cities: Mapped[Optional[list]] = mapped_column(ARRAY(String))
     created_by: Mapped[Optional[UUID]] = mapped_column(PG_UUID(as_uuid=True), ForeignKey("users.id"))
     # Patch 2 — package-level qualification gating
@@ -614,8 +629,21 @@ class Booking(Base):
     # Patch 3 — Radius-wave dispatch tracking.
     assignment_wave: Mapped[int] = mapped_column(Integer, default=1, server_default="1")
     assignment_escalated_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    # When the booking became dispatchable to workers (payment captured →
+    # status confirmed). The wave clock runs from here, NOT created_at:
+    # workers only see confirmed bookings, so counting waves from creation
+    # burned the whole 20-minute wave window while the consumer was still
+    # on the payment screen.
+    dispatch_started_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now, server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now, onupdate=_now, server_default=func.now())
+
+    # ── Workflow 1: Composite Care Package (material_included bookings) ──
+    material_included: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false")
+    prescription_id: Mapped[Optional[UUID]] = mapped_column(PG_UUID(as_uuid=True), ForeignKey("prescriptions.id"))
+    fulfillment_route: Mapped[Optional[FulfillmentRoute]] = mapped_column(
+        SQLEnum(FulfillmentRoute, name="fulfillment_route")
+    )
 
     __table_args__ = (
         Index("ix_bookings_worker_date", "worker_id", "scheduled_date"),
@@ -674,6 +702,126 @@ class VisitRecord(Base):
     is_offline_synced: Mapped[bool] = mapped_column(Boolean, default=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now, server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now, onupdate=_now, server_default=func.now())
+
+    # ── Workflow 1 — Step 4: synchronized nurse/patient safety checklist ──
+    # Nurse's 5-item pre-procedure questionnaire, e.g.
+    # {"hand_hygiene": true, "sterile_gloves": true, "identity_verified": true,
+    #  "allergy_history_checked": true, "prescription_expiry_verified": true}
+    pre_procedure_checklist: Mapped[Optional[dict]] = mapped_column(JSONB)
+    pre_procedure_checklist_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    # Patient/family's mirrored yes/no safety verification card.
+    patient_safety_verification: Mapped[Optional[dict]] = mapped_column(JSONB)
+    patient_safety_verification_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    # True when nurse self-reported all-clear but patient flagged a mismatch.
+    quality_discrepancy: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false")
+    quality_discrepancy_reviewed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    quality_discrepancy_reviewed_by: Mapped[Optional[UUID]] = mapped_column(PG_UUID(as_uuid=True), ForeignKey("users.id"))
+
+    # ── Workflow 1 — Step 5/6: mandatory photo proof ──
+    pre_procedure_photo_url: Mapped[Optional[str]] = mapped_column(Text)   # sealed kit + Rx, one frame
+    pre_procedure_photo_meta: Mapped[Optional[dict]] = mapped_column(JSONB)  # {timestamp, lat, lng, order_id}
+    post_procedure_photo_url: Mapped[Optional[str]] = mapped_column(Text)  # dressed/completed site
+    post_procedure_photo_meta: Mapped[Optional[dict]] = mapped_column(JSONB)
+
+
+# ============================================================================
+# Workflow 1 — Step 7: Automated Invoicing
+# ============================================================================
+class Invoice(Base):
+    __tablename__ = "invoices"
+    id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), primary_key=True, default=_uuid)
+    booking_id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), ForeignKey("bookings.id", ondelete="CASCADE"), unique=True, index=True)
+    invoice_number: Mapped[str] = mapped_column(String(40), unique=True, index=True)
+    # "composite_healthcare_service" (material_included bundle, 0% GST) vs
+    # "professional_service" (nursing-only, taxable per local rules).
+    invoice_type: Mapped[str] = mapped_column(String(50), default="professional_service")
+    gst_percent: Mapped[Decimal] = mapped_column(Numeric(5, 2), default=0)
+    subtotal_amount: Mapped[Decimal] = mapped_column(Numeric(10, 2), nullable=False)
+    tax_amount: Mapped[Decimal] = mapped_column(Numeric(10, 2), default=0)
+    total_amount: Mapped[Decimal] = mapped_column(Numeric(10, 2), nullable=False)
+    line_items: Mapped[list] = mapped_column(JSONB, nullable=False)
+    pdf_url: Mapped[Optional[str]] = mapped_column(Text)
+    generated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now, server_default=func.now())
+
+
+# ============================================================================
+# In-app calling (Dyte) + best-effort background call push
+# ============================================================================
+class CallSession(Base):
+    """One row per call attempt on a booking. A booking can have many rows
+    (redials). dyte_meeting_id is reused across redials within the same
+    booking so history stays on one Dyte meeting."""
+    __tablename__ = "call_sessions"
+    id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), primary_key=True, default=_uuid)
+    booking_id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), ForeignKey("bookings.id", ondelete="CASCADE"), index=True, nullable=False)
+    dyte_meeting_id: Mapped[str] = mapped_column(String(120), nullable=False, index=True)
+    initiated_by_user_id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), ForeignKey("users.id"), nullable=False)
+    initiated_by_role: Mapped[str] = mapped_column(String(20), nullable=False)  # consumer | worker
+    callee_user_id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), ForeignKey("users.id"), nullable=False)
+    status: Mapped[str] = mapped_column(String(20), default="ringing", index=True)  # ringing|joined|missed|ended|failed
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now, server_default=func.now())
+    callee_joined_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    ended_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    duration_seconds: Mapped[Optional[int]] = mapped_column(Integer)
+    end_reason: Mapped[Optional[str]] = mapped_column(String(30))  # completed|no_answer|declined|failed
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now, server_default=func.now())
+
+
+class PushSubscription(Base):
+    """Web Push (VAPID) subscription — one row per browser/device the user has
+    granted notification permission on. Separate from UserSession.fcm_token
+    (native FCM). Used for the best-effort "ring while backgrounded" call
+    ping — see the accompanying writeup for the ceiling on what this can and
+    can't do (it cannot wake a force-killed app)."""
+    __tablename__ = "push_subscriptions"
+    id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), primary_key=True, default=_uuid)
+    user_id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), index=True, nullable=False)
+    endpoint: Mapped[str] = mapped_column(Text, nullable=False, unique=True)
+    p256dh_key: Mapped[str] = mapped_column(Text, nullable=False)
+    auth_key: Mapped[str] = mapped_column(Text, nullable=False)
+    user_agent: Mapped[Optional[str]] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now, server_default=func.now())
+    last_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now, onupdate=_now, server_default=func.now())
+
+
+# ============================================================================
+# In-app calling (Dyte) + best-effort background call push
+# ============================================================================
+class CallSession(Base):
+    """One row per call attempt on a booking. A booking can have many rows
+    (redials). dyte_meeting_id is reused across redials within the same
+    booking so history stays on one Dyte meeting."""
+    __tablename__ = "call_sessions"
+    id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), primary_key=True, default=_uuid)
+    booking_id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), ForeignKey("bookings.id", ondelete="CASCADE"), index=True, nullable=False)
+    dyte_meeting_id: Mapped[str] = mapped_column(String(120), nullable=False, index=True)
+    initiated_by_user_id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), ForeignKey("users.id"), nullable=False)
+    initiated_by_role: Mapped[str] = mapped_column(String(20), nullable=False)  # consumer | worker
+    callee_user_id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), ForeignKey("users.id"), nullable=False)
+    status: Mapped[str] = mapped_column(String(20), default="ringing", index=True)  # ringing|joined|missed|ended|failed
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now, server_default=func.now())
+    callee_joined_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    ended_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    duration_seconds: Mapped[Optional[int]] = mapped_column(Integer)
+    end_reason: Mapped[Optional[str]] = mapped_column(String(30))  # completed|no_answer|declined|failed
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now, server_default=func.now())
+
+
+class PushSubscription(Base):
+    """Web Push (VAPID) subscription — one row per browser/device the user has
+    granted notification permission on. Separate from UserSession.fcm_token
+    (native FCM). Used for the best-effort "ring while backgrounded" call
+    ping — see the accompanying writeup for the ceiling on what this can and
+    can't do (it cannot wake a force-killed app)."""
+    __tablename__ = "push_subscriptions"
+    id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), primary_key=True, default=_uuid)
+    user_id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), index=True, nullable=False)
+    endpoint: Mapped[str] = mapped_column(Text, nullable=False, unique=True)
+    p256dh_key: Mapped[str] = mapped_column(Text, nullable=False)
+    auth_key: Mapped[str] = mapped_column(Text, nullable=False)
+    user_agent: Mapped[Optional[str]] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now, server_default=func.now())
+    last_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now, onupdate=_now, server_default=func.now())
 
 
 # ============================================================================
