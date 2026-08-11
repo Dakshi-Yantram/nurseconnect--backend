@@ -785,6 +785,46 @@ class PushSubscription(Base):
 
 
 # ============================================================================
+# In-app calling (Dyte) + best-effort background call push
+# ============================================================================
+class CallSession(Base):
+    """One row per call attempt on a booking. A booking can have many rows
+    (redials). dyte_meeting_id is reused across redials within the same
+    booking so history stays on one Dyte meeting."""
+    __tablename__ = "call_sessions"
+    id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), primary_key=True, default=_uuid)
+    booking_id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), ForeignKey("bookings.id", ondelete="CASCADE"), index=True, nullable=False)
+    dyte_meeting_id: Mapped[str] = mapped_column(String(120), nullable=False, index=True)
+    initiated_by_user_id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), ForeignKey("users.id"), nullable=False)
+    initiated_by_role: Mapped[str] = mapped_column(String(20), nullable=False)  # consumer | worker
+    callee_user_id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), ForeignKey("users.id"), nullable=False)
+    status: Mapped[str] = mapped_column(String(20), default="ringing", index=True)  # ringing|joined|missed|ended|failed
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now, server_default=func.now())
+    callee_joined_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    ended_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    duration_seconds: Mapped[Optional[int]] = mapped_column(Integer)
+    end_reason: Mapped[Optional[str]] = mapped_column(String(30))  # completed|no_answer|declined|failed
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now, server_default=func.now())
+
+
+class PushSubscription(Base):
+    """Web Push (VAPID) subscription — one row per browser/device the user has
+    granted notification permission on. Separate from UserSession.fcm_token
+    (native FCM). Used for the best-effort "ring while backgrounded" call
+    ping — see the accompanying writeup for the ceiling on what this can and
+    can't do (it cannot wake a force-killed app)."""
+    __tablename__ = "push_subscriptions"
+    id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), primary_key=True, default=_uuid)
+    user_id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), index=True, nullable=False)
+    endpoint: Mapped[str] = mapped_column(Text, nullable=False, unique=True)
+    p256dh_key: Mapped[str] = mapped_column(Text, nullable=False)
+    auth_key: Mapped[str] = mapped_column(Text, nullable=False)
+    user_agent: Mapped[Optional[str]] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now, server_default=func.now())
+    last_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now, onupdate=_now, server_default=func.now())
+
+
+# ============================================================================
 # Patch 4 — Dynamic checklist / documentation engine
 # Per-question + per-field response rows, kept versioned & immutable per visit.
 # Schema is offline-sync ready (is_offline_submitted + synced_at + template_version).
