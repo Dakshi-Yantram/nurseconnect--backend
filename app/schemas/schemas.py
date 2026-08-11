@@ -537,6 +537,105 @@ class ChecklistSubmit(BaseModel):
     is_offline_submitted: bool = False
 
 
+# ============================================================================
+# Workflow 1 — Composite Care Package (material_included bookings)
+# ============================================================================
+NURSE_SAFETY_CHECKLIST_ITEMS = (
+    "hand_hygiene",                    # Sanitized hands in front of patient/family
+    "sterile_gloves",                  # Donned fresh, sterile gloves
+    "identity_and_wellbeing_check",    # Verified patient identity & asked how they're feeling
+    "allergy_and_complaint_history",   # Assessed allergy history & current chief complaints
+    "prescription_and_expiry_check",   # Verified doctor's prescription & drug expiry date
+)
+
+
+class NurseSafetyChecklistSubmit(BaseModel):
+    """Nurse's side of Step 4 — pre-procedure clinical & intake questionnaire.
+    All five items are required; each is a plain yes/no."""
+    hand_hygiene: bool
+    sterile_gloves: bool
+    identity_and_wellbeing_check: bool
+    allergy_and_complaint_history: bool
+    prescription_and_expiry_check: bool
+    notes: Optional[str] = None
+
+
+class PatientSafetyVerificationSubmit(BaseModel):
+    """Patient/family's mirrored safety verification card. Same five items,
+    answered independently — mismatches against the nurse's answers are
+    what the anti-cheat logic checks for."""
+    hand_hygiene: bool
+    sterile_gloves: bool
+    identity_and_wellbeing_check: bool
+    allergy_and_complaint_history: bool
+    prescription_and_expiry_check: bool
+
+
+class SafetyChecklistStatusOut(BaseModel):
+    nurse_checklist: Optional[Dict[str, Any]] = None
+    nurse_submitted_at: Optional[datetime] = None
+    patient_verification: Optional[Dict[str, Any]] = None
+    patient_submitted_at: Optional[datetime] = None
+    quality_discrepancy: bool = False
+    both_submitted: bool = False
+
+
+class PreProcedurePhotoSubmit(BaseModel):
+    """One live-camera photo showing the sealed, unopened kit + the Rx.
+    photo_url should already point at uploaded storage (e.g. Cloudinary);
+    this endpoint just records it with the required metadata overlay."""
+    photo_url: str
+    latitude: Decimal
+    longitude: Decimal
+
+
+class PostProcedurePhotoSubmit(BaseModel):
+    photo_url: str
+    latitude: Decimal
+    longitude: Decimal
+
+
+class CompletionOtpVerifyRequest(BaseModel):
+    otp: str
+    latitude: Decimal
+    longitude: Decimal
+    family_summary: Optional[str] = None
+    care_notes: Optional[str] = None
+
+
+class InvoiceLineItem(BaseModel):
+    description: str
+    amount: Decimal
+
+
+class InvoiceOut(ORMModel):
+    id: UUID
+    booking_id: UUID
+    invoice_number: str
+    invoice_type: str
+    gst_percent: Decimal
+    subtotal_amount: Decimal
+    tax_amount: Decimal
+    total_amount: Decimal
+    line_items: List[Dict[str, Any]]
+    pdf_url: Optional[str] = None
+    generated_at: datetime
+
+
+class CompositeBookingCreate(BaseModel):
+    """Step 1 — patient books a Composite Care Package."""
+    package_id: UUID
+    patient_id: UUID
+    scheduled_date: date
+    scheduled_start_time: time
+    address_snapshot: Dict[str, Any]
+    latitude: Decimal
+    longitude: Decimal
+    special_instructions: Optional[str] = None
+    prescription_cloudinary_url: str
+    prescription_cloudinary_public_id: str
+
+
 class VisitRecordOut(ORMModel):
     id: UUID
     booking_id: UUID
