@@ -1,13 +1,23 @@
-"""Workflow 1 — Customer Books WITH Material (Composite Care Package).
+"""The two guarded visit workflows.
 
-Endpoints for the full lifecycle described in the spec:
-  Step 1  POST /composite-care/bookings                          (patient books + uploads Rx)
+Workflow 1 — Customer Books WITH Material (Composite Care Package): the
+platform supplies the procedural kit (`material_included=True`).
+Workflow 2 — Customer Books WITHOUT Material (Service-Only): the patient
+supplies their own materials, so booking carries a supply guardrail and the
+nurse additionally inspects and expiry-checks those supplies on arrival.
+
+Steps 2–7 are identical for both, so they share one set of endpoints that
+branch on `booking.material_included` rather than being duplicated:
+
+  Step 1  POST /composite-care/bookings                          (W1: books + uploads Rx)
+          POST /composite-care/bookings/service-only             (W2: + supply guardrail)
   Step 2  POST /composite-care/bookings/{id}/approve-prescription (pharmacist/reviewer)
           POST /composite-care/bookings/{id}/reject-prescription
   Step 3  Dispatch reuses the existing accept-booking flow (bookings.py) —
           searching_nurse is claimable exactly like confirmed (see patch there).
   Step 4  POST /composite-care/bookings/{id}/nurse-safety-checklist   (nurse)
           POST /composite-care/bookings/{id}/patient-safety-verification (consumer)
+          POST /composite-care/bookings/{id}/report-supply-issue       (W2 nurse)
           GET  /composite-care/bookings/{id}/safety-checklist-status
   Step 5  POST /composite-care/bookings/{id}/pre-procedure-photo     (nurse)
   Step 6  POST /composite-care/bookings/{id}/post-procedure-photo    (nurse)
@@ -23,10 +33,11 @@ unlock.
 """
 import random
 from datetime import datetime, timezone
-from typing import Optional
+from typing import List, Optional
 from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Depends, HTTPException
+from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -69,7 +80,10 @@ from app.schemas.schemas import (
     PatientSafetyVerificationSubmit,
     PostProcedurePhotoSubmit,
     PreProcedurePhotoSubmit,
+    PrescriptionQueueItem,
     SafetyChecklistStatusOut,
+    ServiceOnlyBookingCreate,
+    SupplyIssueReport,
     VisitRecordOut,
 )
 from app.schemas.schemas import BookingOut
@@ -79,7 +93,12 @@ from app.services.care_workflow_engine import (
     validate_documentation_completion,
 )
 from app.services.common_services import audit, notify_parties
-from app.services.composite_care_workflow import diff_safety_checklists, generate_invoice
+from app.services.composite_care_workflow import (
+    checklist_items_for,
+    diff_safety_checklists,
+    generate_invoice,
+    is_guarded_workflow,
+)
 from app.services.insurance_service import create_or_update_assessment
 from app.websockets.manager import booking_topic, manager
 
@@ -88,6 +107,35 @@ router = APIRouter(prefix="/composite-care", tags=["composite-care"])
 
 def _gen_booking_ref() -> str:
     return f"NC{datetime.now().strftime('%y%m%d')}{uuid4().hex[:6].upper()}"
+
+
+async def _upload_base64(data_base64: str, folder: str, resource_type: str = "image") -> dict:
+    try:
+        return await cloudinary_client.upload_base64(
+            data_base64, folder=folder, resource_type=resource_type
+        )
+    except ExternalProviderError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+
+async def _resolve_prescription(payload, consumer_id) -> tuple[str, Optional[str]]:
+    """Both workflows require a doctor's prescription at booking time, passed
+    either as an already-hosted URL or as base64 for us to upload."""
+    url = payload.prescription_cloudinary_url
+    public_id = payload.prescription_cloudinary_public_id
+    if payload.prescription_base64:
+        upload = await _upload_base64(
+            payload.prescription_base64,
+            folder=f"nurseconnect/prescriptions/{consumer_id}",
+            resource_type="auto",
+        )
+        url = upload.get("secure_url") or upload.get("url")
+        public_id = upload.get("public_id")
+    if not url:
+        raise HTTPException(
+            status_code=400, detail="Attach a prescription (photo or file) before booking"
+        )
+    return url, public_id
 
 
 # ============================================================================
@@ -130,21 +178,7 @@ async def create_composite_booking(
     if not package_fee:
         raise HTTPException(status_code=400, detail="Package has no configured price")
 
-    prescription_url = payload.prescription_cloudinary_url
-    prescription_public_id = payload.prescription_cloudinary_public_id
-    if payload.prescription_base64:
-        try:
-            upload = await cloudinary_client.upload_base64(
-                payload.prescription_base64,
-                folder=f"nurseconnect/prescriptions/{profile.id}",
-                resource_type="auto",
-            )
-        except ExternalProviderError as exc:
-            raise HTTPException(status_code=502, detail=str(exc)) from exc
-        prescription_url = upload.get("secure_url") or upload.get("url")
-        prescription_public_id = upload.get("public_id")
-    if not prescription_url:
-        raise HTTPException(status_code=400, detail="Attach a prescription (photo or file) before booking")
+    prescription_url, prescription_public_id = await _resolve_prescription(payload, profile.id)
 
     booking = Booking(
         booking_ref=_gen_booking_ref(),
@@ -190,9 +224,166 @@ async def create_composite_booking(
     return BookingOut.model_validate(booking)
 
 
+@router.post("/bookings/service-only", response_model=BookingOut)
+async def create_service_only_booking(
+    payload: ServiceOnlyBookingCreate,
+    profile: ConsumerProfile = Depends(get_consumer_profile),
+    db: AsyncSession = Depends(get_db),
+):
+    """Workflow 2 Step 1 — patient books a Service-Only package and provides
+    their own materials.
+
+    The supply guardrail is enforced here rather than in the client: every
+    confirmation item must be ticked AND a photo of the supplies laid out
+    next to the prescription must be attached. Because the booking is created
+    in `pending_payment`, failing either check means no payable booking ever
+    exists — which is what "the app blocks the payment step" means on the
+    server side, where it can't be bypassed."""
+    pres = await db.execute(
+        select(Patient).where(Patient.id == payload.patient_id, Patient.consumer_id == profile.id)
+    )
+    patient = pres.scalar_one_or_none()
+    if not patient:
+        raise HTTPException(status_code=404, detail="Patient not found")
+
+    kres = await db.execute(
+        select(CarePackage).where(CarePackage.id == payload.package_id, CarePackage.is_active.is_(True))
+    )
+    package = kres.scalar_one_or_none()
+    if not package:
+        raise HTTPException(status_code=404, detail="Care package not found")
+    if package.material_included:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "NOT_A_SERVICE_ONLY_PACKAGE",
+                "message": "This package bundles a procedural kit. Use the composite booking flow.",
+            },
+        )
+
+    confirmation = payload.supply_confirmation.model_dump()
+    unconfirmed = sorted(k for k, v in confirmation.items() if not v)
+    if unconfirmed:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "SUPPLIES_NOT_CONFIRMED",
+                "message": "Confirm you have every required supply ready before booking.",
+                "unconfirmed_items": unconfirmed,
+            },
+        )
+
+    supply_photo_url = payload.supply_photo_url
+    if payload.supply_photo_base64:
+        upload = await _upload_base64(
+            payload.supply_photo_base64,
+            folder=f"nurseconnect/supply-proof/{profile.id}",
+        )
+        supply_photo_url = upload.get("secure_url") or upload.get("url")
+    if not supply_photo_url:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "SUPPLY_PHOTO_REQUIRED",
+                "message": "Attach one photo of your supplies next to the prescription before booking.",
+            },
+        )
+
+    package_fee = package.package_price or package.per_visit_price
+    if not package_fee:
+        raise HTTPException(status_code=400, detail="Package has no configured price")
+
+    prescription_url, prescription_public_id = await _resolve_prescription(payload, profile.id)
+
+    booking = Booking(
+        booking_ref=_gen_booking_ref(),
+        consumer_id=profile.id,
+        patient_id=patient.id,
+        booking_type=BookingType.package,
+        package_id=package.id,
+        worker_id=None,
+        status=BookingStatus.pending_payment,
+        scheduled_date=payload.scheduled_date,
+        scheduled_start_time=payload.scheduled_start_time,
+        scheduled_duration_minutes=package.shift_hours * 60 if package.shift_hours else 60,
+        address_snapshot=payload.address_snapshot,
+        latitude=payload.latitude,
+        longitude=payload.longitude,
+        base_amount=package_fee,
+        surge_amount=0,
+        subsidy_amount=0,
+        tax_amount=0,
+        total_amount=package_fee,  # Service-Only fee — no materials are billed
+        payment_status=PaymentStatus.pending,
+        special_instructions=payload.special_instructions,
+        material_included=False,
+        patient_supply_confirmation=confirmation,
+        patient_supply_photo_url=supply_photo_url,
+    )
+    db.add(booking)
+    await db.flush()
+
+    prescription = Prescription(
+        patient_id=patient.id,
+        booking_id=booking.id,
+        uploaded_by=profile.user_id,
+        cloudinary_url=prescription_url,
+        cloudinary_public_id=prescription_public_id,
+        status=PrescriptionStatus.pending_review,
+    )
+    db.add(prescription)
+    await db.flush()
+    booking.prescription_id = prescription.id
+
+    await audit(
+        db, profile.user_id, "consumer", "composite_care.service_only_booking_created", "booking", booking.id
+    )
+    await db.commit()
+    await db.refresh(booking)
+    return BookingOut.model_validate(booking)
+
+
 # ============================================================================
 # Step 2 — Quality & Verification (pharmacist / admin dashboard)
 # ============================================================================
+@router.get("/prescription-queue", response_model=List[PrescriptionQueueItem])
+async def prescription_queue(
+    current: CurrentUser = Depends(require_roles(UserRole.admin, UserRole.reviewer, UserRole.operations)),
+    db: AsyncSession = Depends(get_db),
+):
+    """Every booking waiting on pharmacist Rx review, oldest first.
+
+    Covers both guarded workflows — Workflow 2 rows additionally carry the
+    patient's supply confirmation and supply photo, which the pharmacist
+    checks against the prescription before approving."""
+    res = await db.execute(
+        select(Booking, Prescription, Patient, User)
+        .join(Prescription, Prescription.id == Booking.prescription_id)
+        .join(Patient, Patient.id == Booking.patient_id)
+        .join(ConsumerProfile, ConsumerProfile.id == Booking.consumer_id)
+        .join(User, User.id == ConsumerProfile.user_id)
+        .where(Booking.status == BookingStatus.prescription_pending)
+        .order_by(Booking.created_at.asc())
+    )
+    return [
+        PrescriptionQueueItem(
+            booking_id=booking.id,
+            booking_ref=booking.booking_ref,
+            patient_name=patient.full_name,
+            consumer_name=user.full_name,
+            scheduled_date=booking.scheduled_date,
+            scheduled_start_time=booking.scheduled_start_time,
+            total_amount=booking.total_amount,
+            material_included=booking.material_included,
+            prescription_url=prescription.cloudinary_url,
+            patient_supply_confirmation=booking.patient_supply_confirmation,
+            patient_supply_photo_url=booking.patient_supply_photo_url,
+            created_at=booking.created_at,
+        )
+        for booking, prescription, patient, user in res.all()
+    ]
+
+
 @router.post("/bookings/{booking_id}/approve-prescription", response_model=BookingOut)
 async def approve_prescription(
     booking_id: UUID,
@@ -201,8 +392,8 @@ async def approve_prescription(
 ):
     bres = await db.execute(select(Booking).where(Booking.id == booking_id))
     booking = bres.scalar_one_or_none()
-    if not booking or not booking.material_included:
-        raise HTTPException(status_code=404, detail="Composite care booking not found")
+    if not booking or not is_guarded_workflow(booking):
+        raise HTTPException(status_code=404, detail="Guarded care booking not found")
     if booking.status != BookingStatus.prescription_pending:
         raise HTTPException(
             status_code=400,
@@ -238,17 +429,25 @@ async def approve_prescription(
     return BookingOut.model_validate(booking)
 
 
+class PrescriptionRejectRequest(BaseModel):
+    """Why the pharmacist rejected the Rx. Sent as a body rather than a query
+    string — it's free text shown to the patient, and reasons routinely run
+    past what belongs in a URL."""
+    reason: str = Field(min_length=1, max_length=1000)
+
+
 @router.post("/bookings/{booking_id}/reject-prescription", response_model=BookingOut)
 async def reject_prescription(
     booking_id: UUID,
-    reason: str,
+    payload: PrescriptionRejectRequest,
     current: CurrentUser = Depends(require_roles(UserRole.admin, UserRole.reviewer, UserRole.operations)),
     db: AsyncSession = Depends(get_db),
 ):
+    reason = payload.reason.strip()
     bres = await db.execute(select(Booking).where(Booking.id == booking_id))
     booking = bres.scalar_one_or_none()
-    if not booking or not booking.material_included:
-        raise HTTPException(status_code=404, detail="Composite care booking not found")
+    if not booking or not is_guarded_workflow(booking):
+        raise HTTPException(status_code=404, detail="Guarded care booking not found")
 
     rxres = await db.execute(select(Prescription).where(Prescription.id == booking.prescription_id))
     prescription = rxres.scalar_one_or_none()
@@ -274,11 +473,35 @@ async def reject_prescription(
 # ============================================================================
 # Step 4 — Synchronized safety checklist (nurse + patient) + anti-cheat
 # ============================================================================
+def _require_checklist_items(answers: dict, booking: Booking) -> dict:
+    """Keep only the items this booking's workflow asks, and reject the
+    submission unless every one of them was actually answered.
+
+    The request models carry the union of both workflows' fields (the two
+    sets overlap), so this is where the per-workflow contract is enforced —
+    a Workflow 2 nurse can't satisfy the checklist by sending Workflow 1's
+    questions, and unanswered items can't slip through as null.
+    """
+    items = checklist_items_for(booking.material_included)
+    missing = [k for k in items if answers.get(k) is None]
+    if missing:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "CHECKLIST_INCOMPLETE",
+                "message": "Answer every safety item before submitting.",
+                "missing_items": missing,
+                "required_items": list(items),
+            },
+        )
+    return {k: bool(answers[k]) for k in items}
+
+
 async def _get_booking_and_visit(db: AsyncSession, booking_id: UUID) -> tuple[Booking, VisitRecord]:
     bres = await db.execute(select(Booking).where(Booking.id == booking_id))
     booking = bres.scalar_one_or_none()
-    if not booking or not booking.material_included:
-        raise HTTPException(status_code=404, detail="Composite care booking not found")
+    if not booking or not is_guarded_workflow(booking):
+        raise HTTPException(status_code=404, detail="Guarded care booking not found")
     vres = await db.execute(select(VisitRecord).where(VisitRecord.booking_id == booking_id))
     visit = vres.scalar_one_or_none()
     if not visit:
@@ -305,7 +528,8 @@ async def submit_nurse_safety_checklist(
     if not visit.check_in_at:
         raise HTTPException(status_code=400, detail="Verify the start OTP before submitting the safety checklist")
 
-    visit.pre_procedure_checklist = payload.model_dump(exclude={"notes"})
+    answers = _require_checklist_items(payload.model_dump(exclude={"notes"}), booking)
+    visit.pre_procedure_checklist = answers
     if payload.notes:
         visit.pre_procedure_checklist["notes"] = payload.notes
     visit.pre_procedure_checklist_at = datetime.now(timezone.utc)
@@ -340,11 +564,13 @@ async def submit_patient_safety_verification(
             },
         )
 
-    verification = payload.model_dump()
+    verification = _require_checklist_items(payload.model_dump(), booking)
     visit.patient_safety_verification = verification
     visit.patient_safety_verification_at = datetime.now(timezone.utc)
 
-    mismatches = diff_safety_checklists(visit.pre_procedure_checklist, verification)
+    mismatches = diff_safety_checklists(
+        visit.pre_procedure_checklist, verification, booking.material_included
+    )
     if mismatches:
         visit.quality_discrepancy = True
         booking.status = BookingStatus.quality_discrepancy_alert
@@ -399,6 +625,79 @@ async def submit_patient_safety_verification(
     return await _safety_checklist_status(booking, visit)
 
 
+@router.post("/bookings/{booking_id}/report-supply-issue", response_model=SafetyChecklistStatusOut)
+async def report_supply_issue(
+    booking_id: UUID,
+    payload: SupplyIssueReport,
+    profile: WorkerProfile = Depends(get_worker_profile),
+    db: AsyncSession = Depends(get_db),
+):
+    """Workflow 2 Step 4 — the nurse found a problem with the patient's own
+    supplies (broken sterile packaging, expired medicine).
+
+    Blocks the procedure and raises an ops escalation. Deliberately separate
+    from `quality_discrepancy`, which is the patient disputing the nurse's
+    hygiene self-report: this is the nurse reporting the patient's materials,
+    so conflating them would lose the distinction ops needs to triage."""
+    booking, visit = await _get_booking_and_visit(db, booking_id)
+    if booking.worker_id != profile.id:
+        raise HTTPException(status_code=403, detail="Not assigned to you")
+    if booking.material_included:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "NOT_A_SERVICE_ONLY_BOOKING",
+                "message": "Supply inspection applies to service-only bookings, where the patient provides materials.",
+            },
+        )
+
+    visit.supply_issue_reported = True
+    visit.supply_issue_details = {
+        "issue_type": payload.issue_type,
+        "notes": payload.notes,
+        "reported_at": datetime.now(timezone.utc).isoformat(),
+        "reported_by_worker_id": str(profile.id),
+    }
+    booking.status = BookingStatus.quality_discrepancy_alert
+
+    db.add(
+        Escalation(
+            booking_id=booking.id,
+            visit_record_id=visit.id,
+            worker_id=booking.worker_id,
+            patient_id=booking.patient_id,
+            level=EscalationLevel.contact_doctor,
+            status=EscalationStatus.open,
+            trigger_type="supply_issue",
+            trigger_details=visit.supply_issue_details,
+            notes=(
+                "Nurse reported a problem with the patient's own supplies. "
+                "Procedure is blocked pending ops review."
+            ),
+        )
+    )
+    await audit(
+        db, profile.user_id, "worker", "composite_care.supply_issue_reported", "visit", visit.id,
+        {"issue_type": payload.issue_type},
+    )
+    await db.commit()
+    await db.refresh(visit)
+
+    await notify_parties(
+        db,
+        ["ops"],
+        {"booking_id": str(booking_id)},
+        "supply_issue_reported",
+        title="Supply issue — review needed",
+        body=f"Booking {booking.booking_ref}: nurse reported '{payload.issue_type}' with the patient's supplies.",
+    )
+    await manager.broadcast(
+        booking_topic(booking_id),
+        {"type": "supply.issue_reported", "booking_id": str(booking_id), "issue_type": payload.issue_type},
+    )
+    return await _safety_checklist_status(booking, visit)
+
+
 @router.get("/bookings/{booking_id}/safety-checklist-status", response_model=SafetyChecklistStatusOut)
 async def get_safety_checklist_status(
     booking_id: UUID,
@@ -417,6 +716,9 @@ async def _safety_checklist_status(booking: Booking, visit: VisitRecord) -> Safe
         patient_submitted_at=visit.patient_safety_verification_at,
         quality_discrepancy=visit.quality_discrepancy,
         both_submitted=bool(visit.pre_procedure_checklist and visit.patient_safety_verification),
+        material_included=booking.material_included,
+        checklist_items=list(checklist_items_for(booking.material_included)),
+        supply_issue_reported=visit.supply_issue_reported,
     )
 
 
@@ -445,6 +747,14 @@ async def submit_pre_procedure_photo(
         raise HTTPException(
             status_code=409,
             detail={"code": "QUALITY_DISCREPANCY_ALERT", "message": "This booking is flagged for supervisor review."},
+        )
+    if visit.supply_issue_reported:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "SUPPLY_ISSUE_REPORTED",
+                "message": "You reported a problem with the patient's supplies. Ops must resolve it before the procedure can start.",
+            },
         )
 
     photo_url = payload.photo_url

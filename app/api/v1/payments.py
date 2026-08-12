@@ -1,7 +1,7 @@
 """Payments: Razorpay order creation, signature verification, webhook, history, refunds."""
 import json
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import List
 from uuid import UUID
@@ -51,6 +51,7 @@ from app.schemas.schemas import (
     PaymentVerifyRequest,
 )
 from app.services.common_services import audit, post_ledger_entry
+from app.services.composite_care_workflow import is_guarded_workflow
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/payments", tags=["payments"])
@@ -125,7 +126,7 @@ async def verify_payment(
         # Webhook (or earlier /verify) already processed this payment id.
         booking.razorpay_payment_id = payload.razorpay_payment_id
         booking.payment_status = PaymentStatus.captured
-        booking.status = BookingStatus.prescription_pending if booking.material_included else BookingStatus.confirmed
+        booking.status = BookingStatus.prescription_pending if is_guarded_workflow(booking) else BookingStatus.confirmed
         if booking.dispatch_started_at is None:
             booking.dispatch_started_at = datetime.now(timezone.utc)
         await db.commit()
@@ -138,10 +139,11 @@ async def verify_payment(
 
     booking.razorpay_payment_id = payload.razorpay_payment_id
     booking.payment_status = PaymentStatus.captured
-    # Workflow 1 — Composite Care Package: payment unlocks pharmacist Rx
-    # review, NOT dispatch. Dispatch only starts once Rx is approved (see
-    # app/api/v1/composite_care.py: approve_prescription -> searching_nurse).
-    booking.status = BookingStatus.prescription_pending if booking.material_included else BookingStatus.confirmed
+    # Both guarded workflows (Composite Care Package and Service-Only):
+    # payment unlocks pharmacist Rx review, NOT dispatch. Dispatch only starts
+    # once Rx is approved (see composite_care.py: approve_prescription ->
+    # searching_nurse).
+    booking.status = BookingStatus.prescription_pending if is_guarded_workflow(booking) else BookingStatus.confirmed
     # Start the dispatch wave clock now — workers only see the booking from
     # this moment, so waves must not count time spent on the payment screen.
     if booking.dispatch_started_at is None:
@@ -232,9 +234,9 @@ async def verify_payment(
         }
     # Booking is now CONFIRMED — push the request to nearby, qualified,
     # free, online workers (best-effort; must not fail the payment).
-    # Composite (material_included) bookings skip this: they sit in
-    # prescription_pending until the pharmacist approves the Rx.
-    if not booking.material_included:
+    # Both guarded workflows skip this: they sit in prescription_pending
+    # until the pharmacist approves the Rx.
+    if not is_guarded_workflow(booking):
         try:
             from app.services.dispatch import notify_nearby_workers
             await notify_nearby_workers(db, booking)
@@ -274,7 +276,7 @@ async def razorpay_webhook(request: Request, x_razorpay_signature: str = Header(
         if b and b.payment_status != PaymentStatus.captured:
             b.payment_status = PaymentStatus.captured
             b.razorpay_payment_id = razorpay_payment_id
-            b.status = BookingStatus.prescription_pending if b.material_included else BookingStatus.confirmed
+            b.status = BookingStatus.prescription_pending if is_guarded_workflow(b) else BookingStatus.confirmed
             if b.dispatch_started_at is None:
                 b.dispatch_started_at = datetime.now(timezone.utc)
             # post_ledger_entry flushes immediately; wrap to catch the partial

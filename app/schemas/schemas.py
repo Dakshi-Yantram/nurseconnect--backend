@@ -362,6 +362,13 @@ class CarePackageOut(ORMModel):
     available_cities: Optional[List[str]] = None
     is_active: bool
     primary_service_id: Optional[UUID] = None
+    # Which booking flow this package takes. The app branches on these at
+    # Step 1, so they must be on the catalogue payload:
+    #   material_included                        -> Workflow 1 (bundled kit)
+    #   requires_prescription & not material_... -> Workflow 2 (own supplies)
+    #   neither                                  -> ordinary booking
+    material_included: bool = False
+    requires_prescription: bool = False
     gate: Optional[str] = None
     required_training_module_codes: Optional[List[str]] = None
     required_assessment_codes: Optional[List[str]] = None
@@ -446,6 +453,14 @@ class BookingOut(ORMModel):
     accepted_at: Optional[datetime] = None
     rematch_count: int
     created_at: datetime
+    # Which guarded workflow (if any) this booking runs. The apps branch on
+    # these to decide whether to show the safety-checklist / completion-OTP
+    # surfaces at all, so they must be on every booking payload.
+    #   Workflow 1 — material_included=True (platform supplies the kit)
+    #   Workflow 2 — patient_supply_confirmation set (patient's own supplies)
+    material_included: bool = False
+    patient_supply_confirmation: Optional[Dict[str, Any]] = None
+    patient_supply_photo_url: Optional[str] = None
     # Patch 3 — proximity dispatch (optional, populated when context allows).
     assignment_wave: Optional[int] = None
     assignment_escalated_at: Optional[datetime] = None
@@ -550,25 +565,43 @@ NURSE_SAFETY_CHECKLIST_ITEMS = (
 
 
 class NurseSafetyChecklistSubmit(BaseModel):
-    """Nurse's side of Step 4 — pre-procedure clinical & intake questionnaire.
-    All five items are required; each is a plain yes/no."""
+    """Nurse's side of Step 4.
+
+    Both workflows ask five yes/no items and share the first two. The
+    endpoint validates that every item belonging to *this booking's*
+    workflow was answered, so the workflow-specific fields are optional here
+    and enforced server-side rather than being split across two near-
+    identical models.
+
+    Workflow 1 — Pre-Procedure Clinical & Intake Questionnaire.
+    Workflow 2 — Pre-Procedure & Patient Supply Inspection.
+    """
+    # Shared by both workflows.
     hand_hygiene: bool
     sterile_gloves: bool
-    identity_and_wellbeing_check: bool
-    allergy_and_complaint_history: bool
-    prescription_and_expiry_check: bool
+    # Workflow 1 only.
+    identity_and_wellbeing_check: Optional[bool] = None
+    allergy_and_complaint_history: Optional[bool] = None
+    prescription_and_expiry_check: Optional[bool] = None
+    # Workflow 2 only.
+    health_condition_check: Optional[bool] = None
+    supply_packaging_intact: Optional[bool] = None
+    supply_expiry_check: Optional[bool] = None
     notes: Optional[str] = None
 
 
 class PatientSafetyVerificationSubmit(BaseModel):
-    """Patient/family's mirrored safety verification card. Same five items,
-    answered independently — mismatches against the nurse's answers are
-    what the anti-cheat logic checks for."""
+    """Patient/family's mirrored safety verification card — the same items as
+    the nurse's checklist, answered independently. Mismatches against the
+    nurse's answers are what the anti-cheat logic checks for."""
     hand_hygiene: bool
     sterile_gloves: bool
-    identity_and_wellbeing_check: bool
-    allergy_and_complaint_history: bool
-    prescription_and_expiry_check: bool
+    identity_and_wellbeing_check: Optional[bool] = None
+    allergy_and_complaint_history: Optional[bool] = None
+    prescription_and_expiry_check: Optional[bool] = None
+    health_condition_check: Optional[bool] = None
+    supply_packaging_intact: Optional[bool] = None
+    supply_expiry_check: Optional[bool] = None
 
 
 class SafetyChecklistStatusOut(BaseModel):
@@ -578,13 +611,47 @@ class SafetyChecklistStatusOut(BaseModel):
     patient_submitted_at: Optional[datetime] = None
     quality_discrepancy: bool = False
     both_submitted: bool = False
+    # Lets each app render the right five questions without hardcoding which
+    # workflow a booking belongs to.
+    material_included: bool = True
+    checklist_items: List[str] = []
+    supply_issue_reported: bool = False
+
+
+class PrescriptionQueueItem(BaseModel):
+    """One booking awaiting pharmacist Rx review (Step 2), for the admin
+    dashboard queue. Workflow 2 rows carry the supply guardrail evidence so
+    the pharmacist can check it against the prescription."""
+    booking_id: UUID
+    booking_ref: str
+    patient_name: str
+    consumer_name: Optional[str] = None
+    scheduled_date: date
+    scheduled_start_time: time
+    total_amount: Decimal
+    material_included: bool
+    prescription_url: Optional[str] = None
+    patient_supply_confirmation: Optional[Dict[str, Any]] = None
+    patient_supply_photo_url: Optional[str] = None
+    created_at: datetime
+
+
+class SupplyIssueReport(BaseModel):
+    """Workflow 2 — nurse found a problem with the patient's own supplies
+    (broken sterile packaging, expired medicine). Blocks the procedure and
+    raises an ops escalation."""
+    issue_type: str = Field(
+        description="One of: packaging_broken, expired, missing, wrong_item, other"
+    )
+    notes: Optional[str] = None
 
 
 class PreProcedurePhotoSubmit(BaseModel):
-    """One live-camera photo showing the sealed, unopened kit + the Rx.
-    Either pass an already-hosted `photo_url`, OR pass `photo_base64`
-    (a data: URI or raw base64 string straight from the camera) and the
-    endpoint will upload it to Cloudinary itself."""
+    """One live-camera photo. Workflow 1 frames the sealed, unopened kit + the
+    Rx; Workflow 2 frames the patient's supplies with the expiry label
+    visible + the Rx. Either pass an already-hosted `photo_url`, OR pass
+    `photo_base64` (a data: URI or raw base64 string straight from the
+    camera) and the endpoint will upload it to Cloudinary itself."""
     photo_url: Optional[str] = None
     photo_base64: Optional[str] = None
     latitude: Decimal
@@ -641,6 +708,39 @@ class CompositeBookingCreate(BaseModel):
     prescription_cloudinary_url: Optional[str] = None
     prescription_cloudinary_public_id: Optional[str] = None
     prescription_base64: Optional[str] = None
+
+
+class SupplyConfirmation(BaseModel):
+    """Workflow 2 Step 1 — the supply guardrail the patient ticks before they
+    are allowed to pay. Every item must be True; the endpoint rejects the
+    booking otherwise."""
+    medicine: bool
+    cannula_or_catheter: bool
+    drip_set: bool
+    prescription: bool
+
+
+class ServiceOnlyBookingCreate(BaseModel):
+    """Step 1 — patient books a Service-Only package and supplies their own
+    materials. Beyond the composite flow this also requires the supply
+    guardrail confirmation and one photo of the supplies laid out next to
+    the prescription — payment is blocked until both are present."""
+    package_id: UUID
+    patient_id: UUID
+    scheduled_date: date
+    scheduled_start_time: time
+    address_snapshot: Dict[str, Any]
+    latitude: Decimal
+    longitude: Decimal
+    special_instructions: Optional[str] = None
+    prescription_cloudinary_url: Optional[str] = None
+    prescription_cloudinary_public_id: Optional[str] = None
+    prescription_base64: Optional[str] = None
+    # The guardrail. Both are mandatory — this is what makes the booking a
+    # Workflow 2 booking rather than an ordinary service booking.
+    supply_confirmation: SupplyConfirmation
+    supply_photo_url: Optional[str] = None
+    supply_photo_base64: Optional[str] = None
 
 
 class VisitRecordOut(ORMModel):
