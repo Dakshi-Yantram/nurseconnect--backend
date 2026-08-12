@@ -5,6 +5,7 @@ Seeds are idempotent: re-running never creates duplicates.
 """
 import asyncio
 import sys
+import uuid
 from decimal import Decimal
 
 from app.core.database import AsyncSessionLocal, engine, Base
