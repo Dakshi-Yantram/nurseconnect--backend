@@ -144,7 +144,23 @@ async def create_booking(
         package = kres.scalar_one_or_none()
         if not package:
             raise HTTPException(status_code=404, detail="Care package not found")
+        # per_visit_price and package_price are both nullable — an admin can
+        # save a package without ever setting either. That used to silently
+        # fall through to a ₹0 booking, which shows up to the consumer as
+        # "amount not assigned" and can look like the booking button is
+        # broken. Reject it with a clear reason instead of charging nothing.
+        if not package.per_visit_price and not package.package_price:
+            raise HTTPException(
+                status_code=409,
+                detail="This care package doesn't have a price set yet. Please contact support.",
+            )
         base_amount = package.per_visit_price or package.package_price or Decimal("0")
+
+    if base_amount <= 0:
+        raise HTTPException(
+            status_code=409,
+            detail="This service doesn't have a price configured yet. Please contact support.",
+        )
 
     surge_amount = Decimal("0")
     if payload.is_urgent and service:
@@ -306,6 +322,13 @@ async def my_worker_bookings(
         out.append(bm)
     return out
 
+        if b.patient_id:
+            if b.patient_id not in patient_cache:
+                pres = await db.execute(select(Patient).where(Patient.id == b.patient_id))
+                patient_cache[b.patient_id] = pres.scalar_one_or_none()
+            patient = patient_cache[b.patient_id]
+            if patient:
+                bm.patient_name = patient.full_name
 
 # Backward-compatible alias for older frontend bundles that still call
 # /api/bookings/available. Keep it before /{booking_id}, otherwise FastAPI

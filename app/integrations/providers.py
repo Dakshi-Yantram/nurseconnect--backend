@@ -94,9 +94,32 @@ class CloudinaryClient:
         self.cloud_name = settings.CLOUDINARY_CLOUD_NAME
         self.api_key = settings.CLOUDINARY_API_KEY
         self.api_secret = settings.CLOUDINARY_API_SECRET
+        # A prod deployment silently falling into mock mode is the single
+        # nastiest failure mode this client has: uploads "succeed" (200 OK,
+        # a plausible-looking URL gets saved to the DB) but the file was
+        # never actually stored anywhere, so every later attempt to view
+        # that document/report/photo 404s. That used to be discoverable
+        # only by reading logs. Now it's loud at boot.
+        if self.mock and settings.APP_ENV.lower() in ("production", "prod"):
+            logger.critical(
+                "Cloudinary is running in MOCK mode while APP_ENV=%s. "
+                "Every document/report upload will be saved with a fake "
+                "res.cloudinary.com/mock/... URL that cannot be viewed. "
+                "Set CLOUDINARY_CLOUD_NAME/CLOUDINARY_API_KEY/CLOUDINARY_API_SECRET "
+                "and MOCK_EXTERNAL_PROVIDERS=false in the production environment.",
+                settings.APP_ENV,
+            )
 
     async def upload_base64(self, b64_payload: str, folder: str = "nurseconnect", resource_type: str = "image") -> Dict[str, Any]:
         if self.mock:
+            if settings.APP_ENV.lower() in ("production", "prod"):
+                # Don't let a misconfigured prod environment quietly eat
+                # people's documents. Fail the upload with a clear error
+                # instead of writing an unviewable fake URL to the DB.
+                raise ExternalProviderError(
+                    "Document storage is not configured for this environment. "
+                    "Please contact support — uploads are temporarily unavailable."
+                )
             public_id = f"{folder}/{uuid.uuid4().hex[:12]}"
             return {
                 "public_id": public_id,

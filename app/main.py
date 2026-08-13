@@ -134,7 +134,13 @@ async def health():
         redis_ok = bool(pong)
     except Exception as e:
         logger.warning("Redis health check failed: %s", e)
-    overall = "ok" if (db_ok and redis_ok) else "degraded"
+    from app.integrations import cloudinary_client
+    storage_mock = cloudinary_client.mock
+    # Mock storage in production means uploads "succeed" but nothing is
+    # actually stored — that's a degraded state worth surfacing here, not
+    # just in logs.
+    is_prod = settings.APP_ENV.lower() in ("production", "prod")
+    overall = "ok" if (db_ok and redis_ok and not (storage_mock and is_prod)) else "degraded"
     return JSONResponse(
         status_code=200 if overall == "ok" else 503,
         content={
@@ -142,7 +148,11 @@ async def health():
             "app": settings.APP_NAME,
             "env": settings.APP_ENV,
             "version": app.version,
-            "checks": {"database": db_ok, "redis": redis_ok},
+            "checks": {
+                "database": db_ok,
+                "redis": redis_ok,
+                "document_storage_configured": not storage_mock,
+            },
         },
     )
 
