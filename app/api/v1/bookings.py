@@ -322,13 +322,6 @@ async def my_worker_bookings(
         out.append(bm)
     return out
 
-        if b.patient_id:
-            if b.patient_id not in patient_cache:
-                pres = await db.execute(select(Patient).where(Patient.id == b.patient_id))
-                patient_cache[b.patient_id] = pres.scalar_one_or_none()
-            patient = patient_cache[b.patient_id]
-            if patient:
-                bm.patient_name = patient.full_name
 
 # Backward-compatible alias for older frontend bundles that still call
 # /api/bookings/available. Keep it before /{booking_id}, otherwise FastAPI
