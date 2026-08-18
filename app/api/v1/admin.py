@@ -89,6 +89,11 @@ from app.core.provider_types import (
     PROVIDER_TYPE_LABELS,
     required_docs as _required_docs_for_type,
 )
+REQUIRED_DOCUMENTS_BY_WORKER_TYPE = {
+    WorkerType.nurse: {"aadhaar", "nursing_license", "degree_certificate", "police_verification"},
+    WorkerType.caregiver: {"aadhaar", "police_verification"},
+}
+
 
 # NOTE: worker approve/reject logic now lives in
 # app/services/worker_approval.py so both this admin router AND the
@@ -280,6 +285,7 @@ async def approve_worker(
     # so this endpoint and the reviewer-ticket "APPROVED" status update
     # (app/api/v1/review_tickets.py) can never fall out of sync again.
     await approve_worker_profile(db, worker_id, changed_by=current.id)
+    await approve_worker_profile(db, worker_id)
     await db.commit()
     return {"approved": True}
 
@@ -348,6 +354,7 @@ async def reject_worker(
     db: AsyncSession = Depends(get_db),
 ):
     await reject_worker_profile(db, worker_id, payload.reason.strip(), changed_by=current.id)
+    await reject_worker_profile(db, worker_id, payload.reason.strip())
     await db.commit()
     return {"rejected": True}
 

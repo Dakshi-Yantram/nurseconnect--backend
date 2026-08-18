@@ -44,6 +44,21 @@ SUPPORTED_QUESTION_TYPES = {
     "vitals_entry",
     "medication_entry",
     "consent_confirmation",
+    # Packaging Integrity Check — nurse confirms + photo-verifies that every
+    # patient-provided consumable is sealed and within its expiry date before
+    # starting an invasive procedure (injection, catheter change, etc).
+    # Field definition carries a static `consumables: [str]` list authored by
+    # the clinical trainer; the nurse's answer reports per-item seal/expiry
+    # status plus one confirmation photo of the laid-out packaging.
+    "packaging_integrity_check",
+    # Material Availability Check — nurse confirms whether the patient/family
+    # already has the consumables required for the procedure on hand. Field
+    # definition carries a static `required_materials: [{name, qty}]` list
+    # that the frontend renders as an auto-generated shopping list whenever
+    # the nurse marks materials as unavailable. In that case the nurse must
+    # also capture a photo of the doctor's prescription so ops/family can act
+    # on it.
+    "material_check",
 }
 
 # Risk levels at which a missing template must hard-block the workflow.
@@ -234,6 +249,36 @@ def _coerce_answer(qtype: str, raw: Any) -> Any:
         if not isinstance(raw, dict) or "consented" not in raw:
             raise ValueError("expected {consented: bool, ...}")
         return {"consented": bool(raw.get("consented")), **{k: v for k, v in raw.items() if k != "consented"}}
+    if qtype == "packaging_integrity_check":
+        if not isinstance(raw, dict) or not isinstance(raw.get("items"), list) or not raw.get("items"):
+            raise ValueError("expected {items: [{name, sealed, not_expired, expiry_date?}], photo_file_url}")
+        items: List[Dict[str, Any]] = []
+        for it in raw["items"]:
+            if not isinstance(it, dict) or "name" not in it:
+                raise ValueError("each packaging item requires a 'name'")
+            items.append({
+                "name": str(it.get("name")),
+                "sealed": bool(it.get("sealed")),
+                "not_expired": bool(it.get("not_expired")),
+                "expiry_date": it.get("expiry_date"),
+            })
+        photo_file_url = raw.get("photo_file_url") or raw.get("file_url")
+        # The nurse-submitted `all_verified` flag is never trusted — the
+        # server derives it from the per-item seal/expiry answers so a nurse
+        # (or a buggy client) can't mark checkout-ready without actually
+        # confirming every item.
+        all_verified = all(it["sealed"] and it["not_expired"] for it in items)
+        return {"items": items, "photo_file_url": photo_file_url, "all_verified": all_verified}
+    if qtype == "material_check":
+        if not isinstance(raw, dict) or "available" not in raw:
+            raise ValueError("expected {available: bool, missing_items?: [...], prescription_file_url?: str}")
+        available = bool(raw.get("available"))
+        missing_items = raw.get("missing_items") if isinstance(raw.get("missing_items"), list) else []
+        result: Dict[str, Any] = {"available": available, "missing_items": [str(m) for m in missing_items]}
+        rx = raw.get("prescription_file_url") or raw.get("file_url")
+        if rx:
+            result["prescription_file_url"] = rx
+        return result
     raise ValueError(f"unsupported question type: {qtype}")
 
 
@@ -259,6 +304,26 @@ def _is_question_complete(qtype: str, answer: Any) -> bool:
         return isinstance(answer, dict) and len(answer) > 0
     if qtype == "consent_confirmation":
         return isinstance(answer, dict) and bool(answer.get("consented"))
+    if qtype == "packaging_integrity_check":
+        # Complete only once every listed consumable is confirmed sealed +
+        # within expiry AND a verification photo has been captured. A partial
+        # check (e.g. photo but one item still unsealed) is intentionally
+        # left incomplete so it keeps blocking checkout on high-risk visits.
+        return (
+            isinstance(answer, dict)
+            and bool(answer.get("all_verified"))
+            and bool(answer.get("photo_file_url"))
+        )
+    if qtype == "material_check":
+        # If materials are on hand, the check is done. If not, it's only
+        # "complete" (i.e. no longer needs nurse attention) once a
+        # prescription photo has been captured for ops/family follow-up —
+        # this is what unlocks the auto-generated shopping list flow.
+        if not isinstance(answer, dict):
+            return False
+        if answer.get("available"):
+            return True
+        return bool(answer.get("prescription_file_url"))
     return False
 
 

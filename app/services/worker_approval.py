@@ -31,6 +31,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.models.enums import ProviderStatusChangeReason, UserStatus, WorkerOnboardingStatus, WorkerType
 from app.models.models import NurseReviewTicket, ProviderStatusHistory, User, WorkerDocument, WorkerProfile
 from app.core.provider_types import required_docs as _required_docs_for_type
+from app.models.enums import UserStatus, WorkerOnboardingStatus, WorkerType
+from app.models.models import NurseReviewTicket, User, WorkerDocument, WorkerProfile
 
 # Ticket statuses that are still "open" in the reviewer queue — used to find
 # the live ticket for a worker when syncing status after a review action.
@@ -54,6 +56,10 @@ async def _record_status_change(
         changed_by=changed_by,
         notes=notes,
     ))
+REQUIRED_DOCUMENTS_BY_WORKER_TYPE = {
+    WorkerType.nurse: {"aadhaar", "nursing_license", "degree_certificate", "police_verification"},
+    WorkerType.caregiver: {"aadhaar", "police_verification"},
+}
 
 
 async def sync_ticket_status(db: AsyncSession, worker_id: UUID, new_status: str) -> None:
@@ -74,6 +80,7 @@ async def sync_ticket_status(db: AsyncSession, worker_id: UUID, new_status: str)
 async def approve_worker_profile(
     db: AsyncSession, worker_id: UUID, changed_by: Optional[UUID] = None
 ) -> WorkerProfile:
+async def approve_worker_profile(db: AsyncSession, worker_id: UUID) -> WorkerProfile:
     """Run the full worker-approval flow. Raises HTTPException on failure.
 
     Does NOT commit — caller commits (so it can be composed with other
@@ -93,6 +100,10 @@ async def approve_worker_profile(
     docs_res = await db.execute(select(WorkerDocument).where(WorkerDocument.worker_id == wp.id))
     docs = list(docs_res.scalars().all())
     required = _required_docs_for_type(getattr(wp, "worker_type", WorkerType.nurse))
+    required = REQUIRED_DOCUMENTS_BY_WORKER_TYPE.get(
+        getattr(wp, "worker_type", WorkerType.nurse),
+        REQUIRED_DOCUMENTS_BY_WORKER_TYPE[WorkerType.nurse],
+    )
     verified_types = {
         d.document_type
         for d in docs
@@ -138,6 +149,7 @@ async def approve_worker_profile(
 
 async def reject_worker_profile(
     db: AsyncSession, worker_id: UUID, reason: Optional[str], changed_by: Optional[UUID] = None
+    db: AsyncSession, worker_id: UUID, reason: Optional[str]
 ) -> WorkerProfile:
     """Run the full worker-rejection flow. Raises HTTPException on failure.
 
@@ -157,4 +169,5 @@ async def reject_worker_profile(
         db, wp.id, prev_status, "rejected", ProviderStatusChangeReason.admin_rejected,
         changed_by, notes=wp.onboarding_rejection_reason,
     )
+    return wp
     return wp

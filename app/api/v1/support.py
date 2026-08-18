@@ -10,6 +10,7 @@ or worker; the support queue is visible to support/operations/admin.
 """
 from __future__ import annotations
 
+import re
 import secrets
 from datetime import datetime, timezone
 from typing import List, Optional
@@ -143,6 +144,174 @@ async def delete_faq(
     await db.delete(f)
     await db.commit()
     return {"deleted": True}
+
+
+# ============================================================================
+# Help bot — tries to answer from the FAQ catalogue first, same shape as the
+# Swiggy/Zomato "chat with us" flow: type a question, bot suggests answers
+# from the FAQ; if none of them actually resolve it, the conversation
+# escalates straight into a support ticket in the human queue, carrying the
+# question + which FAQs the bot already tried so the agent isn't starting
+# from zero.
+#
+# No ML/embedding infra here — this is deliberately a plain keyword-overlap
+# ranker against the FAQ table (title/answer text), which is enough for a
+# help-center-sized FAQ set and doesn't add a new service dependency. If the
+# FAQ catalogue grows large enough that overlap-ranking stops being good
+# enough, swap _score_faq for a real search index — the endpoint contract
+# (BotAskResponse) doesn't need to change.
+# ============================================================================
+_STOPWORDS = {
+    "a", "an", "the", "is", "are", "was", "were", "am", "i", "my", "me", "you",
+    "your", "it", "its", "do", "does", "did", "can", "could", "will", "would",
+    "how", "what", "when", "where", "why", "who", "to", "of", "in", "on", "for",
+    "and", "or", "with", "about", "this", "that", "please", "help", "need",
+}
+
+
+def _tokenize(text: str) -> set[str]:
+    words = re.findall(r"[a-z0-9]+", text.lower())
+    return {w for w in words if w not in _STOPWORDS and len(w) > 1}
+
+
+def _score_faq(query_tokens: set[str], faq: Faq) -> float:
+    if not query_tokens:
+        return 0.0
+    faq_tokens = _tokenize(faq.question) | _tokenize(faq.answer)
+    if not faq_tokens:
+        return 0.0
+    overlap = query_tokens & faq_tokens
+    # Weighted toward the question text matching, since that's the intent
+    # signal — matching a random word inside a long answer paragraph is
+    # weaker evidence than matching the FAQ's own question.
+    question_tokens = _tokenize(faq.question)
+    question_overlap = query_tokens & question_tokens
+    return len(overlap) / len(query_tokens) + (len(question_overlap) / len(query_tokens)) * 0.5
+
+
+# Below this score, the bot has no confident answer and offers to connect
+# the person to a human agent instead of guessing.
+_BOT_CONFIDENCE_THRESHOLD = 0.5
+
+
+class BotAskRequest(BaseModel):
+    message: str
+    booking_id: Optional[UUID] = None
+    # FAQ ids the bot already surfaced earlier in this same conversation
+    # that the person said didn't help — excluded from re-matching so the
+    # bot doesn't loop on the same wrong answer.
+    already_shown_faq_ids: list[UUID] = []
+
+
+class BotSuggestion(BaseModel):
+    faq_id: str
+    question: str
+    answer: str
+    score: float
+
+
+class BotAskResponse(BaseModel):
+    resolved: bool
+    suggestions: list[BotSuggestion]
+    message: str
+
+
+@router.post("/help/ask", response_model=BotAskResponse)
+async def help_bot_ask(
+    payload: BotAskRequest,
+    current: CurrentUser = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Step 1 of the help flow: the bot tries to answer from FAQs. Returns
+    up to 3 candidate FAQs ranked by relevance. The frontend shows these as
+    tappable suggestions ('Was this helpful?'); if the person says none of
+    them helped, call /help/escalate to hand off to a support agent."""
+    audience = "worker" if current.role == UserRole.worker else "consumer"
+    stmt = select(Faq).where(Faq.is_active.is_(True), Faq.audience.in_([audience, "all"]))
+    if payload.already_shown_faq_ids:
+        stmt = stmt.where(Faq.id.notin_(payload.already_shown_faq_ids))
+    rows = (await db.execute(stmt)).scalars().all()
+
+    query_tokens = _tokenize(payload.message)
+    scored = sorted(
+        ((f, _score_faq(query_tokens, f)) for f in rows),
+        key=lambda pair: pair[1],
+        reverse=True,
+    )
+    top = [(f, s) for f, s in scored[:3] if s > 0]
+
+    if top and top[0][1] >= _BOT_CONFIDENCE_THRESHOLD:
+        return BotAskResponse(
+            resolved=True,
+            suggestions=[
+                BotSuggestion(faq_id=str(f.id), question=f.question, answer=f.answer, score=round(s, 2))
+                for f, s in top
+            ],
+            message="Here's what I found — let me know if this answers it.",
+        )
+
+    if top:
+        # Weak matches only — still show them (may still be useful) but be
+        # upfront that the bot isn't confident, and offer the human path.
+        return BotAskResponse(
+            resolved=False,
+            suggestions=[
+                BotSuggestion(faq_id=str(f.id), question=f.question, answer=f.answer, score=round(s, 2))
+                for f, s in top
+            ],
+            message="I'm not fully sure, but these might be related. If none of these help, "
+                    "I can connect you with our support team.",
+        )
+
+    return BotAskResponse(
+        resolved=False,
+        suggestions=[],
+        message="I couldn't find an answer to that. I can connect you with our support team instead.",
+    )
+
+
+class BotEscalateRequest(BaseModel):
+    message: str
+    booking_id: Optional[UUID] = None
+    conversation_transcript: Optional[str] = None
+    shown_faq_questions: list[str] = []
+
+
+@router.post("/help/escalate")
+async def help_bot_escalate(
+    payload: BotEscalateRequest,
+    current: CurrentUser = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Step 2: bot couldn't resolve it (or the person said the suggestions
+    didn't help) — hand off to a human agent by creating a support ticket,
+    same queue support staff already work from at /support/tickets. Carries
+    forward what the bot already tried so the agent doesn't ask the person
+    to repeat themselves."""
+    if current.role not in (UserRole.consumer, UserRole.worker):
+        raise HTTPException(status_code=403, detail="Only consumers and nurses can raise support tickets")
+
+    description_parts = [payload.message]
+    if payload.shown_faq_questions:
+        tried = "\n".join(f"- {q}" for q in payload.shown_faq_questions)
+        description_parts.append(f"\n[Bot already suggested these FAQs, which didn't resolve it:]\n{tried}")
+    if payload.conversation_transcript:
+        description_parts.append(f"\n[Conversation so far:]\n{payload.conversation_transcript}")
+
+    ticket = SupportTicket(
+        ticket_ref=f"TKT-{secrets.randbelow(900000) + 100000}",
+        raised_by=current.id,
+        raiser_role=current.role.value,
+        category="bot_escalation",
+        subject=payload.message[:255],
+        description="\n".join(description_parts),
+        booking_id=payload.booking_id,
+        status=SupportTicketStatus.open,
+    )
+    db.add(ticket)
+    await db.commit()
+    await db.refresh(ticket)
+    return _serialize_ticket(ticket)
 
 
 # ============================================================================
