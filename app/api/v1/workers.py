@@ -33,6 +33,7 @@ from app.models.models import (
     WorkerDocument,
     WorkerKitItem,
     WorkerProfile,
+    WorkerReference,
     WorkerServicePreference,
     WorkerServiceQualification,
 )
@@ -496,6 +497,86 @@ async def list_documents(profile: WorkerProfile = Depends(get_worker_profile), d
         }
         for d in docs
     ]
+
+
+# ----- References (character/employer references — used mainly for
+# Caregiver / Mother & Baby Caregiver onboarding, where there's no degree
+# to verify so a previous employer/character reference carries more weight;
+# not restricted to those provider types). Worker self-service: a worker
+# can add and view their own references. Verifying a reference (or adding
+# one on a worker's behalf, e.g. from a phone call) is admin/reviewer-only
+# — see /admin/workers/{worker_id}/references in admin.py. -----
+class WorkerReferenceCreate(BaseModel):
+    reference_name: str
+    relationship_to_worker: Optional[str] = None
+    phone: Optional[str] = None
+    previous_employer_name: Optional[str] = None
+
+
+def _serialize_own_reference(ref: WorkerReference) -> dict:
+    return {
+        "id": str(ref.id),
+        "reference_name": ref.reference_name,
+        "relationship_to_worker": ref.relationship_to_worker,
+        "phone": ref.phone,
+        "previous_employer_name": ref.previous_employer_name,
+        "verification_status": ref.verification_status,
+        "created_at": ref.created_at.isoformat() if ref.created_at else None,
+    }
+
+
+@router.get("/me/references")
+async def list_my_references(profile: WorkerProfile = Depends(get_worker_profile), db: AsyncSession = Depends(get_db)):
+    res = await db.execute(
+        select(WorkerReference).where(WorkerReference.worker_id == profile.id).order_by(WorkerReference.created_at.desc())
+    )
+    return [_serialize_own_reference(r) for r in res.scalars().all()]
+
+
+@router.post("/me/references", status_code=201)
+async def add_my_reference(
+    payload: WorkerReferenceCreate,
+    profile: WorkerProfile = Depends(get_worker_profile),
+    db: AsyncSession = Depends(get_db),
+):
+    """A worker can add a reference at any time during onboarding, but
+    can't self-verify it — verification_status always starts 'pending' and
+    only moves via the admin endpoint (PATCH /admin/references/{id}/verify)."""
+    ref = WorkerReference(
+        worker_id=profile.id,
+        reference_name=payload.reference_name.strip(),
+        relationship_to_worker=payload.relationship_to_worker,
+        phone=payload.phone,
+        previous_employer_name=payload.previous_employer_name,
+        verification_status="pending",
+    )
+    db.add(ref)
+    await db.commit()
+    await db.refresh(ref)
+    return _serialize_own_reference(ref)
+
+
+@router.delete("/me/references/{reference_id}")
+async def delete_my_reference(
+    reference_id: UUID,
+    profile: WorkerProfile = Depends(get_worker_profile),
+    db: AsyncSession = Depends(get_db),
+):
+    """A worker may only delete their own reference, and only while it's
+    still pending — once admin has verified/rejected it, it becomes part of
+    the onboarding record and stays (consistent with documents, which also
+    can't be silently removed post-review)."""
+    res = await db.execute(
+        select(WorkerReference).where(WorkerReference.id == reference_id, WorkerReference.worker_id == profile.id)
+    )
+    ref = res.scalar_one_or_none()
+    if not ref:
+        raise HTTPException(status_code=404, detail="Reference not found")
+    if ref.verification_status != "pending":
+        raise HTTPException(status_code=409, detail="Can't delete a reference that's already been reviewed")
+    await db.delete(ref)
+    await db.commit()
+    return {"id": str(reference_id), "deleted": True}
 
 
 # ----- Certificates -----
