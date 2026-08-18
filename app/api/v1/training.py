@@ -77,6 +77,9 @@ class TrainingModuleDraft(BaseModel):
     assessment: Optional[List[Dict[str, Any]]] = None
     pass_percent: int = 70
     is_mandatory: bool = False
+    # Provider Type system — which WorkerType values this module is even
+    # shown to. None/empty = visible to every provider type.
+    allowed_provider_types: Optional[List[str]] = None
 
 
 class TrainingModuleUpdate(BaseModel):
@@ -90,6 +93,7 @@ class TrainingModuleUpdate(BaseModel):
     assessment: Optional[List[Dict[str, Any]]] = None
     pass_percent: Optional[int] = None
     is_mandatory: Optional[bool] = None
+    allowed_provider_types: Optional[List[str]] = None
 
 
 class AssessmentDraft(BaseModel):
@@ -99,6 +103,7 @@ class AssessmentDraft(BaseModel):
     pass_score: int = 70
     questions: List[Dict[str, Any]]
     linked_training_module_code: Optional[str] = None
+    allowed_provider_types: Optional[List[str]] = None
 
 
 class AssessmentUpdate(BaseModel):
@@ -107,6 +112,7 @@ class AssessmentUpdate(BaseModel):
     pass_score: Optional[int] = None
     questions: Optional[List[Dict[str, Any]]] = None
     linked_training_module_code: Optional[str] = None
+    allowed_provider_types: Optional[List[str]] = None
 
 
 class ReviewBody(BaseModel):
@@ -238,6 +244,7 @@ def _serialize_module(m: TrainingModule, *, include_admin_fields: bool = False, 
         "version": m.version,
         "status": m.status.value if m.status else None,
         "required_for_tiers": m.required_for_tiers or [],
+        "allowed_provider_types": m.allowed_provider_types or [],
     }
     if include_full_assessment:
         out["assessment"] = m.assessment or []
@@ -288,6 +295,7 @@ def _serialize_assessment(a: AssessmentModule, *, include_admin_fields: bool = F
         "time_limit_minutes": a.time_limit_minutes,
         "max_attempts": a.max_attempts,
         "cooldown_hours": a.cooldown_hours,
+        "allowed_provider_types": a.allowed_provider_types or [],
     }
     if include_admin_fields:
         out.update({
@@ -316,7 +324,10 @@ async def list_modules(
     profile: WorkerProfile = Depends(get_worker_profile),
     db: AsyncSession = Depends(get_db),
 ):
-    """Worker view — only published modules."""
+    """Worker view — only published modules, filtered to the ones relevant
+    to this worker's Provider Type. A module with no allowed_provider_types
+    set (None/empty) is visible to every provider type — same unrestricted-
+    by-default semantics as ServiceCatalogue/CarePackage."""
     res = await db.execute(
         select(TrainingModule).where(
             TrainingModule.is_active.is_(True),
@@ -324,6 +335,12 @@ async def list_modules(
         )
     )
     modules = res.scalars().all()
+    worker_type = getattr(profile, "worker_type", None)
+    worker_type_value = worker_type.value if worker_type else None
+    modules = [
+        m for m in modules
+        if not m.allowed_provider_types or worker_type_value in m.allowed_provider_types
+    ]
     cres = await db.execute(select(TrainingCompletion).where(TrainingCompletion.worker_id == profile.id))
     comps = {c.module_id: c for c in cres.scalars().all()}
     out = []
@@ -463,6 +480,14 @@ async def list_published_assessments(
         )
     )
     items = res.scalars().all()
+    # Filter to this worker's Provider Type — same unrestricted-by-default
+    # semantics as training modules (see list_modules above).
+    worker_type = getattr(profile, "worker_type", None)
+    worker_type_value = worker_type.value if worker_type else None
+    items = [
+        a for a in items
+        if not a.allowed_provider_types or worker_type_value in a.allowed_provider_types
+    ]
     # Latest attempts per assessment_id
     ares = await db.execute(
         select(WorkerAssessmentAttempt).where(
@@ -928,6 +953,7 @@ async def create_module_draft(
         assessment=payload.assessment,
         pass_percent=payload.pass_percent,
         is_mandatory=payload.is_mandatory,
+        allowed_provider_types=payload.allowed_provider_types,
         is_active=True,
         version=1,
         status=ContentStatus.draft,
@@ -1099,6 +1125,7 @@ async def create_assessment_draft(
         pass_score=payload.pass_score,
         questions=payload.questions,
         linked_training_module_code=payload.linked_training_module_code,
+        allowed_provider_types=payload.allowed_provider_types,
         version=1,
         status=ContentStatus.draft,
         created_by=current.id,

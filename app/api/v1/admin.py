@@ -8,12 +8,13 @@ from decimal import Decimal
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
-from sqlalchemy import func, select
+from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
 from app.core.deps import CurrentUser, get_current_user, is_admin, require_admin, require_operations, require_reviewer, require_roles
 from app.core.security import hash_password
+from app.services.common_services import audit
 from app.models.enums import (
     BookingStatus,
     ComplaintStatus,
@@ -21,14 +22,22 @@ from app.models.enums import (
     EscalationLevel,
     EscalationStatus,
     GenderRestriction,
+    PackageBookingStatus,
     PaymentStatus,
     PayoutBatchStatus,
+    ProviderStatusChangeReason,
     QualificationGate,
+    ServiceCategory,
+    ServiceRiskLevel,
+    BillingTrigger,
     UserRole,
     UserStatus,
     VisitFrequency,
     VisitStatus,
+    WorkerAvailability,
     WorkerOnboardingStatus,
+    WorkerPayoutStatus,
+    WorkerQualificationStatus,
     WorkerTier,
     WorkerType,
 )
@@ -36,6 +45,8 @@ from app.models.models import (
     AuditLog,
     Booking,
     CarePackage,
+    CarePackageBooking,
+    CareNote,
     ClinicalRuleSet,
     Complaint,
     ConsentRecord,
@@ -44,17 +55,29 @@ from app.models.models import (
     Dispute,
     Escalation,
     FinancialLedger,
+    InsuranceCoverageAssessment,
+    MedicationAdministration,
+    Message,
     NurseReviewTicket,
+    OfflineSyncQueue,
     Patient,
     PayoutBatch,
+    Prescription,
+    ProviderStatusHistory,
+    ReviewerProfile,
     RoleDefinition,
     ServiceCatalogue,
     SubsidyEligibility,
+    SupportTicket,
     User,
     VisitRecord,
+    VitalSignReading,
     WorkerDocument,
+    WorkerLocationLog,
     WorkerPayout,
     WorkerProfile,
+    WorkerReference,
+    WorkerServiceQualification,
 )
 
 router = APIRouter(prefix="/admin", tags=["admin"])
@@ -63,29 +86,28 @@ router = APIRouter(prefix="/admin", tags=["admin"])
 # the live ticket for a worker when syncing status after a review action.
 _OPEN_TICKET_STATUSES = ("PENDING_REVIEW", "IN_REVIEW", "NEEDS_CLARIFICATION", "UNASSIGNED")
 
+# Document requirements per Provider Type now live in app/core/provider_types.py
+# (single source of truth — this dict used to be redeclared here, unused,
+# and had already drifted from the copies actually enforced elsewhere).
+from app.core.provider_types import (
+    PROVIDER_TYPE_LABELS,
+    required_docs as _required_docs_for_type,
+)
 REQUIRED_DOCUMENTS_BY_WORKER_TYPE = {
     WorkerType.nurse: {"aadhaar", "nursing_license", "degree_certificate", "police_verification"},
     WorkerType.caregiver: {"aadhaar", "police_verification"},
 }
 
 
-async def _sync_ticket_status(db: AsyncSession, worker_id: UUID, new_status: str) -> None:
-    """Keep the reviewer-queue ticket (NurseReviewTicket) in sync with worker
-    onboarding / document review actions taken from the admin endpoints below.
-
-    Without this, WorkerDocument/WorkerProfile get updated but the ticket that
-    actually drives the reviewer's queue UI (/api/review/my-queue) never
-    changes, so cards stay stuck on "PENDING REVIEW" forever.
-    """
-    res = await db.execute(
-        select(NurseReviewTicket).where(
-            NurseReviewTicket.nurse_id == worker_id,
-            NurseReviewTicket.status.in_(_OPEN_TICKET_STATUSES),
-        )
-    )
-    ticket = res.scalar_one_or_none()
-    if ticket:
-        ticket.status = new_status
+# NOTE: worker approve/reject logic now lives in
+# app/services/worker_approval.py so both this admin router AND the
+# reviewer-ticket router (app/api/v1/review_tickets.py) share one
+# implementation and can never drift out of sync with each other.
+from app.services.worker_approval import (
+    approve_worker_profile,
+    reject_worker_profile,
+    sync_ticket_status as _sync_ticket_status,
+)
 
 
 class DocumentReviewRequest(BaseModel):
@@ -170,11 +192,23 @@ async def pending_workers(
 @router.get("/workers/all")
 async def all_workers(
     onboarding_status: str | None = None,
+    provider_type: str | None = None,
+    city: str | None = None,
+    # Combined "Package" filter: a package_code (CarePackage.package_code) or
+    # a service_code (ServiceCatalogue.service_code) — matches either, since
+    # your spec's package list ("Injection", "Physiotherapy", ...) maps to a
+    # mix of both in the existing catalogue.
+    package: str | None = None,
+    qualification_status: str | None = None,
     limit: int = 200,
     current: CurrentUser = Depends(require_reviewer),
     db: AsyncSession = Depends(get_db),
 ):
-    """All workers regardless of onboarding status — used by the admin nurses list."""
+    """All workers regardless of onboarding status — used by the admin
+    Provider list. Supports the combined filter set from the Provider Type /
+    Status / Location / Package / Qualification Status admin filters:
+    e.g. provider_type=nurse&city=Hyderabad&onboarding_status=approved&package=injection
+    """
     stmt = (
         select(WorkerProfile, User)
         .join(User, User.id == WorkerProfile.user_id)
@@ -182,11 +216,42 @@ async def all_workers(
         .limit(limit)
     )
     if onboarding_status:
-        from app.models.enums import WorkerOnboardingStatus
         try:
             stmt = stmt.where(WorkerProfile.onboarding_status == WorkerOnboardingStatus(onboarding_status))
         except ValueError:
-            pass
+            raise HTTPException(status_code=400, detail=f"Invalid onboarding_status: {onboarding_status}")
+    if provider_type:
+        try:
+            stmt = stmt.where(WorkerProfile.worker_type == WorkerType(provider_type))
+        except ValueError:
+            raise HTTPException(status_code=400, detail=f"Invalid provider_type: {provider_type}")
+    if city:
+        stmt = stmt.where(WorkerProfile.base_city.ilike(f"%{city}%"))
+
+    worker_ids_for_package_or_qual: set[UUID] | None = None
+    if package or qualification_status:
+        qual_stmt = select(WorkerServiceQualification.worker_id).join(
+            ServiceCatalogue, ServiceCatalogue.id == WorkerServiceQualification.service_id, isouter=True,
+        ).join(
+            CarePackage, CarePackage.id == WorkerServiceQualification.package_id, isouter=True,
+        )
+        if package:
+            qual_stmt = qual_stmt.where(
+                (ServiceCatalogue.service_code.ilike(f"%{package}%"))
+                | (CarePackage.package_code.ilike(f"%{package}%"))
+            )
+        if qualification_status:
+            try:
+                qs = WorkerQualificationStatus(qualification_status.upper())
+                qual_stmt = qual_stmt.where(WorkerServiceQualification.qualification_status == qs)
+            except ValueError:
+                raise HTTPException(status_code=400, detail=f"Invalid qualification_status: {qualification_status}")
+        qual_res = await db.execute(qual_stmt)
+        worker_ids_for_package_or_qual = {row[0] for row in qual_res.all()}
+        if not worker_ids_for_package_or_qual:
+            return []
+        stmt = stmt.where(WorkerProfile.id.in_(worker_ids_for_package_or_qual))
+
     res = await db.execute(stmt)
     items = []
     for wp, u in res.all():
@@ -195,6 +260,7 @@ async def all_workers(
             {"document_type": doc.document_type, "verification_status": doc.verification_status}
             for doc in docs_res.scalars().all()
         ]
+        wtype = getattr(wp, "worker_type", None)
         items.append({
             "worker_id": str(wp.id),
             "user_id": str(u.id),
@@ -202,10 +268,12 @@ async def all_workers(
             "phone": u.phone_e164,
             "email": u.email,
             "tier": wp.tier.value,
-            "worker_type": getattr(wp, "worker_type", None) and wp.worker_type.value,
+            "worker_type": wtype and wtype.value,
+            "provider_type_label": wtype and PROVIDER_TYPE_LABELS.get(wtype),
             "onboarding_status": wp.onboarding_status.value,
             "background_check_status": wp.background_check_status,
             "availability": wp.availability.value if wp.availability else None,
+            "base_city": wp.base_city,
             "documents": documents,
             "created_at": wp.created_at.isoformat(),
         })
@@ -217,51 +285,11 @@ async def approve_worker(
     current: CurrentUser = Depends(require_reviewer),
     db: AsyncSession = Depends(get_db),
 ):
-    res = await db.execute(select(WorkerProfile).where(WorkerProfile.id == worker_id))
-    wp = res.scalar_one_or_none()
-    if not wp:
-        raise HTTPException(status_code=404, detail="Worker not found")
-    if wp.onboarding_status != WorkerOnboardingStatus.pending_review:
-        raise HTTPException(status_code=409, detail="Worker has not submitted onboarding for review")
-    docs_res = await db.execute(select(WorkerDocument).where(WorkerDocument.worker_id == wp.id))
-    docs = list(docs_res.scalars().all())
-    required = REQUIRED_DOCUMENTS_BY_WORKER_TYPE.get(
-        getattr(wp, "worker_type", WorkerType.nurse),
-        REQUIRED_DOCUMENTS_BY_WORKER_TYPE[WorkerType.nurse],
-    )
-    verified_types = {
-        d.document_type
-        for d in docs
-        if d.verification_status == "verified"
-        and (d.valid_until is None or d.valid_until >= date.today())
-    }
-    missing_verified = sorted(required - verified_types)
-    if missing_verified:
-        raise HTTPException(
-            status_code=409,
-            detail={"message": "Required documents are not verified", "documents": missing_verified},
-        )
-    if wp.background_check_status != "passed":
-        raise HTTPException(status_code=409, detail="Background check has not passed")
-    wp.onboarding_status = WorkerOnboardingStatus.approved
-    wp.onboarding_reviewed_at = datetime.now(timezone.utc)
-    wp.onboarding_rejection_reason = None
-    # ACTIVATE the account: the worker was held in `onboarding` until now.
-    ures = await db.execute(select(User).where(User.id == wp.user_id))
-    wuser = ures.scalar_one_or_none()
-    if wuser and wuser.status == UserStatus.onboarding:
-        wuser.status = UserStatus.active
-    # Award the worker's tier badge on first approval (skill-based badge).
-    from app.services.badges import award_tier_badge
-    await award_tier_badge(db, wp)
-    # BUGFIX: approval used to never create WorkerServiceQualification rows,
-    # so any service/package gated only by tier (no training/cert/assessment)
-    # stayed permanently locked with locked_reason=QUALIFICATION_RECORD_MISSING
-    # and no way for the worker to opt in or request access.
-    from app.services.qualification import sync_tier_qualifications
-    await sync_tier_qualifications(db, wp)
-    # Keep the reviewer-queue ticket in sync so the card leaves "PENDING REVIEW".
-    await _sync_ticket_status(db, wp.id, "APPROVED")
+    # Delegates to the shared approve/reject service (app/services/worker_approval.py)
+    # so this endpoint and the reviewer-ticket "APPROVED" status update
+    # (app/api/v1/review_tickets.py) can never fall out of sync again.
+    await approve_worker_profile(db, worker_id, changed_by=current.id)
+    await approve_worker_profile(db, worker_id)
     await db.commit()
     return {"approved": True}
 
@@ -329,16 +357,8 @@ async def reject_worker(
     current: CurrentUser = Depends(require_reviewer),
     db: AsyncSession = Depends(get_db),
 ):
-    res = await db.execute(select(WorkerProfile).where(WorkerProfile.id == worker_id))
-    wp = res.scalar_one_or_none()
-    if not wp:
-        raise HTTPException(status_code=404, detail="Worker not found")
-    wp.onboarding_status = WorkerOnboardingStatus.rejected
-    wp.onboarding_reviewed_at = datetime.now(timezone.utc)
-    wp.onboarding_rejection_reason = payload.reason.strip()
-    wp.availability = "offline"
-    # Keep the reviewer-queue ticket in sync so the card leaves the queue.
-    await _sync_ticket_status(db, wp.id, "REJECTED")
+    await reject_worker_profile(db, worker_id, payload.reason.strip(), changed_by=current.id)
+    await reject_worker_profile(db, worker_id, payload.reason.strip())
     await db.commit()
     return {"rejected": True}
 
@@ -412,10 +432,43 @@ async def suspend_worker(
     if not row:
         raise HTTPException(status_code=404, detail="Worker not found")
     wp, user = row
+    prev_status = wp.onboarding_status.value
     wp.onboarding_status = WorkerOnboardingStatus.suspended
     user.status = UserStatus.suspended
+    db.add(ProviderStatusHistory(
+        worker_id=wp.id, from_status=prev_status, to_status="suspended",
+        reason=ProviderStatusChangeReason.admin_suspended, changed_by=current.id, notes=reason,
+    ))
     await db.commit()
     return {"suspended": True}
+
+
+@router.post("/workers/{worker_id}/reinstate")
+async def reinstate_worker(
+    worker_id: UUID,
+    current: CurrentUser = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Reverse a suspension. Returns the worker to 'approved' (active,
+    bookable) — does not re-run document/qualification checks, since those
+    were already satisfied before suspension."""
+    res = await db.execute(select(WorkerProfile, User).join(User, User.id == WorkerProfile.user_id).where(WorkerProfile.id == worker_id))
+    row = res.first()
+    if not row:
+        raise HTTPException(status_code=404, detail="Worker not found")
+    wp, user = row
+    if wp.onboarding_status != WorkerOnboardingStatus.suspended:
+        raise HTTPException(status_code=409, detail="Worker is not currently suspended")
+    prev_status = wp.onboarding_status.value
+    wp.onboarding_status = WorkerOnboardingStatus.approved
+    if user.status == UserStatus.suspended:
+        user.status = UserStatus.active
+    db.add(ProviderStatusHistory(
+        worker_id=wp.id, from_status=prev_status, to_status="approved",
+        reason=ProviderStatusChangeReason.admin_reinstated, changed_by=current.id,
+    ))
+    await db.commit()
+    return {"reinstated": True}
 
 
 @router.get("/financial/ledger")
@@ -573,9 +626,10 @@ async def admin_list_consumers(
 # ============================================================================
 # PATCH 3 — Admin Care Package endpoints
 # Backs the admin Care Packages page (_app.care-packages.tsx):
-#   POST   /api/admin/care-packages              create
-#   PUT    /api/admin/care-packages/{id}          update
-#   PATCH  /api/admin/care-packages/{id}/toggle   activate/deactivate
+#   POST   /api/admin/care-packages               create
+#   PUT    /api/admin/care-packages/{id}           update
+#   PATCH  /api/admin/care-packages/{id}/toggle    enable/disable (still listed, greyed out)
+#   DELETE /api/admin/care-packages/{id}           soft-delete (removed from every list)
 # ============================================================================
 class CarePackageCreateRequest(BaseModel):
     name: str
@@ -597,12 +651,33 @@ class CarePackageCreateRequest(BaseModel):
     available_cities: Optional[List[str]] = None
     # Three-gate qualification model
     gate: str = "credential_only"  # credential_only | theory_verified | practical_verified
+    required_training_module_codes: Optional[List[str]] = None
     required_assessment_codes: Optional[List[str]] = None
     practical_checklist_items: Optional[List[str]] = None
+    # Provider Type gate — which WorkerType values may ever qualify for this
+    # package. None/empty = unrestricted (back-compat default).
+    allowed_provider_types: Optional[List[str]] = None
 
 
 class CarePackageUpdateRequest(CarePackageCreateRequest):
     pass
+
+
+def _validate_provider_types(values: Optional[List[str]]) -> Optional[List[str]]:
+    """Validates each entry against WorkerType and normalizes. None/empty
+    list both mean 'unrestricted' and are passed through as-is (empty list
+    is stored as-is rather than coerced to None, since an admin explicitly
+    clearing the list is a valid, distinct action from never having set it)."""
+    if not values:
+        return values
+    valid = {t.value for t in WorkerType}
+    bad = [v for v in values if v not in valid]
+    if bad:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Invalid provider type(s) {bad}. Must be one of: {sorted(valid)}",
+        )
+    return values
 
 
 def _serialize_care_package(pkg: CarePackage) -> dict:
@@ -626,11 +701,16 @@ def _serialize_care_package(pkg: CarePackage) -> dict:
         "requires_prescription": pkg.requires_prescription,
         "insurance_covered": pkg.insurance_covered,
         "is_active": pkg.is_active,
+        "is_deleted": pkg.is_deleted,
+        "deleted_at": pkg.deleted_at.isoformat() if pkg.deleted_at else None,
         "version": pkg.version,
         "available_cities": pkg.available_cities,
         "gate": pkg.gate.value if pkg.gate else None,
+        "required_training_module_codes": pkg.required_training_module_codes,
         "required_assessment_codes": pkg.required_assessment_codes,
+        "required_specialty_tags": pkg.required_specialty_tags,
         "practical_checklist_items": pkg.practical_checklist_items,
+        "allowed_provider_types": pkg.allowed_provider_types,
         "created_at": pkg.created_at.isoformat() if pkg.created_at else None,
     }
 
@@ -684,8 +764,10 @@ async def create_care_package(
         insurance_covered=payload.insurance_covered,
         available_cities=payload.available_cities,
         gate=gate or QualificationGate.credential_only,
+        required_training_module_codes=payload.required_training_module_codes,
         required_assessment_codes=payload.required_assessment_codes,
         practical_checklist_items=payload.practical_checklist_items,
+        allowed_provider_types=_validate_provider_types(payload.allowed_provider_types),
         is_active=True,
         version=1,
         created_by=current.id,
@@ -739,8 +821,10 @@ async def update_care_package(
     pkg.insurance_covered = payload.insurance_covered
     pkg.available_cities = payload.available_cities
     pkg.gate = gate or pkg.gate
+    pkg.required_training_module_codes = payload.required_training_module_codes
     pkg.required_assessment_codes = payload.required_assessment_codes
     pkg.practical_checklist_items = payload.practical_checklist_items
+    pkg.allowed_provider_types = _validate_provider_types(payload.allowed_provider_types)
     pkg.version = (pkg.version or 1) + 1
 
     await db.commit()
@@ -758,9 +842,600 @@ async def toggle_care_package(
     pkg = res.scalar_one_or_none()
     if not pkg:
         raise HTTPException(status_code=404, detail="Care package not found")
+    if pkg.is_deleted:
+        raise HTTPException(status_code=409, detail="This package has been deleted and can't be toggled")
     pkg.is_active = not pkg.is_active
     await db.commit()
     return {"id": str(pkg.id), "is_active": pkg.is_active}
+
+
+@router.delete("/care-packages/{package_id}")
+async def delete_care_package(
+    package_id: UUID,
+    current: CurrentUser = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Soft-delete only. Never hard-deletes: existing CarePackageBooking rows
+    reference this package, so a real DELETE would break that history.
+    Blocked while any booking on this package is still active/paused/pending
+    a rematch — those need to be resolved (or the package deactivated to stop
+    new bookings) before it can be removed for good."""
+    res = await db.execute(select(CarePackage).where(CarePackage.id == package_id))
+    pkg = res.scalar_one_or_none()
+    if not pkg:
+        raise HTTPException(status_code=404, detail="Care package not found")
+    if pkg.is_deleted:
+        raise HTTPException(status_code=409, detail="Package already deleted")
+
+    open_statuses = (
+        PackageBookingStatus.active,
+        PackageBookingStatus.paused,
+        PackageBookingStatus.rematch_pending,
+    )
+    open_count_res = await db.execute(
+        select(func.count(CarePackageBooking.id)).where(
+            CarePackageBooking.package_id == package_id,
+            CarePackageBooking.status.in_(open_statuses),
+        )
+    )
+    open_count = open_count_res.scalar_one()
+    if open_count > 0:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Can't delete — {open_count} booking(s) on this package are still "
+                "active, paused, or awaiting rematch. Resolve or complete them first, "
+                "or disable the package instead to stop new bookings."
+            ),
+        )
+
+    pkg.is_deleted = True
+    pkg.is_active = False
+    pkg.deleted_at = datetime.now(timezone.utc)
+    pkg.deleted_by = current.id
+    await db.commit()
+    return {"id": str(pkg.id), "is_deleted": True}
+
+
+# ============================================================================
+# PATCH 5 — Admin Service Catalogue endpoints (individual services)
+#
+# Previously ServiceCatalogue had no admin CRUD at all — every row was
+# seed-script only (app/seed.py), so allowed_provider_types on a service
+# (as opposed to a package) could never be set through the API. This closes
+# that gap with the same shape as the Care Package endpoints above:
+#   GET    /api/admin/services                     list (with filters)
+#   GET    /api/admin/services/{id}                 single
+#   POST   /api/admin/services                      create
+#   PUT    /api/admin/services/{id}                 update
+#   PATCH  /api/admin/services/{id}/toggle           enable/disable
+#   DELETE /api/admin/services/{id}                 soft-delete
+# Seed scripts (app/seed.py) remain valid — this is an additional way to
+# create/edit rows, not a replacement for existing seeded data.
+# ============================================================================
+class ServiceCreateRequest(BaseModel):
+    service_code: str
+    name: str
+    description: Optional[str] = None
+    category: str = "micro_visit"
+    min_tier: str = "tier1"
+    duration_minutes: int
+    base_price: float
+    max_price: Optional[float] = None
+    commission_pct: float
+    urgent_surge_pct: int = 25
+    requires_prescription: bool = False
+    prescription_drug_classes: Optional[List[str]] = None
+    billing_trigger: str = "on_completion"
+    insurance_covered: bool = True
+    icon: Optional[str] = None
+    required_training_module_codes: Optional[List[str]] = None
+    required_certificate_codes: Optional[List[str]] = None
+    required_specialty_tags: Optional[List[str]] = None
+    requires_admin_skill_approval: bool = False
+    risk_level: str = "LOW"
+    lower_tier_override_allowed: bool = False
+    required_assessment_codes: Optional[List[str]] = None
+    minimum_pass_score: Optional[int] = None
+    gate: str = "credential_only"
+    practical_checklist_items: Optional[List[str]] = None
+    # Provider Type gate — which WorkerType values may ever qualify for this
+    # service. None/empty = unrestricted (back-compat default — matches
+    # every existing seeded row, which has this column NULL).
+    allowed_provider_types: Optional[List[str]] = None
+
+
+class ServiceUpdateRequest(ServiceCreateRequest):
+    pass
+
+
+def _serialize_service(svc: ServiceCatalogue) -> dict:
+    return {
+        "id": str(svc.id),
+        "service_code": svc.service_code,
+        "name": svc.name,
+        "description": svc.description,
+        "category": svc.category.value if svc.category else None,
+        "min_tier": svc.min_tier.value if svc.min_tier else None,
+        "duration_minutes": svc.duration_minutes,
+        "base_price": float(svc.base_price) if svc.base_price is not None else None,
+        "max_price": float(svc.max_price) if svc.max_price is not None else None,
+        "commission_pct": float(svc.commission_pct) if svc.commission_pct is not None else None,
+        "urgent_surge_pct": svc.urgent_surge_pct,
+        "requires_prescription": svc.requires_prescription,
+        "prescription_drug_classes": svc.prescription_drug_classes,
+        "billing_trigger": svc.billing_trigger.value if svc.billing_trigger else None,
+        "insurance_covered": svc.insurance_covered,
+        "icon": svc.icon,
+        "is_active": svc.is_active,
+        "is_deleted": svc.is_deleted,
+        "deleted_at": svc.deleted_at.isoformat() if svc.deleted_at else None,
+        "version": svc.version,
+        "required_training_module_codes": svc.required_training_module_codes,
+        "required_certificate_codes": svc.required_certificate_codes,
+        "required_specialty_tags": svc.required_specialty_tags,
+        "requires_admin_skill_approval": svc.requires_admin_skill_approval,
+        "risk_level": svc.risk_level.value if svc.risk_level else None,
+        "lower_tier_override_allowed": svc.lower_tier_override_allowed,
+        "required_assessment_codes": svc.required_assessment_codes,
+        "minimum_pass_score": svc.minimum_pass_score,
+        "gate": svc.gate.value if svc.gate else None,
+        "practical_checklist_items": svc.practical_checklist_items,
+        "allowed_provider_types": svc.allowed_provider_types,
+        "created_at": svc.created_at.isoformat() if svc.created_at else None,
+    }
+
+
+@router.get("/services")
+async def list_services(
+    category: str | None = None,
+    provider_type: str | None = None,
+    is_active: bool | None = None,
+    include_deleted: bool = False,
+    current: CurrentUser = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    stmt = select(ServiceCatalogue).order_by(ServiceCatalogue.created_at.desc())
+    if not include_deleted:
+        stmt = stmt.where(ServiceCatalogue.is_deleted.is_(False))
+    if category:
+        stmt = stmt.where(ServiceCatalogue.category == _validate_enum_field(category, ServiceCategory, "category"))
+    if is_active is not None:
+        stmt = stmt.where(ServiceCatalogue.is_active == is_active)
+    if provider_type:
+        if provider_type not in {t.value for t in WorkerType}:
+            raise HTTPException(status_code=400, detail=f"Invalid provider_type: {provider_type}")
+        # A NULL/empty allowed_provider_types row is unrestricted, so it
+        # matches every provider_type filter — same semantics as the
+        # booking-eligibility check in app/services/qualification.py.
+        stmt = stmt.where(
+            (ServiceCatalogue.allowed_provider_types.is_(None))
+            | (ServiceCatalogue.allowed_provider_types == [])
+            | (ServiceCatalogue.allowed_provider_types.any(provider_type))
+        )
+    res = await db.execute(stmt)
+    return [_serialize_service(s) for s in res.scalars().all()]
+
+
+@router.get("/services/{service_id}")
+async def get_service(
+    service_id: UUID,
+    current: CurrentUser = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    res = await db.execute(select(ServiceCatalogue).where(ServiceCatalogue.id == service_id))
+    svc = res.scalar_one_or_none()
+    if not svc:
+        raise HTTPException(status_code=404, detail="Service not found")
+    return _serialize_service(svc)
+
+
+@router.post("/services", status_code=201)
+async def create_service(
+    payload: ServiceCreateRequest,
+    current: CurrentUser = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    code = payload.service_code.strip().lower()
+    existing = await db.execute(select(ServiceCatalogue).where(ServiceCatalogue.service_code == code))
+    if existing.scalar_one_or_none():
+        raise HTTPException(status_code=409, detail=f"Service code '{code}' already exists")
+
+    category = _validate_enum_field(payload.category, ServiceCategory, "category")
+    min_tier = _validate_enum_field(payload.min_tier, WorkerTier, "min_tier")
+    billing_trigger = _validate_enum_field(payload.billing_trigger, BillingTrigger, "billing_trigger")
+    risk_level = _validate_enum_field(payload.risk_level, ServiceRiskLevel, "risk_level")
+    gate = _validate_enum_field(payload.gate, QualificationGate, "gate")
+
+    svc = ServiceCatalogue(
+        service_code=code,
+        name=payload.name.strip(),
+        description=payload.description,
+        category=category or ServiceCategory.micro_visit,
+        min_tier=min_tier or WorkerTier.tier1,
+        duration_minutes=payload.duration_minutes,
+        base_price=Decimal(str(payload.base_price)),
+        max_price=Decimal(str(payload.max_price)) if payload.max_price is not None else None,
+        commission_pct=Decimal(str(payload.commission_pct)),
+        urgent_surge_pct=payload.urgent_surge_pct,
+        requires_prescription=payload.requires_prescription,
+        prescription_drug_classes=payload.prescription_drug_classes,
+        billing_trigger=billing_trigger or BillingTrigger.on_completion,
+        insurance_covered=payload.insurance_covered,
+        icon=payload.icon,
+        required_training_module_codes=payload.required_training_module_codes,
+        required_certificate_codes=payload.required_certificate_codes,
+        required_specialty_tags=payload.required_specialty_tags,
+        requires_admin_skill_approval=payload.requires_admin_skill_approval,
+        risk_level=risk_level or ServiceRiskLevel.LOW,
+        lower_tier_override_allowed=payload.lower_tier_override_allowed,
+        required_assessment_codes=payload.required_assessment_codes,
+        minimum_pass_score=payload.minimum_pass_score,
+        gate=gate or QualificationGate.credential_only,
+        practical_checklist_items=payload.practical_checklist_items,
+        allowed_provider_types=_validate_provider_types(payload.allowed_provider_types),
+        is_active=True,
+        version=1,
+    )
+    db.add(svc)
+    await db.commit()
+    await db.refresh(svc)
+    return _serialize_service(svc)
+
+
+@router.put("/services/{service_id}")
+async def update_service(
+    service_id: UUID,
+    payload: ServiceUpdateRequest,
+    current: CurrentUser = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    res = await db.execute(select(ServiceCatalogue).where(ServiceCatalogue.id == service_id))
+    svc = res.scalar_one_or_none()
+    if not svc:
+        raise HTTPException(status_code=404, detail="Service not found")
+
+    new_code = payload.service_code.strip().lower()
+    if new_code != svc.service_code:
+        dupe = await db.execute(
+            select(ServiceCatalogue).where(ServiceCatalogue.service_code == new_code, ServiceCatalogue.id != service_id)
+        )
+        if dupe.scalar_one_or_none():
+            raise HTTPException(status_code=409, detail=f"Service code '{new_code}' already exists")
+
+    category = _validate_enum_field(payload.category, ServiceCategory, "category")
+    min_tier = _validate_enum_field(payload.min_tier, WorkerTier, "min_tier")
+    billing_trigger = _validate_enum_field(payload.billing_trigger, BillingTrigger, "billing_trigger")
+    risk_level = _validate_enum_field(payload.risk_level, ServiceRiskLevel, "risk_level")
+    gate = _validate_enum_field(payload.gate, QualificationGate, "gate")
+
+    svc.service_code = new_code
+    svc.name = payload.name.strip()
+    svc.description = payload.description
+    svc.category = category or svc.category
+    svc.min_tier = min_tier or svc.min_tier
+    svc.duration_minutes = payload.duration_minutes
+    svc.base_price = Decimal(str(payload.base_price))
+    svc.max_price = Decimal(str(payload.max_price)) if payload.max_price is not None else None
+    svc.commission_pct = Decimal(str(payload.commission_pct))
+    svc.urgent_surge_pct = payload.urgent_surge_pct
+    svc.requires_prescription = payload.requires_prescription
+    svc.prescription_drug_classes = payload.prescription_drug_classes
+    svc.billing_trigger = billing_trigger or svc.billing_trigger
+    svc.insurance_covered = payload.insurance_covered
+    svc.icon = payload.icon
+    svc.required_training_module_codes = payload.required_training_module_codes
+    svc.required_certificate_codes = payload.required_certificate_codes
+    svc.required_specialty_tags = payload.required_specialty_tags
+    svc.requires_admin_skill_approval = payload.requires_admin_skill_approval
+    svc.risk_level = risk_level or svc.risk_level
+    svc.lower_tier_override_allowed = payload.lower_tier_override_allowed
+    svc.required_assessment_codes = payload.required_assessment_codes
+    svc.minimum_pass_score = payload.minimum_pass_score
+    svc.gate = gate or svc.gate
+    svc.practical_checklist_items = payload.practical_checklist_items
+    svc.allowed_provider_types = _validate_provider_types(payload.allowed_provider_types)
+    svc.version = (svc.version or 1) + 1
+
+    await db.commit()
+    await db.refresh(svc)
+    return _serialize_service(svc)
+
+
+@router.patch("/services/{service_id}/toggle")
+async def toggle_service(
+    service_id: UUID,
+    current: CurrentUser = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    res = await db.execute(select(ServiceCatalogue).where(ServiceCatalogue.id == service_id))
+    svc = res.scalar_one_or_none()
+    if not svc:
+        raise HTTPException(status_code=404, detail="Service not found")
+    if svc.is_deleted:
+        raise HTTPException(status_code=409, detail="This service has been deleted and can't be toggled")
+    svc.is_active = not svc.is_active
+    await db.commit()
+    return {"id": str(svc.id), "is_active": svc.is_active}
+
+
+@router.delete("/services/{service_id}")
+async def delete_service(
+    service_id: UUID,
+    current: CurrentUser = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Soft-delete only — Booking, WorkerServiceQualification, PracticalSignOff,
+    WorkerServicePreference, and CarePackage.primary_service_id/included_service_ids
+    all reference service_catalogue rows, so a real DELETE would break history.
+    Blocked while any worker still holds an active/pending qualification for
+    this service — resolve those (or just deactivate the service to stop new
+    bookings) before deleting."""
+    res = await db.execute(select(ServiceCatalogue).where(ServiceCatalogue.id == service_id))
+    svc = res.scalar_one_or_none()
+    if not svc:
+        raise HTTPException(status_code=404, detail="Service not found")
+    if svc.is_deleted:
+        raise HTTPException(status_code=409, detail="Service already deleted")
+
+    open_qual_res = await db.execute(
+        select(func.count(WorkerServiceQualification.id)).where(
+            WorkerServiceQualification.service_id == service_id,
+            WorkerServiceQualification.qualification_status == WorkerQualificationStatus.APPROVED,
+        )
+    )
+    open_qual = open_qual_res.scalar_one()
+    if open_qual > 0:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Can't delete — {open_qual} worker(s) currently hold an approved "
+                "qualification for this service. Deactivate it instead to stop new "
+                "bookings without breaking their qualification history."
+            ),
+        )
+
+    svc.is_deleted = True
+    svc.is_active = False
+    svc.deleted_at = datetime.now(timezone.utc)
+    svc.deleted_by = current.id
+    await db.commit()
+    return {"id": str(svc.id), "is_deleted": True}
+
+
+# ============================================================================
+# PATCH 6 — Worker Reference (character/employer reference) endpoints
+#
+# WorkerReference model existed since Phase 1 with no API — mainly used for
+# Caregiver / Mother & Baby Caregiver onboarding (no degree, so references
+# carry more verification weight), but not restricted to those types.
+#   GET    /api/admin/workers/{worker_id}/references        list
+#   POST   /api/admin/workers/{worker_id}/references         create
+#   PATCH  /api/admin/references/{reference_id}/verify        verify/reject
+#   DELETE /api/admin/references/{reference_id}                remove
+# The worker-facing create (a worker submitting their own references during
+# onboarding) lives in workers.py, not here — this file is admin-only.
+# ============================================================================
+class WorkerReferenceCreateRequest(BaseModel):
+    reference_name: str
+    relationship_to_worker: Optional[str] = None
+    phone: Optional[str] = None
+    previous_employer_name: Optional[str] = None
+    notes: Optional[str] = None
+
+
+class WorkerReferenceVerifyRequest(BaseModel):
+    verification_status: str  # verified | could_not_reach | negative
+    notes: Optional[str] = None
+
+
+def _serialize_reference(ref: WorkerReference) -> dict:
+    return {
+        "id": str(ref.id),
+        "worker_id": str(ref.worker_id),
+        "reference_name": ref.reference_name,
+        "relationship_to_worker": ref.relationship_to_worker,
+        "phone": ref.phone,
+        "previous_employer_name": ref.previous_employer_name,
+        "verification_status": ref.verification_status,
+        "verified_by": str(ref.verified_by) if ref.verified_by else None,
+        "verified_at": ref.verified_at.isoformat() if ref.verified_at else None,
+        "notes": ref.notes,
+        "created_at": ref.created_at.isoformat() if ref.created_at else None,
+    }
+
+
+@router.get("/workers/{worker_id}/references")
+async def list_worker_references(
+    worker_id: UUID,
+    current: CurrentUser = Depends(require_reviewer),
+    db: AsyncSession = Depends(get_db),
+):
+    res = await db.execute(
+        select(WorkerReference).where(WorkerReference.worker_id == worker_id).order_by(WorkerReference.created_at.desc())
+    )
+    return [_serialize_reference(r) for r in res.scalars().all()]
+
+
+@router.post("/workers/{worker_id}/references", status_code=201)
+async def create_worker_reference(
+    worker_id: UUID,
+    payload: WorkerReferenceCreateRequest,
+    current: CurrentUser = Depends(require_reviewer),
+    db: AsyncSession = Depends(get_db),
+):
+    """Admin/reviewer adding a reference on the worker's behalf (e.g. from a
+    phone-collected reference sheet). A worker self-service equivalent, if
+    needed, belongs in workers.py."""
+    wp_res = await db.execute(select(WorkerProfile).where(WorkerProfile.id == worker_id))
+    if not wp_res.scalar_one_or_none():
+        raise HTTPException(status_code=404, detail="Worker not found")
+
+    ref = WorkerReference(
+        worker_id=worker_id,
+        reference_name=payload.reference_name.strip(),
+        relationship_to_worker=payload.relationship_to_worker,
+        phone=payload.phone,
+        previous_employer_name=payload.previous_employer_name,
+        notes=payload.notes,
+        verification_status="pending",
+    )
+    db.add(ref)
+    await db.commit()
+    await db.refresh(ref)
+    return _serialize_reference(ref)
+
+
+@router.patch("/references/{reference_id}/verify")
+async def verify_worker_reference(
+    reference_id: UUID,
+    payload: WorkerReferenceVerifyRequest,
+    current: CurrentUser = Depends(require_reviewer),
+    db: AsyncSession = Depends(get_db),
+):
+    valid_statuses = {"verified", "could_not_reach", "negative", "pending"}
+    if payload.verification_status not in valid_statuses:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Invalid verification_status. Must be one of: {sorted(valid_statuses)}",
+        )
+    res = await db.execute(select(WorkerReference).where(WorkerReference.id == reference_id))
+    ref = res.scalar_one_or_none()
+    if not ref:
+        raise HTTPException(status_code=404, detail="Reference not found")
+
+    ref.verification_status = payload.verification_status
+    ref.verified_by = current.id
+    ref.verified_at = datetime.now(timezone.utc)
+    if payload.notes is not None:
+        ref.notes = payload.notes
+    await db.commit()
+    return _serialize_reference(ref)
+
+
+@router.delete("/references/{reference_id}")
+async def delete_worker_reference(
+    reference_id: UUID,
+    current: CurrentUser = Depends(require_reviewer),
+    db: AsyncSession = Depends(get_db),
+):
+    res = await db.execute(select(WorkerReference).where(WorkerReference.id == reference_id))
+    ref = res.scalar_one_or_none()
+    if not ref:
+        raise HTTPException(status_code=404, detail="Reference not found")
+    await db.execute(delete(WorkerReference).where(WorkerReference.id == reference_id))
+    await db.commit()
+    return {"id": str(reference_id), "deleted": True}
+
+
+# ============================================================================
+# Booking / visit report — permanent delete.
+# Admin-only. Unlike the care-package delete above, this is a real, hard
+# DELETE from the database (not a soft/is_deleted flag) — the visit report
+# and everything tied to it must stop existing, not just stop showing up.
+# The frontend is expected to gate this behind an explicit "are you sure you
+# want to delete it permanently?" confirmation before calling this endpoint;
+# the server does not ask for confirmation itself, it just executes on call,
+# so nothing else in the product should expose a path to this.
+#
+# Booking.id is the parent FK for VisitRecord / VisitChecklistResponse /
+# VisitDocumentationItem, all declared ondelete="CASCADE" in the schema, so
+# deleting the Booking row cascades the visit report, checklist answers, and
+# documentation items with it at the DB level — no orphaned rows left behind.
+# ============================================================================
+@router.delete("/bookings/{booking_id}")
+async def delete_booking_permanently(
+    booking_id: UUID,
+    current: CurrentUser = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Permanently deletes a booking and its visit report (and any
+    checklist/documentation rows under it) from the database. Admin-only —
+    there is no equivalent action available to any other role, and this
+    should never be surfaced on any non-admin page.
+
+    Blocked if the booking has real financial or dispute history attached
+    (ledger entries, a worker payout, or an open dispute/complaint) — those
+    are records the business needs to keep even after the booking itself is
+    gone, so hard-deleting the booking underneath them would either orphan
+    them or silently destroy financial/audit history. Everything else that
+    points at this booking without ON DELETE CASCADE (vitals, prescriptions,
+    medication administration, escalations, messages, offline sync rows,
+    location logs, insurance assessments, care notes, resolved support
+    tickets, resolved complaints/disputes) is deleted explicitly first.
+    """
+    res = await db.execute(select(Booking).where(Booking.id == booking_id))
+    booking = res.scalar_one_or_none()
+    if not booking:
+        raise HTTPException(status_code=404, detail="Booking not found")
+
+    ledger_count = (await db.execute(
+        select(func.count(FinancialLedger.id)).where(FinancialLedger.booking_id == booking_id)
+    )).scalar_one()
+    if ledger_count > 0:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Can't permanently delete — {ledger_count} financial ledger entr(y/ies) reference this "
+                   "booking and must be retained for accounting records.",
+        )
+
+    payout_count = (await db.execute(
+        select(func.count(WorkerPayout.id)).where(WorkerPayout.booking_id == booking_id)
+    )).scalar_one()
+    if payout_count > 0:
+        raise HTTPException(
+            status_code=409,
+            detail="Can't permanently delete — a worker payout is recorded against this booking.",
+        )
+
+    open_dispute_count = (await db.execute(
+        select(func.count(Dispute.id)).where(
+            Dispute.booking_id == booking_id, Dispute.status != DisputeStatus.resolved
+        )
+    )).scalar_one()
+    if open_dispute_count > 0:
+        raise HTTPException(
+            status_code=409,
+            detail="Can't permanently delete — this booking has an open dispute. Resolve it first.",
+        )
+
+    open_complaint_count = (await db.execute(
+        select(func.count(Complaint.id)).where(
+            Complaint.booking_id == booking_id, Complaint.status != ComplaintStatus.resolved
+        )
+    )).scalar_one()
+    if open_complaint_count > 0:
+        raise HTTPException(
+            status_code=409,
+            detail="Can't permanently delete — this booking has an open complaint. Resolve it first.",
+        )
+
+    # Record the audit entry before deleting — AuditLog.entity_id is a plain
+    # string column (no FK to bookings), so the log entry survives the
+    # booking's deletion and stays as the permanent record that this
+    # happened, who did it, and what was removed.
+    snapshot = {
+        "booking_ref": booking.booking_ref,
+        "status": booking.status.value,
+        "scheduled_date": booking.scheduled_date.isoformat(),
+        "consumer_id": str(booking.consumer_id),
+        "patient_id": str(booking.patient_id),
+        "worker_id": str(booking.worker_id) if booking.worker_id else None,
+    }
+    await audit(db, current.id, current.role.value, "booking.delete_permanent", "booking", booking.id, snapshot)
+
+    # Explicitly clear child rows that don't cascade at the DB level before
+    # deleting the booking itself, so the FK constraint doesn't reject it.
+    for model in (
+        VitalSignReading, Prescription, MedicationAdministration, Escalation,
+        Message, OfflineSyncQueue, WorkerLocationLog, InsuranceCoverageAssessment,
+        CareNote, SupportTicket, Complaint, Dispute,
+    ):
+        await db.execute(delete(model).where(model.booking_id == booking_id))
+
+    await db.delete(booking)
+    await db.commit()
+    return {"id": str(booking_id), "deleted": True}
 
 
 # ============================================================================
@@ -790,6 +1465,63 @@ async def dashboard_kpis(current: CurrentUser = Depends(require_admin), db: Asyn
         "revenue": float(revenue),
         "avg_rating": round(float(avg_rating), 2),
         "completion_rate": completion_rate,
+    }
+
+
+@router.get("/dashboard/providers")
+async def dashboard_providers(current: CurrentUser = Depends(require_admin), db: AsyncSession = Depends(get_db)):
+    """DB-driven counts for the admin Provider dashboard cards — every
+    number here is a live query, nothing hardcoded. Each key below is
+    designed to map 1:1 to a clickable card that filters
+    GET /admin/workers/all (e.g. the 'nurses' count -> click ->
+    GET /admin/workers/all?provider_type=nurse).
+    """
+    total = (await db.execute(select(func.count(WorkerProfile.id)))).scalar() or 0
+
+    by_type_rows = await db.execute(
+        select(WorkerProfile.worker_type, func.count(WorkerProfile.id)).group_by(WorkerProfile.worker_type)
+    )
+    by_type = {wtype.value: count for wtype, count in by_type_rows.all()}
+    # Ensure every provider type appears even with a zero count.
+    for wt in WorkerType:
+        by_type.setdefault(wt.value, 0)
+
+    by_status_rows = await db.execute(
+        select(WorkerProfile.onboarding_status, func.count(WorkerProfile.id)).group_by(WorkerProfile.onboarding_status)
+    )
+    by_status = {status.value: count for status, count in by_status_rows.all()}
+    for st in WorkerOnboardingStatus:
+        by_status.setdefault(st.value, 0)
+
+    active_count = (await db.execute(
+        select(func.count(WorkerProfile.id)).where(
+            WorkerProfile.onboarding_status == WorkerOnboardingStatus.approved,
+            WorkerProfile.availability != WorkerAvailability.offline,
+        )
+    )).scalar() or 0
+
+    return {
+        "total_providers": total,
+        "by_provider_type": {
+            "doctors": by_type.get("doctor", 0),
+            "dentists": by_type.get("dentist", 0),
+            "nurses": by_type.get("nurse", 0),
+            "physiotherapists": by_type.get("physiotherapist", 0),
+            "caregivers": by_type.get("caregiver", 0),
+            "mother_baby_caregivers": by_type.get("mother_baby_caregiver", 0),
+        },
+        "by_status": {
+            "applied": by_status.get("documents_pending", 0),
+            "documents_pending": by_status.get("documents_pending", 0),
+            "under_verification": by_status.get("pending_review", 0),
+            "training_pending": by_status.get("training_pending", 0),
+            "assessment_pending": by_status.get("assessment_pending", 0),
+            "approved": by_status.get("approved", 0),
+            "active": active_count,
+            "suspended": by_status.get("suspended", 0),
+            "rejected": by_status.get("rejected", 0),
+            "expired": by_status.get("expired", 0),
+        },
     }
 
 
@@ -1138,6 +1870,107 @@ async def get_payout_batch(
             for p in payouts
         ],
     }
+
+
+# ---------------------------------------------------------------------------
+# Individual worker payouts (pending queue + process/hold).
+# Payouts are generated per-booking at visit checkout as `pending`; these
+# endpoints are how admin reviews and settles them.
+# ---------------------------------------------------------------------------
+class PayoutHoldRequest(BaseModel):
+    release: bool = False
+    reason: Optional[str] = None
+
+
+@router.get("/worker-payouts")
+async def list_worker_payouts(
+    status: Optional[str] = None,
+    current: CurrentUser = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    stmt = select(WorkerPayout).order_by(WorkerPayout.created_at.desc())
+    if status:
+        stmt = stmt.where(WorkerPayout.status == status)
+    rows = (await db.execute(stmt)).scalars().all()
+
+    worker_ids = {p.worker_id for p in rows}
+    names: dict = {}
+    if worker_ids:
+        wres = await db.execute(
+            select(WorkerProfile, User)
+            .join(User, User.id == WorkerProfile.user_id)
+            .where(WorkerProfile.id.in_(worker_ids))
+        )
+        for wp, u in wres.all():
+            names[wp.id] = {
+                "name": u.full_name or u.email,
+                "has_bank": bool(wp.bank_account_number and wp.bank_ifsc),
+            }
+    return [
+        {
+            "id": str(p.id),
+            "worker_id": str(p.worker_id),
+            "worker_name": names.get(p.worker_id, {}).get("name"),
+            "worker_has_bank": names.get(p.worker_id, {}).get("has_bank", False),
+            "booking_id": str(p.booking_id),
+            "gross_amount": float(p.gross_amount),
+            "tds_deducted": float(p.tds_deducted),
+            "net_amount": float(p.net_amount),
+            "status": p.status.value,
+            "paid_at": p.paid_at.isoformat() if p.paid_at else None,
+            "created_at": p.created_at.isoformat(),
+        }
+        for p in rows
+    ]
+
+
+@router.post("/worker-payouts/{payout_id}/process")
+async def process_worker_payout(
+    payout_id: UUID,
+    current: CurrentUser = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Pay a pending/failed payout — via RazorpayX when configured and the
+    nurse has bank details, otherwise mark it settled manually."""
+    res = await db.execute(select(WorkerPayout).where(WorkerPayout.id == payout_id))
+    payout = res.scalar_one_or_none()
+    if not payout:
+        raise HTTPException(status_code=404, detail="Payout not found")
+
+    from app.services.payout_service import process_payout
+    result = await process_payout(db, payout)
+    if result.get("error"):
+        await db.rollback()
+        raise HTTPException(status_code=409, detail=result["error"])
+    await audit(db, current.id, current.role.value, "payout.process", "worker_payout", payout.id, result)
+    await db.commit()
+    return result
+
+
+@router.post("/worker-payouts/{payout_id}/hold")
+async def hold_worker_payout(
+    payout_id: UUID,
+    body: PayoutHoldRequest,
+    current: CurrentUser = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    res = await db.execute(select(WorkerPayout).where(WorkerPayout.id == payout_id))
+    payout = res.scalar_one_or_none()
+    if not payout:
+        raise HTTPException(status_code=404, detail="Payout not found")
+    if payout.status == WorkerPayoutStatus.paid:
+        raise HTTPException(status_code=409, detail="Already paid")
+    from datetime import datetime as _dt, timezone as _tz
+    if body.release:
+        payout.status = WorkerPayoutStatus.pending
+        payout.hold_released_at = _dt.now(_tz.utc)
+    else:
+        payout.status = WorkerPayoutStatus.on_hold
+        payout.hold_reason = body.reason
+        payout.hold_initiated_by = current.id
+        payout.hold_initiated_at = _dt.now(_tz.utc)
+    await db.commit()
+    return {"status": payout.status.value}
 
 
 # ============================================================================
@@ -1610,6 +2443,38 @@ async def create_operations_account(
     if payload.role != UserRole.operations.value:
         raise HTTPException(status_code=400, detail="This endpoint only creates operations accounts")
     user = await _create_staff_user(payload, db)
+    return _serialize_staff_user(user)
+
+
+@router.post("/staff/reviewer")
+async def create_reviewer_account(
+    payload: StaffCreateRequest,
+    current: CurrentUser = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Only admin can create reviewer accounts. Reviewers review nurse
+    onboarding documents and background checks — separate from the
+    support/clinical_training_lead/clinical_trainer roles operations
+    manages via /staff, so this gets its own admin-only endpoint (same
+    shape as /staff/operations)."""
+    if payload.role != UserRole.reviewer.value:
+        raise HTTPException(status_code=400, detail="This endpoint only creates reviewer accounts")
+    user = await _create_staff_user(payload, db)
+
+    # Without a ReviewerProfile row, the auto-assignment engine never sees
+    # this reviewer as eligible, so nurse review tickets would never reach
+    # them. Create one automatically, active and ready to review.
+    db.add(
+        ReviewerProfile(
+            user_id=user.id,
+            is_active=True,
+            can_review_nurse_documents=True,
+            max_open_tickets=20,
+            specialization="nursing",
+        )
+    )
+    await db.commit()
+
     return _serialize_staff_user(user)
 
 
