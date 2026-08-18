@@ -25,13 +25,16 @@ from app.models.enums import (
     PackageBookingStatus,
     PaymentStatus,
     PayoutBatchStatus,
+    ProviderStatusChangeReason,
     QualificationGate,
     UserRole,
     UserStatus,
     VisitFrequency,
     VisitStatus,
+    WorkerAvailability,
     WorkerOnboardingStatus,
     WorkerPayoutStatus,
+    WorkerQualificationStatus,
     WorkerTier,
     WorkerType,
 )
@@ -57,6 +60,7 @@ from app.models.models import (
     Patient,
     PayoutBatch,
     Prescription,
+    ProviderStatusHistory,
     ReviewerProfile,
     RoleDefinition,
     ServiceCatalogue,
@@ -69,6 +73,7 @@ from app.models.models import (
     WorkerLocationLog,
     WorkerPayout,
     WorkerProfile,
+    WorkerServiceQualification,
 )
 
 router = APIRouter(prefix="/admin", tags=["admin"])
@@ -77,6 +82,13 @@ router = APIRouter(prefix="/admin", tags=["admin"])
 # the live ticket for a worker when syncing status after a review action.
 _OPEN_TICKET_STATUSES = ("PENDING_REVIEW", "IN_REVIEW", "NEEDS_CLARIFICATION", "UNASSIGNED")
 
+# Document requirements per Provider Type now live in app/core/provider_types.py
+# (single source of truth — this dict used to be redeclared here, unused,
+# and had already drifted from the copies actually enforced elsewhere).
+from app.core.provider_types import (
+    PROVIDER_TYPE_LABELS,
+    required_docs as _required_docs_for_type,
+)
 REQUIRED_DOCUMENTS_BY_WORKER_TYPE = {
     WorkerType.nurse: {"aadhaar", "nursing_license", "degree_certificate", "police_verification"},
     WorkerType.caregiver: {"aadhaar", "police_verification"},
@@ -176,11 +188,23 @@ async def pending_workers(
 @router.get("/workers/all")
 async def all_workers(
     onboarding_status: str | None = None,
+    provider_type: str | None = None,
+    city: str | None = None,
+    # Combined "Package" filter: a package_code (CarePackage.package_code) or
+    # a service_code (ServiceCatalogue.service_code) — matches either, since
+    # your spec's package list ("Injection", "Physiotherapy", ...) maps to a
+    # mix of both in the existing catalogue.
+    package: str | None = None,
+    qualification_status: str | None = None,
     limit: int = 200,
     current: CurrentUser = Depends(require_reviewer),
     db: AsyncSession = Depends(get_db),
 ):
-    """All workers regardless of onboarding status — used by the admin nurses list."""
+    """All workers regardless of onboarding status — used by the admin
+    Provider list. Supports the combined filter set from the Provider Type /
+    Status / Location / Package / Qualification Status admin filters:
+    e.g. provider_type=nurse&city=Hyderabad&onboarding_status=approved&package=injection
+    """
     stmt = (
         select(WorkerProfile, User)
         .join(User, User.id == WorkerProfile.user_id)
@@ -188,11 +212,42 @@ async def all_workers(
         .limit(limit)
     )
     if onboarding_status:
-        from app.models.enums import WorkerOnboardingStatus
         try:
             stmt = stmt.where(WorkerProfile.onboarding_status == WorkerOnboardingStatus(onboarding_status))
         except ValueError:
-            pass
+            raise HTTPException(status_code=400, detail=f"Invalid onboarding_status: {onboarding_status}")
+    if provider_type:
+        try:
+            stmt = stmt.where(WorkerProfile.worker_type == WorkerType(provider_type))
+        except ValueError:
+            raise HTTPException(status_code=400, detail=f"Invalid provider_type: {provider_type}")
+    if city:
+        stmt = stmt.where(WorkerProfile.base_city.ilike(f"%{city}%"))
+
+    worker_ids_for_package_or_qual: set[UUID] | None = None
+    if package or qualification_status:
+        qual_stmt = select(WorkerServiceQualification.worker_id).join(
+            ServiceCatalogue, ServiceCatalogue.id == WorkerServiceQualification.service_id, isouter=True,
+        ).join(
+            CarePackage, CarePackage.id == WorkerServiceQualification.package_id, isouter=True,
+        )
+        if package:
+            qual_stmt = qual_stmt.where(
+                (ServiceCatalogue.service_code.ilike(f"%{package}%"))
+                | (CarePackage.package_code.ilike(f"%{package}%"))
+            )
+        if qualification_status:
+            try:
+                qs = WorkerQualificationStatus(qualification_status.upper())
+                qual_stmt = qual_stmt.where(WorkerServiceQualification.qualification_status == qs)
+            except ValueError:
+                raise HTTPException(status_code=400, detail=f"Invalid qualification_status: {qualification_status}")
+        qual_res = await db.execute(qual_stmt)
+        worker_ids_for_package_or_qual = {row[0] for row in qual_res.all()}
+        if not worker_ids_for_package_or_qual:
+            return []
+        stmt = stmt.where(WorkerProfile.id.in_(worker_ids_for_package_or_qual))
+
     res = await db.execute(stmt)
     items = []
     for wp, u in res.all():
@@ -201,6 +256,7 @@ async def all_workers(
             {"document_type": doc.document_type, "verification_status": doc.verification_status}
             for doc in docs_res.scalars().all()
         ]
+        wtype = getattr(wp, "worker_type", None)
         items.append({
             "worker_id": str(wp.id),
             "user_id": str(u.id),
@@ -208,10 +264,12 @@ async def all_workers(
             "phone": u.phone_e164,
             "email": u.email,
             "tier": wp.tier.value,
-            "worker_type": getattr(wp, "worker_type", None) and wp.worker_type.value,
+            "worker_type": wtype and wtype.value,
+            "provider_type_label": wtype and PROVIDER_TYPE_LABELS.get(wtype),
             "onboarding_status": wp.onboarding_status.value,
             "background_check_status": wp.background_check_status,
             "availability": wp.availability.value if wp.availability else None,
+            "base_city": wp.base_city,
             "documents": documents,
             "created_at": wp.created_at.isoformat(),
         })
@@ -226,6 +284,7 @@ async def approve_worker(
     # Delegates to the shared approve/reject service (app/services/worker_approval.py)
     # so this endpoint and the reviewer-ticket "APPROVED" status update
     # (app/api/v1/review_tickets.py) can never fall out of sync again.
+    await approve_worker_profile(db, worker_id, changed_by=current.id)
     await approve_worker_profile(db, worker_id)
     await db.commit()
     return {"approved": True}
@@ -294,6 +353,7 @@ async def reject_worker(
     current: CurrentUser = Depends(require_reviewer),
     db: AsyncSession = Depends(get_db),
 ):
+    await reject_worker_profile(db, worker_id, payload.reason.strip(), changed_by=current.id)
     await reject_worker_profile(db, worker_id, payload.reason.strip())
     await db.commit()
     return {"rejected": True}
@@ -368,10 +428,43 @@ async def suspend_worker(
     if not row:
         raise HTTPException(status_code=404, detail="Worker not found")
     wp, user = row
+    prev_status = wp.onboarding_status.value
     wp.onboarding_status = WorkerOnboardingStatus.suspended
     user.status = UserStatus.suspended
+    db.add(ProviderStatusHistory(
+        worker_id=wp.id, from_status=prev_status, to_status="suspended",
+        reason=ProviderStatusChangeReason.admin_suspended, changed_by=current.id, notes=reason,
+    ))
     await db.commit()
     return {"suspended": True}
+
+
+@router.post("/workers/{worker_id}/reinstate")
+async def reinstate_worker(
+    worker_id: UUID,
+    current: CurrentUser = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Reverse a suspension. Returns the worker to 'approved' (active,
+    bookable) — does not re-run document/qualification checks, since those
+    were already satisfied before suspension."""
+    res = await db.execute(select(WorkerProfile, User).join(User, User.id == WorkerProfile.user_id).where(WorkerProfile.id == worker_id))
+    row = res.first()
+    if not row:
+        raise HTTPException(status_code=404, detail="Worker not found")
+    wp, user = row
+    if wp.onboarding_status != WorkerOnboardingStatus.suspended:
+        raise HTTPException(status_code=409, detail="Worker is not currently suspended")
+    prev_status = wp.onboarding_status.value
+    wp.onboarding_status = WorkerOnboardingStatus.approved
+    if user.status == UserStatus.suspended:
+        user.status = UserStatus.active
+    db.add(ProviderStatusHistory(
+        worker_id=wp.id, from_status=prev_status, to_status="approved",
+        reason=ProviderStatusChangeReason.admin_reinstated, changed_by=current.id,
+    ))
+    await db.commit()
+    return {"reinstated": True}
 
 
 @router.get("/financial/ledger")
@@ -914,6 +1007,63 @@ async def dashboard_kpis(current: CurrentUser = Depends(require_admin), db: Asyn
         "revenue": float(revenue),
         "avg_rating": round(float(avg_rating), 2),
         "completion_rate": completion_rate,
+    }
+
+
+@router.get("/dashboard/providers")
+async def dashboard_providers(current: CurrentUser = Depends(require_admin), db: AsyncSession = Depends(get_db)):
+    """DB-driven counts for the admin Provider dashboard cards — every
+    number here is a live query, nothing hardcoded. Each key below is
+    designed to map 1:1 to a clickable card that filters
+    GET /admin/workers/all (e.g. the 'nurses' count -> click ->
+    GET /admin/workers/all?provider_type=nurse).
+    """
+    total = (await db.execute(select(func.count(WorkerProfile.id)))).scalar() or 0
+
+    by_type_rows = await db.execute(
+        select(WorkerProfile.worker_type, func.count(WorkerProfile.id)).group_by(WorkerProfile.worker_type)
+    )
+    by_type = {wtype.value: count for wtype, count in by_type_rows.all()}
+    # Ensure every provider type appears even with a zero count.
+    for wt in WorkerType:
+        by_type.setdefault(wt.value, 0)
+
+    by_status_rows = await db.execute(
+        select(WorkerProfile.onboarding_status, func.count(WorkerProfile.id)).group_by(WorkerProfile.onboarding_status)
+    )
+    by_status = {status.value: count for status, count in by_status_rows.all()}
+    for st in WorkerOnboardingStatus:
+        by_status.setdefault(st.value, 0)
+
+    active_count = (await db.execute(
+        select(func.count(WorkerProfile.id)).where(
+            WorkerProfile.onboarding_status == WorkerOnboardingStatus.approved,
+            WorkerProfile.availability != WorkerAvailability.offline,
+        )
+    )).scalar() or 0
+
+    return {
+        "total_providers": total,
+        "by_provider_type": {
+            "doctors": by_type.get("doctor", 0),
+            "dentists": by_type.get("dentist", 0),
+            "nurses": by_type.get("nurse", 0),
+            "physiotherapists": by_type.get("physiotherapist", 0),
+            "caregivers": by_type.get("caregiver", 0),
+            "mother_baby_caregivers": by_type.get("mother_baby_caregiver", 0),
+        },
+        "by_status": {
+            "applied": by_status.get("documents_pending", 0),
+            "documents_pending": by_status.get("documents_pending", 0),
+            "under_verification": by_status.get("pending_review", 0),
+            "training_pending": by_status.get("training_pending", 0),
+            "assessment_pending": by_status.get("assessment_pending", 0),
+            "approved": by_status.get("approved", 0),
+            "active": active_count,
+            "suspended": by_status.get("suspended", 0),
+            "rejected": by_status.get("rejected", 0),
+            "expired": by_status.get("expired", 0),
+        },
     }
 
 

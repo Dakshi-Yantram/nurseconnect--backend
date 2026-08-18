@@ -54,37 +54,22 @@ from app.services.qualification import (
 router = APIRouter(prefix="/workers", tags=["workers"])
 
 from app.models.enums import WorkerType
-
-# Required documents differ by worker type. Nurses are clinically qualified;
-# caregivers are non-clinical helpers, so no nursing license is demanded of them.
-REQUIRED_DOCUMENTS_BY_TYPE = {
-    WorkerType.nurse: {"aadhaar", "nursing_license", "degree_certificate", "police_verification"},
-    WorkerType.caregiver: {"aadhaar", "police_verification"},
-}
-# Optional / supporting documents (uploaded to strengthen the profile / unlock
-# more services), never block submission.
-OPTIONAL_DOCUMENTS_BY_TYPE = {
-    WorkerType.nurse: {"experience_certificate", "specialization_certificate"},
-    WorkerType.caregiver: {"caregiver_training_certificate", "degree_certificate", "experience_certificate"},
-}
-# Human-readable labels for the app.
-DOCUMENT_LABELS = {
-    "aadhaar": "Aadhaar Card",
-    "nursing_license": "Nursing Registration / License",
-    "degree_certificate": "Degree / Education Certificate",
-    "police_verification": "Police Verification",
-    "experience_certificate": "Experience Certificate",
-    "specialization_certificate": "Specialization Certificate",
-    "caregiver_training_certificate": "Caregiver Training Certificate",
-}
+from app.core.provider_types import (
+    DOCUMENT_LABELS,
+    LICENSED_PROVIDER_TYPES,
+    OPTIONAL_DOCUMENTS_BY_PROVIDER_TYPE as OPTIONAL_DOCUMENTS_BY_TYPE,
+    REQUIRED_DOCUMENTS_BY_PROVIDER_TYPE as REQUIRED_DOCUMENTS_BY_TYPE,
+    optional_docs as _optional_docs_for_type,
+    required_docs as _required_docs_for_type,
+)
 
 
 def _required_docs(profile) -> set:
-    return REQUIRED_DOCUMENTS_BY_TYPE.get(getattr(profile, "worker_type", WorkerType.nurse), REQUIRED_DOCUMENTS_BY_TYPE[WorkerType.nurse])
+    return _required_docs_for_type(getattr(profile, "worker_type", WorkerType.nurse))
 
 
 def _optional_docs(profile) -> set:
-    return OPTIONAL_DOCUMENTS_BY_TYPE.get(getattr(profile, "worker_type", WorkerType.nurse), set())
+    return _optional_docs_for_type(getattr(profile, "worker_type", WorkerType.nurse))
 
 
 def _all_allowed_docs(profile) -> set:
@@ -133,15 +118,26 @@ async def _onboarding_snapshot(
     profile_values = {
         "full_name": user.full_name,
         "date_of_birth": profile.date_of_birth,
-        "registration_no": profile.registration_no,
-        "registration_authority": profile.registration_authority,
-        "registration_valid_until": profile.registration_valid_until,
         "base_city": profile.base_city,
     }
+    worker_type = getattr(profile, "worker_type", WorkerType.nurse)
+    # Registration/license fields only apply to licensed provider types
+    # (Nurse, Doctor, Dentist, Physiotherapist). Caregiver and Mother & Baby
+    # Caregiver never require a degree/registration, per spec — previously
+    # this block required registration_no for every worker type, which
+    # silently blocked caregivers from ever completing onboarding.
+    if worker_type in LICENSED_PROVIDER_TYPES:
+        profile_values["registration_no"] = profile.registration_no
+        profile_values["registration_authority"] = profile.registration_authority
+        profile_values["registration_valid_until"] = profile.registration_valid_until
     for field, value in profile_values.items():
         if value is None or (isinstance(value, str) and not value.strip()):
             missing_profile_fields.append(field)
-    if profile.registration_valid_until and profile.registration_valid_until < date.today():
+    if (
+        worker_type in LICENSED_PROVIDER_TYPES
+        and profile.registration_valid_until
+        and profile.registration_valid_until < date.today()
+    ):
         missing_profile_fields.append("registration_valid_until_not_expired")
 
     missing_documents = sorted(_required_docs(profile) - uploaded_types)
@@ -150,7 +146,8 @@ async def _onboarding_snapshot(
     )
     return {
         "onboarding_status": profile.onboarding_status.value,
-        "worker_type": getattr(profile, "worker_type", WorkerType.nurse).value,
+        "worker_type": worker_type.value,
+        "requires_license": worker_type in LICENSED_PROVIDER_TYPES,
         "background_check_status": profile.background_check_status,
         "documents": _doc_catalogue(profile),
         "missing_profile_fields": missing_profile_fields,
