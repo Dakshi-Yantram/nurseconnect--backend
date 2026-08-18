@@ -495,6 +495,12 @@ class ServiceCatalogue(Base):
     # is in this list can ever hold an APPROVED WorkerServiceQualification for
     # this service — enforced in app/services/qualification.py.
     allowed_provider_types: Mapped[Optional[list]] = mapped_column(ARRAY(String))
+    # Soft-delete — same pattern as CarePackage below. A real DELETE would
+    # break Booking/WorkerServiceQualification/etc. rows that reference this
+    # service, so admin "delete" only ever sets these.
+    is_deleted: Mapped[bool] = mapped_column(Boolean, default=False, index=True, server_default="false")
+    deleted_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    deleted_by: Mapped[Optional[UUID]] = mapped_column(PG_UUID(as_uuid=True), ForeignKey("users.id"))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now, server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now, onupdate=_now, server_default=func.now())
 
@@ -1425,6 +1431,11 @@ class TrainingModule(Base):
     is_mandatory: Mapped[bool] = mapped_column(Boolean, default=False)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
     version: Mapped[int] = mapped_column(Integer, default=1, server_default="1", nullable=False)
+    # Provider Type system — which WorkerType values this module is shown to
+    # (worker-facing GET /training/modules filters on this). NULL/empty =
+    # visible to every provider type, same unrestricted-by-default semantics
+    # as ServiceCatalogue.allowed_provider_types / CarePackage.allowed_provider_types.
+    allowed_provider_types: Mapped[Optional[list]] = mapped_column(ARRAY(String))
     # Patch 4B — content lifecycle fields
     status: Mapped[ContentStatus] = mapped_column(
         SQLEnum(ContentStatus, name="content_status"),
@@ -1461,6 +1472,9 @@ class AssessmentModule(Base):
     # per attempt so two workers rarely see byte-identical questions.
     questions: Mapped[list] = mapped_column(JSONB, nullable=False)
     linked_training_module_code: Mapped[Optional[str]] = mapped_column(String(100), index=True)
+    # Provider Type system — same semantics as TrainingModule.allowed_provider_types.
+    # NULL/empty = visible to every provider type.
+    allowed_provider_types: Mapped[Optional[list]] = mapped_column(ARRAY(String))
     # ── Anti-cheat assessment mechanics (Gate 2/3 "theory-verified") ──────
     randomize_options: Mapped[bool] = mapped_column(Boolean, default=True, server_default="true", nullable=False)
     questions_per_attempt: Mapped[Optional[int]] = mapped_column(Integer)  # null = use every question in the bank

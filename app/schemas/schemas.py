@@ -339,6 +339,9 @@ class ServiceOut(ORMModel):
     insurance_covered: bool
     icon: Optional[str] = None
     is_active: bool
+    # Provider Type gate — NULL/empty = unrestricted (every provider type
+    # can qualify). See app/services/qualification.py for enforcement.
+    allowed_provider_types: Optional[List[str]] = None
 
 
 class PackageServiceSummary(BaseModel):
@@ -381,6 +384,8 @@ class CarePackageOut(ORMModel):
     required_assessment_codes: Optional[List[str]] = None
     required_specialty_tags: Optional[List[str]] = None
     practical_checklist_items: Optional[List[str]] = None
+    # Provider Type gate — same semantics as ServiceOut.allowed_provider_types.
+    allowed_provider_types: Optional[List[str]] = None
     # Full set of service ids included in this package (primary + any
     # additional ones). Populated by the catalog API from
     # CarePackage.included_service_ids (falling back to primary_service_id).

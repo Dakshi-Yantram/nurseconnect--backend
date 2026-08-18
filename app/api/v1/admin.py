@@ -27,6 +27,9 @@ from app.models.enums import (
     PayoutBatchStatus,
     ProviderStatusChangeReason,
     QualificationGate,
+    ServiceCategory,
+    ServiceRiskLevel,
+    BillingTrigger,
     UserRole,
     UserStatus,
     VisitFrequency,
@@ -73,6 +76,7 @@ from app.models.models import (
     WorkerLocationLog,
     WorkerPayout,
     WorkerProfile,
+    WorkerReference,
     WorkerServiceQualification,
 )
 
@@ -650,10 +654,30 @@ class CarePackageCreateRequest(BaseModel):
     required_training_module_codes: Optional[List[str]] = None
     required_assessment_codes: Optional[List[str]] = None
     practical_checklist_items: Optional[List[str]] = None
+    # Provider Type gate — which WorkerType values may ever qualify for this
+    # package. None/empty = unrestricted (back-compat default).
+    allowed_provider_types: Optional[List[str]] = None
 
 
 class CarePackageUpdateRequest(CarePackageCreateRequest):
     pass
+
+
+def _validate_provider_types(values: Optional[List[str]]) -> Optional[List[str]]:
+    """Validates each entry against WorkerType and normalizes. None/empty
+    list both mean 'unrestricted' and are passed through as-is (empty list
+    is stored as-is rather than coerced to None, since an admin explicitly
+    clearing the list is a valid, distinct action from never having set it)."""
+    if not values:
+        return values
+    valid = {t.value for t in WorkerType}
+    bad = [v for v in values if v not in valid]
+    if bad:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Invalid provider type(s) {bad}. Must be one of: {sorted(valid)}",
+        )
+    return values
 
 
 def _serialize_care_package(pkg: CarePackage) -> dict:
@@ -686,6 +710,7 @@ def _serialize_care_package(pkg: CarePackage) -> dict:
         "required_assessment_codes": pkg.required_assessment_codes,
         "required_specialty_tags": pkg.required_specialty_tags,
         "practical_checklist_items": pkg.practical_checklist_items,
+        "allowed_provider_types": pkg.allowed_provider_types,
         "created_at": pkg.created_at.isoformat() if pkg.created_at else None,
     }
 
@@ -742,6 +767,7 @@ async def create_care_package(
         required_training_module_codes=payload.required_training_module_codes,
         required_assessment_codes=payload.required_assessment_codes,
         practical_checklist_items=payload.practical_checklist_items,
+        allowed_provider_types=_validate_provider_types(payload.allowed_provider_types),
         is_active=True,
         version=1,
         created_by=current.id,
@@ -798,6 +824,7 @@ async def update_care_package(
     pkg.required_training_module_codes = payload.required_training_module_codes
     pkg.required_assessment_codes = payload.required_assessment_codes
     pkg.practical_checklist_items = payload.practical_checklist_items
+    pkg.allowed_provider_types = _validate_provider_types(payload.allowed_provider_types)
     pkg.version = (pkg.version or 1) + 1
 
     await db.commit()
@@ -868,6 +895,437 @@ async def delete_care_package(
     pkg.deleted_by = current.id
     await db.commit()
     return {"id": str(pkg.id), "is_deleted": True}
+
+
+# ============================================================================
+# PATCH 5 — Admin Service Catalogue endpoints (individual services)
+#
+# Previously ServiceCatalogue had no admin CRUD at all — every row was
+# seed-script only (app/seed.py), so allowed_provider_types on a service
+# (as opposed to a package) could never be set through the API. This closes
+# that gap with the same shape as the Care Package endpoints above:
+#   GET    /api/admin/services                     list (with filters)
+#   GET    /api/admin/services/{id}                 single
+#   POST   /api/admin/services                      create
+#   PUT    /api/admin/services/{id}                 update
+#   PATCH  /api/admin/services/{id}/toggle           enable/disable
+#   DELETE /api/admin/services/{id}                 soft-delete
+# Seed scripts (app/seed.py) remain valid — this is an additional way to
+# create/edit rows, not a replacement for existing seeded data.
+# ============================================================================
+class ServiceCreateRequest(BaseModel):
+    service_code: str
+    name: str
+    description: Optional[str] = None
+    category: str = "micro_visit"
+    min_tier: str = "tier1"
+    duration_minutes: int
+    base_price: float
+    max_price: Optional[float] = None
+    commission_pct: float
+    urgent_surge_pct: int = 25
+    requires_prescription: bool = False
+    prescription_drug_classes: Optional[List[str]] = None
+    billing_trigger: str = "on_completion"
+    insurance_covered: bool = True
+    icon: Optional[str] = None
+    required_training_module_codes: Optional[List[str]] = None
+    required_certificate_codes: Optional[List[str]] = None
+    required_specialty_tags: Optional[List[str]] = None
+    requires_admin_skill_approval: bool = False
+    risk_level: str = "LOW"
+    lower_tier_override_allowed: bool = False
+    required_assessment_codes: Optional[List[str]] = None
+    minimum_pass_score: Optional[int] = None
+    gate: str = "credential_only"
+    practical_checklist_items: Optional[List[str]] = None
+    # Provider Type gate — which WorkerType values may ever qualify for this
+    # service. None/empty = unrestricted (back-compat default — matches
+    # every existing seeded row, which has this column NULL).
+    allowed_provider_types: Optional[List[str]] = None
+
+
+class ServiceUpdateRequest(ServiceCreateRequest):
+    pass
+
+
+def _serialize_service(svc: ServiceCatalogue) -> dict:
+    return {
+        "id": str(svc.id),
+        "service_code": svc.service_code,
+        "name": svc.name,
+        "description": svc.description,
+        "category": svc.category.value if svc.category else None,
+        "min_tier": svc.min_tier.value if svc.min_tier else None,
+        "duration_minutes": svc.duration_minutes,
+        "base_price": float(svc.base_price) if svc.base_price is not None else None,
+        "max_price": float(svc.max_price) if svc.max_price is not None else None,
+        "commission_pct": float(svc.commission_pct) if svc.commission_pct is not None else None,
+        "urgent_surge_pct": svc.urgent_surge_pct,
+        "requires_prescription": svc.requires_prescription,
+        "prescription_drug_classes": svc.prescription_drug_classes,
+        "billing_trigger": svc.billing_trigger.value if svc.billing_trigger else None,
+        "insurance_covered": svc.insurance_covered,
+        "icon": svc.icon,
+        "is_active": svc.is_active,
+        "is_deleted": svc.is_deleted,
+        "deleted_at": svc.deleted_at.isoformat() if svc.deleted_at else None,
+        "version": svc.version,
+        "required_training_module_codes": svc.required_training_module_codes,
+        "required_certificate_codes": svc.required_certificate_codes,
+        "required_specialty_tags": svc.required_specialty_tags,
+        "requires_admin_skill_approval": svc.requires_admin_skill_approval,
+        "risk_level": svc.risk_level.value if svc.risk_level else None,
+        "lower_tier_override_allowed": svc.lower_tier_override_allowed,
+        "required_assessment_codes": svc.required_assessment_codes,
+        "minimum_pass_score": svc.minimum_pass_score,
+        "gate": svc.gate.value if svc.gate else None,
+        "practical_checklist_items": svc.practical_checklist_items,
+        "allowed_provider_types": svc.allowed_provider_types,
+        "created_at": svc.created_at.isoformat() if svc.created_at else None,
+    }
+
+
+@router.get("/services")
+async def list_services(
+    category: str | None = None,
+    provider_type: str | None = None,
+    is_active: bool | None = None,
+    include_deleted: bool = False,
+    current: CurrentUser = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    stmt = select(ServiceCatalogue).order_by(ServiceCatalogue.created_at.desc())
+    if not include_deleted:
+        stmt = stmt.where(ServiceCatalogue.is_deleted.is_(False))
+    if category:
+        stmt = stmt.where(ServiceCatalogue.category == _validate_enum_field(category, ServiceCategory, "category"))
+    if is_active is not None:
+        stmt = stmt.where(ServiceCatalogue.is_active == is_active)
+    if provider_type:
+        if provider_type not in {t.value for t in WorkerType}:
+            raise HTTPException(status_code=400, detail=f"Invalid provider_type: {provider_type}")
+        # A NULL/empty allowed_provider_types row is unrestricted, so it
+        # matches every provider_type filter — same semantics as the
+        # booking-eligibility check in app/services/qualification.py.
+        stmt = stmt.where(
+            (ServiceCatalogue.allowed_provider_types.is_(None))
+            | (ServiceCatalogue.allowed_provider_types == [])
+            | (ServiceCatalogue.allowed_provider_types.any(provider_type))
+        )
+    res = await db.execute(stmt)
+    return [_serialize_service(s) for s in res.scalars().all()]
+
+
+@router.get("/services/{service_id}")
+async def get_service(
+    service_id: UUID,
+    current: CurrentUser = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    res = await db.execute(select(ServiceCatalogue).where(ServiceCatalogue.id == service_id))
+    svc = res.scalar_one_or_none()
+    if not svc:
+        raise HTTPException(status_code=404, detail="Service not found")
+    return _serialize_service(svc)
+
+
+@router.post("/services", status_code=201)
+async def create_service(
+    payload: ServiceCreateRequest,
+    current: CurrentUser = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    code = payload.service_code.strip().lower()
+    existing = await db.execute(select(ServiceCatalogue).where(ServiceCatalogue.service_code == code))
+    if existing.scalar_one_or_none():
+        raise HTTPException(status_code=409, detail=f"Service code '{code}' already exists")
+
+    category = _validate_enum_field(payload.category, ServiceCategory, "category")
+    min_tier = _validate_enum_field(payload.min_tier, WorkerTier, "min_tier")
+    billing_trigger = _validate_enum_field(payload.billing_trigger, BillingTrigger, "billing_trigger")
+    risk_level = _validate_enum_field(payload.risk_level, ServiceRiskLevel, "risk_level")
+    gate = _validate_enum_field(payload.gate, QualificationGate, "gate")
+
+    svc = ServiceCatalogue(
+        service_code=code,
+        name=payload.name.strip(),
+        description=payload.description,
+        category=category or ServiceCategory.micro_visit,
+        min_tier=min_tier or WorkerTier.tier1,
+        duration_minutes=payload.duration_minutes,
+        base_price=Decimal(str(payload.base_price)),
+        max_price=Decimal(str(payload.max_price)) if payload.max_price is not None else None,
+        commission_pct=Decimal(str(payload.commission_pct)),
+        urgent_surge_pct=payload.urgent_surge_pct,
+        requires_prescription=payload.requires_prescription,
+        prescription_drug_classes=payload.prescription_drug_classes,
+        billing_trigger=billing_trigger or BillingTrigger.on_completion,
+        insurance_covered=payload.insurance_covered,
+        icon=payload.icon,
+        required_training_module_codes=payload.required_training_module_codes,
+        required_certificate_codes=payload.required_certificate_codes,
+        required_specialty_tags=payload.required_specialty_tags,
+        requires_admin_skill_approval=payload.requires_admin_skill_approval,
+        risk_level=risk_level or ServiceRiskLevel.LOW,
+        lower_tier_override_allowed=payload.lower_tier_override_allowed,
+        required_assessment_codes=payload.required_assessment_codes,
+        minimum_pass_score=payload.minimum_pass_score,
+        gate=gate or QualificationGate.credential_only,
+        practical_checklist_items=payload.practical_checklist_items,
+        allowed_provider_types=_validate_provider_types(payload.allowed_provider_types),
+        is_active=True,
+        version=1,
+    )
+    db.add(svc)
+    await db.commit()
+    await db.refresh(svc)
+    return _serialize_service(svc)
+
+
+@router.put("/services/{service_id}")
+async def update_service(
+    service_id: UUID,
+    payload: ServiceUpdateRequest,
+    current: CurrentUser = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    res = await db.execute(select(ServiceCatalogue).where(ServiceCatalogue.id == service_id))
+    svc = res.scalar_one_or_none()
+    if not svc:
+        raise HTTPException(status_code=404, detail="Service not found")
+
+    new_code = payload.service_code.strip().lower()
+    if new_code != svc.service_code:
+        dupe = await db.execute(
+            select(ServiceCatalogue).where(ServiceCatalogue.service_code == new_code, ServiceCatalogue.id != service_id)
+        )
+        if dupe.scalar_one_or_none():
+            raise HTTPException(status_code=409, detail=f"Service code '{new_code}' already exists")
+
+    category = _validate_enum_field(payload.category, ServiceCategory, "category")
+    min_tier = _validate_enum_field(payload.min_tier, WorkerTier, "min_tier")
+    billing_trigger = _validate_enum_field(payload.billing_trigger, BillingTrigger, "billing_trigger")
+    risk_level = _validate_enum_field(payload.risk_level, ServiceRiskLevel, "risk_level")
+    gate = _validate_enum_field(payload.gate, QualificationGate, "gate")
+
+    svc.service_code = new_code
+    svc.name = payload.name.strip()
+    svc.description = payload.description
+    svc.category = category or svc.category
+    svc.min_tier = min_tier or svc.min_tier
+    svc.duration_minutes = payload.duration_minutes
+    svc.base_price = Decimal(str(payload.base_price))
+    svc.max_price = Decimal(str(payload.max_price)) if payload.max_price is not None else None
+    svc.commission_pct = Decimal(str(payload.commission_pct))
+    svc.urgent_surge_pct = payload.urgent_surge_pct
+    svc.requires_prescription = payload.requires_prescription
+    svc.prescription_drug_classes = payload.prescription_drug_classes
+    svc.billing_trigger = billing_trigger or svc.billing_trigger
+    svc.insurance_covered = payload.insurance_covered
+    svc.icon = payload.icon
+    svc.required_training_module_codes = payload.required_training_module_codes
+    svc.required_certificate_codes = payload.required_certificate_codes
+    svc.required_specialty_tags = payload.required_specialty_tags
+    svc.requires_admin_skill_approval = payload.requires_admin_skill_approval
+    svc.risk_level = risk_level or svc.risk_level
+    svc.lower_tier_override_allowed = payload.lower_tier_override_allowed
+    svc.required_assessment_codes = payload.required_assessment_codes
+    svc.minimum_pass_score = payload.minimum_pass_score
+    svc.gate = gate or svc.gate
+    svc.practical_checklist_items = payload.practical_checklist_items
+    svc.allowed_provider_types = _validate_provider_types(payload.allowed_provider_types)
+    svc.version = (svc.version or 1) + 1
+
+    await db.commit()
+    await db.refresh(svc)
+    return _serialize_service(svc)
+
+
+@router.patch("/services/{service_id}/toggle")
+async def toggle_service(
+    service_id: UUID,
+    current: CurrentUser = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    res = await db.execute(select(ServiceCatalogue).where(ServiceCatalogue.id == service_id))
+    svc = res.scalar_one_or_none()
+    if not svc:
+        raise HTTPException(status_code=404, detail="Service not found")
+    if svc.is_deleted:
+        raise HTTPException(status_code=409, detail="This service has been deleted and can't be toggled")
+    svc.is_active = not svc.is_active
+    await db.commit()
+    return {"id": str(svc.id), "is_active": svc.is_active}
+
+
+@router.delete("/services/{service_id}")
+async def delete_service(
+    service_id: UUID,
+    current: CurrentUser = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Soft-delete only — Booking, WorkerServiceQualification, PracticalSignOff,
+    WorkerServicePreference, and CarePackage.primary_service_id/included_service_ids
+    all reference service_catalogue rows, so a real DELETE would break history.
+    Blocked while any worker still holds an active/pending qualification for
+    this service — resolve those (or just deactivate the service to stop new
+    bookings) before deleting."""
+    res = await db.execute(select(ServiceCatalogue).where(ServiceCatalogue.id == service_id))
+    svc = res.scalar_one_or_none()
+    if not svc:
+        raise HTTPException(status_code=404, detail="Service not found")
+    if svc.is_deleted:
+        raise HTTPException(status_code=409, detail="Service already deleted")
+
+    open_qual_res = await db.execute(
+        select(func.count(WorkerServiceQualification.id)).where(
+            WorkerServiceQualification.service_id == service_id,
+            WorkerServiceQualification.qualification_status == WorkerQualificationStatus.APPROVED,
+        )
+    )
+    open_qual = open_qual_res.scalar_one()
+    if open_qual > 0:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Can't delete — {open_qual} worker(s) currently hold an approved "
+                "qualification for this service. Deactivate it instead to stop new "
+                "bookings without breaking their qualification history."
+            ),
+        )
+
+    svc.is_deleted = True
+    svc.is_active = False
+    svc.deleted_at = datetime.now(timezone.utc)
+    svc.deleted_by = current.id
+    await db.commit()
+    return {"id": str(svc.id), "is_deleted": True}
+
+
+# ============================================================================
+# PATCH 6 — Worker Reference (character/employer reference) endpoints
+#
+# WorkerReference model existed since Phase 1 with no API — mainly used for
+# Caregiver / Mother & Baby Caregiver onboarding (no degree, so references
+# carry more verification weight), but not restricted to those types.
+#   GET    /api/admin/workers/{worker_id}/references        list
+#   POST   /api/admin/workers/{worker_id}/references         create
+#   PATCH  /api/admin/references/{reference_id}/verify        verify/reject
+#   DELETE /api/admin/references/{reference_id}                remove
+# The worker-facing create (a worker submitting their own references during
+# onboarding) lives in workers.py, not here — this file is admin-only.
+# ============================================================================
+class WorkerReferenceCreateRequest(BaseModel):
+    reference_name: str
+    relationship_to_worker: Optional[str] = None
+    phone: Optional[str] = None
+    previous_employer_name: Optional[str] = None
+    notes: Optional[str] = None
+
+
+class WorkerReferenceVerifyRequest(BaseModel):
+    verification_status: str  # verified | could_not_reach | negative
+    notes: Optional[str] = None
+
+
+def _serialize_reference(ref: WorkerReference) -> dict:
+    return {
+        "id": str(ref.id),
+        "worker_id": str(ref.worker_id),
+        "reference_name": ref.reference_name,
+        "relationship_to_worker": ref.relationship_to_worker,
+        "phone": ref.phone,
+        "previous_employer_name": ref.previous_employer_name,
+        "verification_status": ref.verification_status,
+        "verified_by": str(ref.verified_by) if ref.verified_by else None,
+        "verified_at": ref.verified_at.isoformat() if ref.verified_at else None,
+        "notes": ref.notes,
+        "created_at": ref.created_at.isoformat() if ref.created_at else None,
+    }
+
+
+@router.get("/workers/{worker_id}/references")
+async def list_worker_references(
+    worker_id: UUID,
+    current: CurrentUser = Depends(require_reviewer),
+    db: AsyncSession = Depends(get_db),
+):
+    res = await db.execute(
+        select(WorkerReference).where(WorkerReference.worker_id == worker_id).order_by(WorkerReference.created_at.desc())
+    )
+    return [_serialize_reference(r) for r in res.scalars().all()]
+
+
+@router.post("/workers/{worker_id}/references", status_code=201)
+async def create_worker_reference(
+    worker_id: UUID,
+    payload: WorkerReferenceCreateRequest,
+    current: CurrentUser = Depends(require_reviewer),
+    db: AsyncSession = Depends(get_db),
+):
+    """Admin/reviewer adding a reference on the worker's behalf (e.g. from a
+    phone-collected reference sheet). A worker self-service equivalent, if
+    needed, belongs in workers.py."""
+    wp_res = await db.execute(select(WorkerProfile).where(WorkerProfile.id == worker_id))
+    if not wp_res.scalar_one_or_none():
+        raise HTTPException(status_code=404, detail="Worker not found")
+
+    ref = WorkerReference(
+        worker_id=worker_id,
+        reference_name=payload.reference_name.strip(),
+        relationship_to_worker=payload.relationship_to_worker,
+        phone=payload.phone,
+        previous_employer_name=payload.previous_employer_name,
+        notes=payload.notes,
+        verification_status="pending",
+    )
+    db.add(ref)
+    await db.commit()
+    await db.refresh(ref)
+    return _serialize_reference(ref)
+
+
+@router.patch("/references/{reference_id}/verify")
+async def verify_worker_reference(
+    reference_id: UUID,
+    payload: WorkerReferenceVerifyRequest,
+    current: CurrentUser = Depends(require_reviewer),
+    db: AsyncSession = Depends(get_db),
+):
+    valid_statuses = {"verified", "could_not_reach", "negative", "pending"}
+    if payload.verification_status not in valid_statuses:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Invalid verification_status. Must be one of: {sorted(valid_statuses)}",
+        )
+    res = await db.execute(select(WorkerReference).where(WorkerReference.id == reference_id))
+    ref = res.scalar_one_or_none()
+    if not ref:
+        raise HTTPException(status_code=404, detail="Reference not found")
+
+    ref.verification_status = payload.verification_status
+    ref.verified_by = current.id
+    ref.verified_at = datetime.now(timezone.utc)
+    if payload.notes is not None:
+        ref.notes = payload.notes
+    await db.commit()
+    return _serialize_reference(ref)
+
+
+@router.delete("/references/{reference_id}")
+async def delete_worker_reference(
+    reference_id: UUID,
+    current: CurrentUser = Depends(require_reviewer),
+    db: AsyncSession = Depends(get_db),
+):
+    res = await db.execute(select(WorkerReference).where(WorkerReference.id == reference_id))
+    ref = res.scalar_one_or_none()
+    if not ref:
+        raise HTTPException(status_code=404, detail="Reference not found")
+    await db.execute(delete(WorkerReference).where(WorkerReference.id == reference_id))
+    await db.commit()
+    return {"id": str(reference_id), "deleted": True}
 
 
 # ============================================================================
