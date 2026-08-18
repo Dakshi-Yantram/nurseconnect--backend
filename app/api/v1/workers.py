@@ -16,6 +16,7 @@ from app.core.deps import (
     require_roles,
 )
 from app.integrations import cloudinary_client
+from app.integrations.providers import ExternalProviderError
 from app.models.enums import (
     UserRole,
     WorkerAvailability,
@@ -53,37 +54,22 @@ from app.services.qualification import (
 router = APIRouter(prefix="/workers", tags=["workers"])
 
 from app.models.enums import WorkerType
-
-# Required documents differ by worker type. Nurses are clinically qualified;
-# caregivers are non-clinical helpers, so no nursing license is demanded of them.
-REQUIRED_DOCUMENTS_BY_TYPE = {
-    WorkerType.nurse: {"aadhaar", "nursing_license", "degree_certificate", "police_verification"},
-    WorkerType.caregiver: {"aadhaar", "police_verification"},
-}
-# Optional / supporting documents (uploaded to strengthen the profile / unlock
-# more services), never block submission.
-OPTIONAL_DOCUMENTS_BY_TYPE = {
-    WorkerType.nurse: {"experience_certificate", "specialization_certificate"},
-    WorkerType.caregiver: {"caregiver_training_certificate", "degree_certificate", "experience_certificate"},
-}
-# Human-readable labels for the app.
-DOCUMENT_LABELS = {
-    "aadhaar": "Aadhaar Card",
-    "nursing_license": "Nursing Registration / License",
-    "degree_certificate": "Degree / Education Certificate",
-    "police_verification": "Police Verification",
-    "experience_certificate": "Experience Certificate",
-    "specialization_certificate": "Specialization Certificate",
-    "caregiver_training_certificate": "Caregiver Training Certificate",
-}
+from app.core.provider_types import (
+    DOCUMENT_LABELS,
+    LICENSED_PROVIDER_TYPES,
+    OPTIONAL_DOCUMENTS_BY_PROVIDER_TYPE as OPTIONAL_DOCUMENTS_BY_TYPE,
+    REQUIRED_DOCUMENTS_BY_PROVIDER_TYPE as REQUIRED_DOCUMENTS_BY_TYPE,
+    optional_docs as _optional_docs_for_type,
+    required_docs as _required_docs_for_type,
+)
 
 
 def _required_docs(profile) -> set:
-    return REQUIRED_DOCUMENTS_BY_TYPE.get(getattr(profile, "worker_type", WorkerType.nurse), REQUIRED_DOCUMENTS_BY_TYPE[WorkerType.nurse])
+    return _required_docs_for_type(getattr(profile, "worker_type", WorkerType.nurse))
 
 
 def _optional_docs(profile) -> set:
-    return OPTIONAL_DOCUMENTS_BY_TYPE.get(getattr(profile, "worker_type", WorkerType.nurse), set())
+    return _optional_docs_for_type(getattr(profile, "worker_type", WorkerType.nurse))
 
 
 def _all_allowed_docs(profile) -> set:
@@ -92,8 +78,16 @@ def _all_allowed_docs(profile) -> set:
 
 def _doc_catalogue(profile) -> list:
     req, opt = _required_docs(profile), _optional_docs(profile)
-    out = [{"type": t, "label": DOCUMENT_LABELS.get(t, t), "required": True} for t in sorted(req)]
-    out += [{"type": t, "label": DOCUMENT_LABELS.get(t, t), "required": False} for t in sorted(opt)]
+    # Keep both keys for app compatibility: older mobile builds read `type`,
+    # newer screens read `document_type`.
+    out = [
+        {"type": t, "document_type": t, "label": DOCUMENT_LABELS.get(t, t), "required": True}
+        for t in sorted(req)
+    ]
+    out += [
+        {"type": t, "document_type": t, "label": DOCUMENT_LABELS.get(t, t), "required": False}
+        for t in sorted(opt)
+    ]
     return out
 
 
@@ -124,15 +118,26 @@ async def _onboarding_snapshot(
     profile_values = {
         "full_name": user.full_name,
         "date_of_birth": profile.date_of_birth,
-        "registration_no": profile.registration_no,
-        "registration_authority": profile.registration_authority,
-        "registration_valid_until": profile.registration_valid_until,
         "base_city": profile.base_city,
     }
+    worker_type = getattr(profile, "worker_type", WorkerType.nurse)
+    # Registration/license fields only apply to licensed provider types
+    # (Nurse, Doctor, Dentist, Physiotherapist). Caregiver and Mother & Baby
+    # Caregiver never require a degree/registration, per spec — previously
+    # this block required registration_no for every worker type, which
+    # silently blocked caregivers from ever completing onboarding.
+    if worker_type in LICENSED_PROVIDER_TYPES:
+        profile_values["registration_no"] = profile.registration_no
+        profile_values["registration_authority"] = profile.registration_authority
+        profile_values["registration_valid_until"] = profile.registration_valid_until
     for field, value in profile_values.items():
         if value is None or (isinstance(value, str) and not value.strip()):
             missing_profile_fields.append(field)
-    if profile.registration_valid_until and profile.registration_valid_until < date.today():
+    if (
+        worker_type in LICENSED_PROVIDER_TYPES
+        and profile.registration_valid_until
+        and profile.registration_valid_until < date.today()
+    ):
         missing_profile_fields.append("registration_valid_until_not_expired")
 
     missing_documents = sorted(_required_docs(profile) - uploaded_types)
@@ -141,7 +146,8 @@ async def _onboarding_snapshot(
     )
     return {
         "onboarding_status": profile.onboarding_status.value,
-        "worker_type": getattr(profile, "worker_type", WorkerType.nurse).value,
+        "worker_type": worker_type.value,
+        "requires_license": worker_type in LICENSED_PROVIDER_TYPES,
         "background_check_status": profile.background_check_status,
         "documents": _doc_catalogue(profile),
         "missing_profile_fields": missing_profile_fields,
@@ -442,11 +448,16 @@ async def upload_document_file(
             status_code=400,
             detail=f"Unsupported document type. Allowed: {sorted(_all_allowed_docs(profile))}",
         )
-    upload = await cloudinary_client.upload_base64(
-        payload.data_base64,
-        folder=f"nurseconnect/workers/{profile.id}",
-        resource_type="auto",
-    )
+    if not payload.data_base64.strip():
+        raise HTTPException(status_code=400, detail="No document file was attached")
+    try:
+        upload = await cloudinary_client.upload_base64(
+            payload.data_base64,
+            folder=f"nurseconnect/workers/{profile.id}",
+            resource_type="auto",
+        )
+    except ExternalProviderError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
     doc = WorkerDocument(
         worker_id=profile.id,
         document_type=payload.document_type,
@@ -571,6 +582,48 @@ async def my_earnings(profile: WorkerProfile = Depends(get_worker_profile), db: 
     }
 
 
+@router.get("/me/badges")
+async def my_badges(
+    profile: WorkerProfile = Depends(get_worker_profile),
+    db: AsyncSession = Depends(get_db),
+):
+    """Skill badges for the signed-in worker.
+
+    Badges are created elsewhere (tier badge on approval, assessment badge on
+    a passed assessment). This endpoint was missing entirely, so the nurse
+    dashboard's /workers/me/badges fetch always 404'd and showed "No badges
+    yet" — even for a worker who had genuinely passed an assessment.
+
+    Two guarantees enforced here:
+      * Everyone has at least their current-tier badge. If a worker never got
+        one (e.g. created before the tier-badge award existed, or self-signup
+        that skipped admin approval) it is granted on read, so the floor is
+        always Tier 1.
+      * Higher tiers show as higher badges automatically, because the tier
+        badge label is derived from WorkerProfile.tier, which admin raises as
+        the worker clears more assessments.
+    """
+    from app.models.models import WorkerBadge
+    from app.services.badges import award_tier_badge, serialize_badge
+
+    res = await db.execute(
+        select(WorkerBadge)
+        .where(WorkerBadge.worker_id == profile.id, WorkerBadge.revoked_at.is_(None))
+        .order_by(WorkerBadge.awarded_at.desc())
+    )
+    badges = list(res.scalars().all())
+
+    # Self-heal the tier-badge floor so every worker has a minimum Tier 1 badge.
+    has_tier_badge = any(b.source == "tier" for b in badges)
+    if not has_tier_badge:
+        awarded = await award_tier_badge(db, profile)
+        if awarded is not None:
+            await db.commit()
+            badges.insert(0, awarded)
+
+    return [serialize_badge(b) for b in badges]
+
+
 # ============================================================================
 # Patch 2 — Service eligibility + preference management
 # ============================================================================
@@ -609,14 +662,26 @@ async def my_service_eligibility(
     profile: WorkerProfile = Depends(get_worker_profile),
     db: AsyncSession = Depends(get_db),
 ):
-    """List every active care package (admin-managed, no standalone
-    services) with the worker's current qualification + preference status
-    and whether they may opt in. No price is ever included here — nurses
-    see packages purely as opt-in offerings gated by training/assessments."""
+    """List every active care package AND standalone service (admin-managed)
+    with the worker's current qualification + preference status and whether
+    they may opt in. No price is ever included here — nurses see offerings
+    purely as opt-in items gated by training/assessments.
+
+    BUGFIX: this used to only return CarePackage rows, so standalone
+    micro-visit services (Wound Dressing, Injection, Vitals Monitoring,
+    etc.) never appeared here and workers had no way to opt in to them —
+    even though the PUT /me/service-preferences endpoint already fully
+    supported target_type="service". Booking dispatch (new-requests) filters
+    on opt-in for both services and packages, so without this fix standalone
+    services could never be surfaced to any worker.
+    """
     items: List[ServiceEligibilityItem] = []
 
     pres = await db.execute(select(CarePackage).where(CarePackage.is_active.is_(True)))
     packages = list(pres.scalars().all())
+
+    sres = await db.execute(select(ServiceCatalogue).where(ServiceCatalogue.is_active.is_(True)))
+    services = list(sres.scalars().all())
 
     # Pre-fetch qualifications & preferences for this worker (single-pass).
     qres = await db.execute(
@@ -624,22 +689,61 @@ async def my_service_eligibility(
             WorkerServiceQualification.worker_id == profile.id
         )
     )
-    qmap_pkg = {q.package_id: q for q in qres.scalars().all() if q.package_id is not None}
+    all_quals = list(qres.scalars().all())
+    qmap_pkg = {q.package_id: q for q in all_quals if q.package_id is not None}
+    qmap_svc = {q.service_id: q for q in all_quals if q.service_id is not None}
 
     prres = await db.execute(
         select(WorkerServicePreference).where(
             WorkerServicePreference.worker_id == profile.id
         )
     )
-    pmap_pkg = {p.package_id: p for p in prres.scalars().all() if p.package_id is not None}
+    all_prefs = list(prres.scalars().all())
+    pmap_pkg = {p.package_id: p for p in all_prefs if p.package_id is not None}
+    pmap_svc = {p.service_id: p for p in all_prefs if p.service_id is not None}
+
+    for svc in services:
+        q = qmap_svc.get(svc.id)
+        p = pmap_svc.get(svc.id)
+        q_status = q.qualification_status.value if q else WorkerQualificationStatus.NOT_QUALIFIED.value
+        q_source = q.qualification_source.value if (q and q.qualification_source) else None
+        # An absent preference row means "not yet chosen", and dispatch treats
+        # that as opted-in (see is_worker_opted_in_for_service). Report the
+        # same default here — otherwise this screen tells a nurse they are
+        # opted out of work they are in fact being offered.
+        p_status = p.preference_status.value if p else WorkerPreferenceStatus.OPTED_IN.value
+        willing = bool(p.willing_to_accept) if p else True
+
+        qualified, locked_reason = await is_worker_qualified_for_service(profile, svc, db)
+
+        items.append(ServiceEligibilityItem(
+            target_type="service",
+            id=svc.id,
+            code=svc.service_code,
+            name=svc.name,
+            category=svc.category.value if svc.category else None,
+            min_tier=svc.min_tier.value if svc.min_tier else None,
+            risk_level=svc.risk_level.value if getattr(svc, "risk_level", None) else None,
+            qualification_status=q_status,
+            qualification_source=q_source,
+            preference_status=p_status,
+            willing_to_accept=willing,
+            can_opt_in=qualified,
+            locked_reason=None if qualified else locked_reason,
+            requires_admin_skill_approval=bool(getattr(svc, "requires_admin_skill_approval", False)),
+        ))
 
     for pkg in packages:
         q = qmap_pkg.get(pkg.id)
         p = pmap_pkg.get(pkg.id)
         q_status = q.qualification_status.value if q else WorkerQualificationStatus.NOT_QUALIFIED.value
         q_source = q.qualification_source.value if (q and q.qualification_source) else None
-        p_status = p.preference_status.value if p else WorkerPreferenceStatus.OPTED_OUT.value
-        willing = bool(p.willing_to_accept) if p else False
+        # An absent preference row means "not yet chosen", and dispatch treats
+        # that as opted-in (see is_worker_opted_in_for_service). Report the
+        # same default here — otherwise this screen tells a nurse they are
+        # opted out of work they are in fact being offered.
+        p_status = p.preference_status.value if p else WorkerPreferenceStatus.OPTED_IN.value
+        willing = bool(p.willing_to_accept) if p else True
 
         qualified, locked_reason = await is_worker_qualified_for_service(profile, pkg, db)
 
@@ -873,6 +977,7 @@ async def request_service_qualification(
 
 
 class ServiceAreaRequest(BaseModel):
+    home_address: Optional[str] = None
     base_city: Optional[str] = None
     latitude: Optional[float] = None
     longitude: Optional[float] = None
@@ -885,6 +990,8 @@ async def set_service_area(
     profile: WorkerProfile = Depends(get_worker_profile),
     db: AsyncSession = Depends(get_db),
 ):
+    if payload.home_address is not None:
+        profile.home_address = payload.home_address.strip() or None
     if payload.base_city is not None:
         profile.base_city = payload.base_city.strip() or None
     if payload.latitude is not None and payload.longitude is not None:
@@ -894,6 +1001,7 @@ async def set_service_area(
         profile.service_radius_km = max(1, min(int(payload.service_radius_km), 100))
     await db.commit()
     return {
+        "home_address": profile.home_address,
         "base_city": profile.base_city,
         "home_latitude": float(profile.home_latitude) if profile.home_latitude is not None else None,
         "home_longitude": float(profile.home_longitude) if profile.home_longitude is not None else None,

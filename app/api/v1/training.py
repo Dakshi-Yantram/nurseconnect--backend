@@ -77,6 +77,9 @@ class TrainingModuleDraft(BaseModel):
     assessment: Optional[List[Dict[str, Any]]] = None
     pass_percent: int = 70
     is_mandatory: bool = False
+    # Provider Type system — which WorkerType values this module is even
+    # shown to. None/empty = visible to every provider type.
+    allowed_provider_types: Optional[List[str]] = None
 
 
 class TrainingModuleUpdate(BaseModel):
@@ -90,6 +93,7 @@ class TrainingModuleUpdate(BaseModel):
     assessment: Optional[List[Dict[str, Any]]] = None
     pass_percent: Optional[int] = None
     is_mandatory: Optional[bool] = None
+    allowed_provider_types: Optional[List[str]] = None
 
 
 class AssessmentDraft(BaseModel):
