@@ -257,6 +257,14 @@ async def is_worker_qualified_for_service(
     if worker.onboarding_status != WorkerOnboardingStatus.approved:
         return False, "WORKER_NOT_VERIFIED"
 
+    # Provider Type check — the first gate: an unlisted provider type is
+    # never eligible for this service/package, full stop, regardless of
+    # training/assessment/tier. NULL/empty allowed_provider_types = no
+    # restriction (back-compat with every existing row).
+    allowed_types = list(getattr(service, "allowed_provider_types", None) or [])
+    if allowed_types and worker.worker_type.value not in allowed_types:
+        return False, "PROVIDER_TYPE_NOT_ALLOWED"
+
     qual = await _get_qualification_row(db, worker.id, service)
 
     # Tier check (unless explicit override row exists)

@@ -31,6 +31,7 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 from app.core.database import Base
 from app.models.enums import (
     WorkerType,
+    ProviderStatusChangeReason,
     AssessmentQuestionType,
     BillingTrigger,
     BookingStatus,
@@ -229,6 +230,15 @@ class WorkerProfile(Base):
     registration_no: Mapped[Optional[str]] = mapped_column(String(100), index=True)
     registration_authority: Mapped[Optional[str]] = mapped_column(String(255))
     registration_valid_until: Mapped[Optional[date]] = mapped_column(Date)
+    # The degree/qualification name (e.g. "BDS", "MDS", "GNM", "BSc Nursing",
+    # "BPT", "MPT"). Deliberately NOT used to derive worker_type — worker_type
+    # is set explicitly at registration per the "Provider Type must NOT be
+    # inferred from degree" rule. Caregivers/Mother & Baby Caregivers leave
+    # this null (no degree required).
+    qualification_name: Mapped[Optional[str]] = mapped_column(String(255))
+    # Doctor/Dentist/Physiotherapist background/police verification reuses
+    # background_check_status below; caregiver-specific reference checks live
+    # in WorkerServiceReference (new table, see below).
     worker_type: Mapped[WorkerType] = mapped_column(
         SQLEnum(WorkerType, name="worker_type_enum"),
         default=WorkerType.nurse, server_default="nurse", nullable=False, index=True,
@@ -296,6 +306,48 @@ class WorkerKitItem(Base):
     is_present: Mapped[bool] = mapped_column(Boolean, default=False)
     last_checked_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
     notes: Mapped[Optional[str]] = mapped_column(Text)
+
+
+class WorkerReference(Base):
+    """Previous-employer / character references — mainly used for Caregiver
+    and Mother & Baby Caregiver onboarding (no degree, so references carry
+    more verification weight), but not restricted to those types."""
+    __tablename__ = "worker_references"
+    id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), primary_key=True, default=_uuid)
+    worker_id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), ForeignKey("worker_profiles.id", ondelete="CASCADE"), index=True, nullable=False)
+    reference_name: Mapped[str] = mapped_column(String(255), nullable=False)
+    relationship_to_worker: Mapped[Optional[str]] = mapped_column(String(100))  # previous employer, family, etc.
+    phone: Mapped[Optional[str]] = mapped_column(String(20))
+    previous_employer_name: Mapped[Optional[str]] = mapped_column(String(255))
+    verification_status: Mapped[str] = mapped_column(String(50), default="pending")  # pending/verified/could_not_reach/negative
+    verified_by: Mapped[Optional[UUID]] = mapped_column(PG_UUID(as_uuid=True), ForeignKey("users.id"))
+    verified_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    notes: Mapped[Optional[str]] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now, server_default=func.now())
+
+
+class ProviderStatusHistory(Base):
+    """Append-only audit trail of every WorkerProfile.onboarding_status (and
+    related qualification/availability) transition. Nothing reads this to
+    make eligibility decisions — it's audit/observability only, written by
+    the same services that already change status (worker_approval.py,
+    qualification.py) so admin can see the full history per provider."""
+    __tablename__ = "provider_status_history"
+    id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), primary_key=True, default=_uuid)
+    worker_id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), ForeignKey("worker_profiles.id", ondelete="CASCADE"), index=True, nullable=False)
+    from_status: Mapped[Optional[str]] = mapped_column(String(50))
+    to_status: Mapped[str] = mapped_column(String(50), nullable=False)
+    reason: Mapped[Optional[ProviderStatusChangeReason]] = mapped_column(
+        SQLEnum(ProviderStatusChangeReason, name="provider_status_change_reason")
+    )
+    related_service_id: Mapped[Optional[UUID]] = mapped_column(PG_UUID(as_uuid=True), ForeignKey("service_catalogue.id"))
+    related_package_id: Mapped[Optional[UUID]] = mapped_column(PG_UUID(as_uuid=True), ForeignKey("care_packages.id"))
+    changed_by: Mapped[Optional[UUID]] = mapped_column(PG_UUID(as_uuid=True), ForeignKey("users.id"))  # null = system
+    notes: Mapped[Optional[str]] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now, server_default=func.now(), index=True)
+    __table_args__ = (
+        Index("ix_provider_status_history_worker_created", "worker_id", "created_at"),
+    )
 
 
 # ============================================================================
@@ -436,6 +488,13 @@ class ServiceCatalogue(Base):
         nullable=False,
     )
     practical_checklist_items: Mapped[Optional[list]] = mapped_column(ARRAY(String))
+    # Provider Type gate — the "Provider Type Allowed" leg of booking
+    # eligibility. NULL/empty = no restriction (back-compat: every existing
+    # service row defaults to unrestricted, so nothing that qualifies today
+    # stops qualifying). Once set, only workers whose WorkerProfile.worker_type
+    # is in this list can ever hold an APPROVED WorkerServiceQualification for
+    # this service — enforced in app/services/qualification.py.
+    allowed_provider_types: Mapped[Optional[list]] = mapped_column(ARRAY(String))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now, server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now, onupdate=_now, server_default=func.now())
 
@@ -502,6 +561,13 @@ class CarePackage(Base):
         nullable=False,
     )
     practical_checklist_items: Mapped[Optional[list]] = mapped_column(ARRAY(String))
+    # Provider Type gate — same semantics as ServiceCatalogue.allowed_provider_types.
+    # e.g. Baby Massage & Bath package: ["mother_baby_caregiver"].
+    # Elder Companion package: ["caregiver"] by default; admin can add
+    # "nurse" explicitly per your "Nurse should only be allowed if Admin
+    # explicitly enables Nurse" rule — that's exactly what adding "nurse"
+    # to this array does, nothing special-cased.
+    allowed_provider_types: Mapped[Optional[list]] = mapped_column(ARRAY(String))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now, server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now, onupdate=_now, server_default=func.now())
 

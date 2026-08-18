@@ -35,9 +35,17 @@ class WorkerTier(str, Enum):
 class WorkerOnboardingStatus(str, Enum):
     documents_pending = "documents_pending"
     pending_review = "pending_review"
+    # New — inserted between pending_review and approved so existing rows
+    # (which only ever held documents_pending/pending_review/approved/
+    # rejected/suspended) keep working unchanged; nothing back-fills these
+    # two automatically, they're only set going forward by the training/
+    # assessment services once a provider type requires them.
+    training_pending = "training_pending"
+    assessment_pending = "assessment_pending"
     approved = "approved"
     rejected = "rejected"
     suspended = "suspended"
+    expired = "expired"
 
 
 class WorkerAvailability(str, Enum):
@@ -431,8 +439,43 @@ class AssessmentQuestionType(str, Enum):
     text = "text"
 
 class WorkerType(str, Enum):
-    """A professionally-trained nurse vs. a non-clinical caregiver/helper.
-    Drives which onboarding documents are required and which services they can
-    be qualified for."""
+    """The Provider Type. This is the fundamental field that drives dynamic
+    onboarding, which documents/licenses are required, which services a
+    worker can be qualified for, and which packages they're eligible for.
+
+    IMPORTANT: adding a value here is additive only (existing 'nurse' and
+    'caregiver' rows are untouched). Postgres requires each new value to be
+    registered on the live enum type before it can be written — see
+    add_provider_type_schema.py, which does this with
+    `ALTER TYPE ... ADD VALUE IF NOT EXISTS` (safe to re-run, no downtime).
+    """
     nurse = "nurse"
     caregiver = "caregiver"
+    doctor = "doctor"
+    dentist = "dentist"
+    physiotherapist = "physiotherapist"
+    mother_baby_caregiver = "mother_baby_caregiver"
+
+
+class ProviderStatusChangeReason(str, Enum):
+    """Why a WorkerProfile.onboarding_status (or availability opt-in) changed.
+    Written to ProviderStatusHistory for audit purposes."""
+    applied = "applied"
+    documents_submitted = "documents_submitted"
+    document_rejected = "document_rejected"
+    training_completed = "training_completed"
+    training_required = "training_required"
+    assessment_passed = "assessment_passed"
+    assessment_failed = "assessment_failed"
+    practical_signoff_passed = "practical_signoff_passed"
+    practical_signoff_failed = "practical_signoff_failed"
+    background_check_cleared = "background_check_cleared"
+    background_check_failed = "background_check_failed"
+    admin_approved = "admin_approved"
+    admin_rejected = "admin_rejected"
+    admin_suspended = "admin_suspended"
+    admin_reinstated = "admin_reinstated"
+    license_expired = "license_expired"
+    qualification_expired = "qualification_expired"
+    opted_in = "opted_in"
+    opted_out = "opted_out"

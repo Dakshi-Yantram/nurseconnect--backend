@@ -80,7 +80,11 @@ class RegisterRequest(BaseModel):
     email: EmailStr
     password: str = Field(min_length=8, max_length=72)
     role: UserRole = UserRole.consumer
-    worker_type: Optional[WorkerType] = None  # 'nurse' or 'caregiver' when role=worker
+    # Provider Type when role=worker: nurse / caregiver / doctor / dentist /
+    # physiotherapist / mother_baby_caregiver. Required going forward for new
+    # worker registrations — the website/mobile "What type of care do you
+    # provide?" step sets this before any dynamic onboarding fields render.
+    worker_type: Optional[WorkerType] = None
 
 
 class RegisterResponse(BaseModel):
@@ -234,6 +238,7 @@ class WorkerProfileUpdate(BaseModel):
     registration_no: Optional[str] = None
     registration_authority: Optional[str] = None
     registration_valid_until: Optional[date] = None
+    qualification_name: Optional[str] = None
     base_city: Optional[str] = None
     service_radius_km: Optional[int] = None
     home_latitude: Optional[Decimal] = None
@@ -244,6 +249,7 @@ class WorkerProfileOut(ORMModel):
     id: UUID
     user_id: UUID
     tier: WorkerTier
+    worker_type: WorkerType
     gender: Optional[Gender] = None
     onboarding_status: WorkerOnboardingStatus
     availability: WorkerAvailability
@@ -255,6 +261,7 @@ class WorkerProfileOut(ORMModel):
     registration_no: Optional[str] = None
     registration_authority: Optional[str] = None
     registration_valid_until: Optional[date] = None
+    qualification_name: Optional[str] = None
     home_address: Optional[str] = None
     base_city: Optional[str] = None
     service_radius_km: int
