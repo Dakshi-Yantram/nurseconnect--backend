@@ -39,7 +39,8 @@ async def main():
     await conn.execute("""
         ALTER TABLE service_catalogue
         ADD COLUMN IF NOT EXISTS gate qualification_gate NOT NULL DEFAULT 'credential_only',
-        ADD COLUMN IF NOT EXISTS practical_checklist_items VARCHAR[];
+        ADD COLUMN IF NOT EXISTS practical_checklist_items VARCHAR[],
+        ADD COLUMN IF NOT EXISTS allowed_provider_types VARCHAR[];
     """)
     await conn.execute("""
         ALTER TABLE care_packages
