@@ -156,6 +156,9 @@ async def my_queue(
         entry = serialize_ticket(t)
         entry["nurse_name"] = row[1].full_name if row else None
         entry["nurse_email"] = row[1].email if row else None
+        # Added so the onboarding-review UI can show/filter by Provider Type
+        # instead of only the free-text `specialty` (first specialisation).
+        entry["worker_type"] = row[0].worker_type.value if row and row[0].worker_type else None
         entry["specialty"] = (row[0].specialisations[0] if row and row[0].specialisations else None)
         entry["experience_years"] = row[0].years_of_experience if row else None
         entry["city"] = row[0].base_city if row else None
