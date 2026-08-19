@@ -1,5 +1,5 @@
 """Booking lifecycle: create, accept, cancel, list, escalate."""
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import List, Optional
 from uuid import UUID, uuid4
@@ -28,6 +28,7 @@ from app.models.enums import (
     VisitStatus,
 )
 from app.models.models import (
+    AuditLog,
     Booking,
     CarePackage,
     CarePackageBooking,
@@ -36,24 +37,69 @@ from app.models.models import (
     Patient,
     ServiceCatalogue,
     SubsidyEligibility,
+    User,
     VisitRecord,
     WorkerProfile,
 )
 from app.schemas.schemas import (
+    AddressSnapshot,
+    BookingAddressUpdate,
     BookingCancelRequest,
     BookingCreate,
     BookingOut,
     EscalationCreateRequest,
+    SOSCreateRequest,
 )
 from app.services.clinical_engine import compute_sla_breach, get_escalation_metadata
-from app.services.common_services import audit, notify_parties, send_notification
-from app.websockets.manager import booking_topic, manager
+from app.services.common_services import audit, notify_admins, notify_parties, send_notification
+from app.websockets.manager import booking_topic, manager, user_topic
 
 router = APIRouter(prefix="/bookings", tags=["bookings"])
 
 
 def _gen_booking_ref() -> str:
     return f"NC{datetime.now().strftime('%y%m%d')}{uuid4().hex[:6].upper()}"
+
+
+async def _resolve_service_address(
+    db: AsyncSession,
+    profile: ConsumerProfile,
+    *,
+    address_id: Optional[UUID],
+    address: Optional[AddressSnapshot],
+    latitude: Optional[Decimal],
+    longitude: Optional[Decimal],
+) -> tuple[dict, Decimal, Decimal]:
+    """Resolve the patient service location into a booking-safe snapshot."""
+    from app.models.models import ConsumerAddress
+
+    resolved_snapshot = None
+    resolved_lat = latitude
+    resolved_lng = longitude
+    if address_id:
+        ares = await db.execute(
+            select(ConsumerAddress).where(
+                ConsumerAddress.id == address_id,
+                ConsumerAddress.consumer_id == profile.id,
+            )
+        )
+        addr = ares.scalar_one_or_none()
+        if not addr:
+            raise HTTPException(status_code=404, detail="Address not found")
+        resolved_snapshot = {
+            "line1": addr.line1, "line2": addr.line2, "city": addr.city,
+            "state": addr.state, "pincode": addr.pincode, "landmark": addr.landmark,
+            "recipient_name": addr.recipient_name, "recipient_phone": addr.recipient_phone,
+        }
+        resolved_lat = addr.latitude
+        resolved_lng = addr.longitude
+    elif address is not None:
+        resolved_snapshot = address.model_dump()
+
+    if resolved_snapshot is None or resolved_lat is None or resolved_lng is None:
+        raise HTTPException(status_code=400, detail="Provide address_id or address + latitude/longitude")
+
+    return resolved_snapshot, resolved_lat, resolved_lng
 
 
 @router.post("/", response_model=BookingOut)
@@ -71,32 +117,14 @@ async def create_booking(
     if not patient:
         raise HTTPException(status_code=404, detail="Patient not found")
 
-    # Resolve the service address: prefer a saved address_id, else inline fields.
-    from app.models.models import ConsumerAddress
-    resolved_snapshot = None
-    resolved_lat = payload.latitude
-    resolved_lng = payload.longitude
-    if payload.address_id:
-        ares = await db.execute(
-            select(ConsumerAddress).where(
-                ConsumerAddress.id == payload.address_id,
-                ConsumerAddress.consumer_id == profile.id,
-            )
-        )
-        addr = ares.scalar_one_or_none()
-        if not addr:
-            raise HTTPException(status_code=404, detail="Address not found")
-        resolved_snapshot = {
-            "line1": addr.line1, "line2": addr.line2, "city": addr.city,
-            "state": addr.state, "pincode": addr.pincode, "landmark": addr.landmark,
-            "recipient_name": addr.recipient_name, "recipient_phone": addr.recipient_phone,
-        }
-        resolved_lat = addr.latitude
-        resolved_lng = addr.longitude
-    elif payload.address is not None:
-        resolved_snapshot = payload.address.model_dump()
-    if resolved_snapshot is None or resolved_lat is None or resolved_lng is None:
-        raise HTTPException(status_code=400, detail="Provide address_id or address + latitude/longitude")
+    resolved_snapshot, resolved_lat, resolved_lng = await _resolve_service_address(
+        db,
+        profile,
+        address_id=payload.address_id,
+        address=payload.address,
+        latitude=payload.latitude,
+        longitude=payload.longitude,
+    )
 
     service: Optional[ServiceCatalogue] = None
     package: Optional[CarePackage] = None
@@ -116,7 +144,23 @@ async def create_booking(
         package = kres.scalar_one_or_none()
         if not package:
             raise HTTPException(status_code=404, detail="Care package not found")
+        # per_visit_price and package_price are both nullable — an admin can
+        # save a package without ever setting either. That used to silently
+        # fall through to a ₹0 booking, which shows up to the consumer as
+        # "amount not assigned" and can look like the booking button is
+        # broken. Reject it with a clear reason instead of charging nothing.
+        if not package.per_visit_price and not package.package_price:
+            raise HTTPException(
+                status_code=409,
+                detail="This care package doesn't have a price set yet. Please contact support.",
+            )
         base_amount = package.per_visit_price or package.package_price or Decimal("0")
+
+    if base_amount <= 0:
+        raise HTTPException(
+            status_code=409,
+            detail="This service doesn't have a price configured yet. Please contact support.",
+        )
 
     surge_amount = Decimal("0")
     if payload.is_urgent and service:
@@ -141,7 +185,13 @@ async def create_booking(
         booking_type=payload.booking_type,
         service_id=payload.service_id,
         package_id=payload.package_id,
-        worker_id=payload.preferred_worker_id,
+        # A booking is NEVER born assigned. `preferred_worker_id` used to be
+        # written straight into worker_id, which let any consumer hand-pick a
+        # worker and bypass the whole claim path: no accept step, no
+        # qualification/opt-in gate, no schedule-conflict check, and no consent
+        # from the worker. Assignment only ever happens through
+        # POST /bookings/{id}/accept (or an admin rematch).
+        worker_id=None,
         status=BookingStatus.pending_payment,
         scheduled_date=payload.scheduled_date,
         scheduled_start_time=payload.scheduled_start_time,
@@ -178,7 +228,53 @@ async def my_consumer_bookings(
     if status:
         conds.append(Booking.status == status)
     res = await db.execute(select(Booking).where(and_(*conds)).order_by(Booking.scheduled_date.desc(), Booking.scheduled_start_time.desc()))
-    return [BookingOut.model_validate(b) for b in res.scalars().all()]
+    items: list[Booking] = list(res.scalars().all())
+
+    # Enrich with patient_name / service_name / worker_name — mirrors the
+    # pattern in /worker (my_worker_bookings). Without this, the consumer
+    # bookings list/detail pages show a generic "Service" placeholder and a
+    # blank nurse field, since BookingOut only carries raw *_id foreign keys.
+    patient_cache: dict = {}
+    svc_cache: dict = {}
+    pkg_cache: dict = {}
+    worker_name_cache: dict = {}
+    out: list[BookingOut] = []
+    for b in items:
+        bm = BookingOut.model_validate(b)
+
+        if b.patient_id:
+            if b.patient_id not in patient_cache:
+                pres = await db.execute(select(Patient).where(Patient.id == b.patient_id))
+                patient_cache[b.patient_id] = pres.scalar_one_or_none()
+            patient = patient_cache[b.patient_id]
+            if patient:
+                bm.patient_name = patient.full_name
+
+        if b.service_id:
+            if b.service_id not in svc_cache:
+                sr = await db.execute(select(ServiceCatalogue).where(ServiceCatalogue.id == b.service_id))
+                svc_cache[b.service_id] = sr.scalar_one_or_none()
+            if svc_cache[b.service_id]:
+                bm.service_name = svc_cache[b.service_id].name
+        elif b.package_id:
+            if b.package_id not in pkg_cache:
+                pr = await db.execute(select(CarePackage).where(CarePackage.id == b.package_id))
+                pkg_cache[b.package_id] = pr.scalar_one_or_none()
+            if pkg_cache[b.package_id]:
+                bm.service_name = pkg_cache[b.package_id].name
+
+        if b.worker_id:
+            if b.worker_id not in worker_name_cache:
+                wr = await db.execute(
+                    select(User.full_name).join(WorkerProfile, WorkerProfile.user_id == User.id)
+                    .where(WorkerProfile.id == b.worker_id)
+                )
+                worker_name_cache[b.worker_id] = wr.scalar_one_or_none()
+            if worker_name_cache[b.worker_id]:
+                bm.worker_name = worker_name_cache[b.worker_id]
+
+        out.append(bm)
+    return out
 
 
 @router.get("/worker", response_model=List[BookingOut])
@@ -191,9 +287,46 @@ async def my_worker_bookings(
     if status:
         conds.append(Booking.status == status)
     res = await db.execute(select(Booking).where(and_(*conds)).order_by(Booking.scheduled_date.desc()))
-    return [BookingOut.model_validate(b) for b in res.scalars().all()]
+    items: list[Booking] = list(res.scalars().all())
+
+    # Enrich with patient_name / service_name — mirrors the logic in
+    # /worker/new-requests. Without this, "My Visits" shows blank names.
+    svc_cache: dict = {}
+    pkg_cache: dict = {}
+    patient_cache: dict = {}
+    out: list[BookingOut] = []
+    for b in items:
+        bm = BookingOut.model_validate(b)
+
+        if b.patient_id:
+            if b.patient_id not in patient_cache:
+                pres = await db.execute(select(Patient).where(Patient.id == b.patient_id))
+                patient_cache[b.patient_id] = pres.scalar_one_or_none()
+            patient = patient_cache[b.patient_id]
+            if patient:
+                bm.patient_name = patient.full_name
+
+        if b.service_id:
+            if b.service_id not in svc_cache:
+                sr = await db.execute(select(ServiceCatalogue).where(ServiceCatalogue.id == b.service_id))
+                svc_cache[b.service_id] = sr.scalar_one_or_none()
+            if svc_cache[b.service_id]:
+                bm.service_name = svc_cache[b.service_id].name
+        elif b.package_id:
+            if b.package_id not in pkg_cache:
+                pr = await db.execute(select(CarePackage).where(CarePackage.id == b.package_id))
+                pkg_cache[b.package_id] = pr.scalar_one_or_none()
+            if pkg_cache[b.package_id]:
+                bm.service_name = pkg_cache[b.package_id].name
+
+        out.append(bm)
+    return out
 
 
+# Backward-compatible alias for older frontend bundles that still call
+# /api/bookings/available. Keep it before /{booking_id}, otherwise FastAPI
+# treats "available" as a UUID path param and returns 422.
+@router.get("/available", response_model=List[BookingOut], include_in_schema=False)
 @router.get("/worker/new-requests", response_model=List[BookingOut])
 async def new_requests(profile: WorkerProfile = Depends(get_worker_profile), db: AsyncSession = Depends(get_db)):
     """Unassigned bookings the worker is qualified for, opted into, AND inside
@@ -215,7 +348,9 @@ async def new_requests(profile: WorkerProfile = Depends(get_worker_profile), db:
     res = await db.execute(
         select(Booking).where(
             Booking.worker_id.is_(None),
-            Booking.status.in_([BookingStatus.confirmed, BookingStatus.rematch_pending]),
+            # searching_nurse == Workflow 1 composite bookings post-Rx-approval,
+            # dispatchable the same way as a normal confirmed booking.
+            Booking.status.in_([BookingStatus.confirmed, BookingStatus.rematch_pending, BookingStatus.searching_nurse]),
         ).order_by(Booking.scheduled_date.asc()).limit(50)
     )
     items: list[Booking] = list(res.scalars().all())
@@ -329,6 +464,69 @@ async def new_requests(profile: WorkerProfile = Depends(get_worker_profile), db:
     return out
 
 
+@router.put("/{booking_id}/address", response_model=BookingOut)
+async def update_booking_address(
+    booking_id: UUID,
+    payload: BookingAddressUpdate,
+    profile: ConsumerProfile = Depends(get_consumer_profile),
+    db: AsyncSession = Depends(get_db),
+):
+    """Let a family correct the patient service location before confirmation."""
+    res = await db.execute(
+        select(Booking).where(Booking.id == booking_id, Booking.consumer_id == profile.id)
+    )
+    b = res.scalar_one_or_none()
+    if not b:
+        raise HTTPException(status_code=404, detail="Booking not found")
+
+    editable_statuses = {BookingStatus.draft, BookingStatus.pending_payment}
+    if b.status not in editable_statuses:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "success": False,
+                "code": "BOOKING_LOCATION_LOCKED",
+                "message": "Location can be changed only before the booking is confirmed.",
+            },
+        )
+
+    resolved_snapshot, resolved_lat, resolved_lng = await _resolve_service_address(
+        db,
+        profile,
+        address_id=payload.address_id,
+        address=payload.address,
+        latitude=payload.latitude,
+        longitude=payload.longitude,
+    )
+
+    old_snapshot = b.address_snapshot
+    old_lat = b.latitude
+    old_lng = b.longitude
+    b.address_snapshot = resolved_snapshot
+    b.latitude = resolved_lat
+    b.longitude = resolved_lng
+    await audit(
+        db,
+        profile.user_id,
+        "consumer",
+        "booking.address_update",
+        "booking",
+        b.id,
+        {
+            "old_address": old_snapshot,
+            "new_address": resolved_snapshot,
+            "old_latitude": str(old_lat) if old_lat is not None else None,
+            "old_longitude": str(old_lng) if old_lng is not None else None,
+            "new_latitude": str(resolved_lat),
+            "new_longitude": str(resolved_lng),
+        },
+    )
+    await db.commit()
+    await db.refresh(b)
+    await manager.broadcast(booking_topic(b.id), {"type": "booking.address_updated", "booking_id": str(b.id)})
+    return BookingOut.model_validate(b)
+
+
 @router.get("/{booking_id}", response_model=BookingOut)
 async def get_booking(booking_id: UUID, current: CurrentUser = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
     res = await db.execute(select(Booking).where(Booking.id == booking_id))
@@ -348,11 +546,108 @@ async def get_booking(booking_id: UUID, current: CurrentUser = Depends(get_curre
             raise HTTPException(status_code=403, detail="Forbidden")
     elif not is_admin(current.role):
         raise HTTPException(status_code=403, detail="Forbidden")
-    return BookingOut.model_validate(b)
+
+    bm = BookingOut.model_validate(b)
+
+    # Enrich with patient_name / service_name / worker_name — this endpoint
+    # backs the consumer/nurse "booking detail" pages, which otherwise show
+    # blank or generic placeholder text ("Service", empty nurse field) since
+    # BookingOut only carries the raw *_id foreign keys.
+    if b.patient_id:
+        pres = await db.execute(select(Patient).where(Patient.id == b.patient_id))
+        patient = pres.scalar_one_or_none()
+        if patient:
+            bm.patient_name = patient.full_name
+
+    if b.service_id:
+        sres = await db.execute(select(ServiceCatalogue).where(ServiceCatalogue.id == b.service_id))
+        svc = sres.scalar_one_or_none()
+        if svc:
+            bm.service_name = svc.name
+    elif b.package_id:
+        pkres = await db.execute(select(CarePackage).where(CarePackage.id == b.package_id))
+        pkg = pkres.scalar_one_or_none()
+        if pkg:
+            bm.service_name = pkg.name
+
+    if b.worker_id:
+        wres2 = await db.execute(
+            select(User.full_name).join(WorkerProfile, WorkerProfile.user_id == User.id)
+            .where(WorkerProfile.id == b.worker_id)
+        )
+        worker_name = wres2.scalar_one_or_none()
+        if worker_name:
+            bm.worker_name = worker_name
+
+    return bm
+
+
+# ---------------------------------------------------------------------------
+# GET /bookings/{booking_id}/history
+#
+# The consumer/nurse "Booking history" timeline was previously rendered
+# entirely from a client-side, in-memory mock store (OrchestrationStore —
+# see src/lib/orchestration/index.tsx on the frontend) that seeds one
+# generic "Imported from operational seed" event per entity on page load
+# and is never wired to real backend data. That's why every booking showed
+# the same static/duplicated write-up regardless of what actually happened.
+#
+# This endpoint returns the real event trail from AuditLog for this
+# booking, so the frontend can render an accurate, per-booking timeline.
+# ---------------------------------------------------------------------------
+@router.get("/{booking_id}/history")
+async def get_booking_history(
+    booking_id: UUID, current: CurrentUser = Depends(get_current_user), db: AsyncSession = Depends(get_db)
+):
+    res = await db.execute(select(Booking).where(Booking.id == booking_id))
+    b = res.scalar_one_or_none()
+    if not b:
+        raise HTTPException(status_code=404, detail="Booking not found")
+    # Same ownership rules as GET /bookings/{booking_id}.
+    if current.role == UserRole.consumer:
+        cres = await db.execute(select(ConsumerProfile).where(ConsumerProfile.user_id == current.id))
+        cp = cres.scalar_one()
+        if b.consumer_id != cp.id:
+            raise HTTPException(status_code=403, detail="Forbidden")
+    elif current.role == UserRole.worker:
+        wres = await db.execute(select(WorkerProfile).where(WorkerProfile.user_id == current.id))
+        wp = wres.scalar_one()
+        if b.worker_id != wp.id:
+            raise HTTPException(status_code=403, detail="Forbidden")
+    elif not is_admin(current.role):
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+    # Booking-level events (create, accept, cancel, checklist/documentation
+    # submissions, OTP generation, etc.) are logged with entity_type="booking"
+    # and entity_id=str(booking_id). Visit-scoped events (check-in, checkout,
+    # vitals) are logged against the VisitRecord id instead, so pull those in
+    # too via the linked visit record, when one exists.
+    entity_ids = [str(booking_id)]
+    vres = await db.execute(select(VisitRecord.id).where(VisitRecord.booking_id == booking_id))
+    visit_id = vres.scalar_one_or_none()
+    if visit_id:
+        entity_ids.append(str(visit_id))
+
+    rows = await db.execute(
+        select(AuditLog)
+        .where(AuditLog.entity_type.in_(["booking", "visit"]), AuditLog.entity_id.in_(entity_ids))
+        .order_by(AuditLog.created_at.asc())
+    )
+    return [
+        {
+            "id": str(r.id),
+            "action": r.action,
+            "actor_type": r.actor_type,
+            "changes": r.changes,
+            "created_at": r.created_at.isoformat(),
+        }
+        for r in rows.scalars().all()
+    ]
 
 
 @router.post("/{booking_id}/accept")
 async def accept_booking(
+
     booking_id: UUID,
     profile: WorkerProfile = Depends(get_worker_profile),
     db: AsyncSession = Depends(get_db),
@@ -368,7 +663,10 @@ async def accept_booking(
     """
     worker_id = profile.id
     now = datetime.now(timezone.utc)
-    claimable_statuses = (BookingStatus.confirmed, BookingStatus.rematch_pending)
+    # searching_nurse == Workflow 1 (Composite Care Package) dispatch state,
+    # entered once the pharmacist has approved the Rx — claimable exactly
+    # like a normal confirmed booking.
+    claimable_statuses = (BookingStatus.confirmed, BookingStatus.rematch_pending, BookingStatus.searching_nurse)
 
     # Patch 2 — qualification + opt-in re-check before claim. Fetch booking
     # (without locking it) to identify the target service/package.
@@ -527,6 +825,17 @@ async def accept_booking(
     )
 
 
+# Neither the nurse nor the customer may cancel inside this window before
+# the scheduled visit start. Admin/ops can always cancel (support cases).
+_CANCELLATION_CUTOFF_HOURS = 6
+
+
+def _scheduled_start_utc(b: Booking) -> datetime:
+    # Same convention as dispatch._window: scheduled_date + scheduled_start_time
+    # are treated as UTC wall-clock throughout the codebase.
+    return datetime.combine(b.scheduled_date, b.scheduled_start_time, tzinfo=timezone.utc)
+
+
 @router.post("/{booking_id}/cancel", response_model=BookingOut)
 async def cancel_booking(
     booking_id: UUID,
@@ -555,6 +864,65 @@ async def cancel_booking(
     elif not is_admin(current.role):
         raise HTTPException(status_code=403, detail="Forbidden")
 
+    # 6-hour cutoff — applies to nurse and customer alike; admin is exempt
+    # so support can still intervene on emergencies.
+    if not is_admin(current.role):
+        now = datetime.now(timezone.utc)
+        cutoff = _scheduled_start_utc(b) - timedelta(hours=_CANCELLATION_CUTOFF_HOURS)
+        if now > cutoff:
+            raise HTTPException(
+                status_code=403,
+                detail={
+                    "success": False,
+                    "code": "CANCELLATION_WINDOW_CLOSED",
+                    "message": (
+                        f"Cancellations are only allowed up to {_CANCELLATION_CUTOFF_HOURS} hours "
+                        "before the scheduled visit. Please contact support for help."
+                    ),
+                },
+            )
+
+    # A nurse backing out does NOT kill the booking — it goes straight back
+    # into the dispatch pool for other qualified nurses (rematch_pending is
+    # already included in /worker/new-requests), with the wave clock reset
+    # so proximity waves start over from the rematch moment.
+    if current.role == UserRole.worker:
+        released_worker_id = b.worker_id
+        b.worker_id = None
+        b.status = BookingStatus.rematch_pending
+        b.accepted_at = None
+        b.rematch_count = (b.rematch_count or 0) + 1
+        b.assignment_wave = 1
+        b.assignment_escalated_at = None
+        b.dispatch_started_at = datetime.now(timezone.utc)
+        await audit(
+            db, current.id, current.role.value, "booking.worker_cancel_rematch", "booking", b.id,
+            {"reason": payload.reason, "released_worker_id": str(released_worker_id), "rematch_count": b.rematch_count},
+        )
+        await db.commit()
+        await db.refresh(b)
+
+        # Best-effort: tell the customer we're finding a replacement, and
+        # push the request to other nearby qualified nurses right away.
+        try:
+            cres = await db.execute(select(ConsumerProfile).where(ConsumerProfile.id == b.consumer_id))
+            cp = cres.scalar_one_or_none()
+            if cp:
+                await send_notification(
+                    db, cp.user_id, "booking_rematch", "Finding You a New Nurse",
+                    f"Your nurse had to cancel booking {b.booking_ref}. "
+                    "We're automatically matching you with another verified nurse.",
+                    {"booking_id": str(b.id)},
+                )
+            from app.services.dispatch import notify_nearby_workers
+            await notify_nearby_workers(db, b)
+            await db.commit()
+        except Exception:  # noqa: BLE001
+            await db.rollback()
+        await manager.broadcast(booking_topic(b.id), {"type": "booking.rematch", "booking_id": str(b.id)})
+        return BookingOut.model_validate(b)
+
+    # Consumer / admin cancellation — terminal.
     b.status = BookingStatus.cancelled
     b.cancelled_by = current.id
     b.cancelled_at = datetime.now(timezone.utc)
@@ -624,3 +992,121 @@ async def escalate_booking(
     await db.commit()
     await manager.broadcast(booking_topic(b.id), {"type": "escalation.created", "level": payload.level.value, "escalation_id": str(esc.id)})
     return {"id": str(esc.id), "level": esc.level.value, "status": esc.status.value, "sla_breach_at": esc.sla_breach_at.isoformat() if esc.sla_breach_at else None}
+
+
+@router.post("/{booking_id}/sos")
+async def trigger_sos(
+    booking_id: UUID,
+    payload: SOSCreateRequest,
+    current: CurrentUser = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Personal-safety panic button.
+
+    Either the consumer or the assigned worker on a booking can fire this
+    when they feel unsafe — e.g. a worker fears the customer, or a customer
+    fears the worker. Unlike /escalate (clinical, worker-only), this is
+    identity-agnostic and always treated as the highest severity: it opens
+    an `emergency` Escalation with a short SLA and auto_call_112 set, and
+    alerts admins immediately (in-app + a live WebSocket push), without
+    ever notifying the other party on the booking — the point is to get the
+    person who's scared to safety quietly, not to alert who they're scared of.
+    """
+    res = await db.execute(select(Booking).where(Booking.id == booking_id))
+    b = res.scalar_one_or_none()
+    if not b:
+        raise HTTPException(status_code=404, detail="Booking not found")
+
+    # Caller must be a party to this booking (the consumer or the assigned
+    # worker) — admins can also trigger it on someone's behalf if needed.
+    triggered_by_role: str
+    if current.role == UserRole.consumer:
+        cres = await db.execute(select(ConsumerProfile).where(ConsumerProfile.user_id == current.id))
+        cp = cres.scalar_one_or_none()
+        if not cp or cp.id != b.consumer_id:
+            raise HTTPException(status_code=403, detail="Not a party to this booking")
+        triggered_by_role = "consumer"
+    elif current.role == UserRole.worker:
+        wres = await db.execute(select(WorkerProfile).where(WorkerProfile.user_id == current.id))
+        wp = wres.scalar_one_or_none()
+        if not wp or wp.id != b.worker_id:
+            raise HTTPException(status_code=403, detail="Not a party to this booking")
+        triggered_by_role = "worker"
+    elif is_admin(current.role):
+        triggered_by_role = "admin"
+    else:
+        raise HTTPException(status_code=403, detail="Not authorized")
+
+    if not b.worker_id:
+        raise HTTPException(status_code=400, detail="No nurse assigned to this booking yet")
+
+    vres = await db.execute(select(VisitRecord).where(VisitRecord.booking_id == b.id))
+    visit = vres.scalar_one_or_none()
+
+    esc = Escalation(
+        booking_id=b.id,
+        visit_record_id=visit.id if visit else None,
+        worker_id=b.worker_id,
+        patient_id=b.patient_id,
+        level=EscalationLevel.emergency,
+        status=EscalationStatus.open,
+        trigger_type="safety_sos",
+        trigger_details={
+            "triggered_by_role": triggered_by_role,
+            "triggered_by_user_id": str(current.id),
+            "latitude": payload.latitude,
+            "longitude": payload.longitude,
+        },
+        notes=payload.notes or f"Safety SOS raised by {triggered_by_role}.",
+        notified_parties=["ops", "admin"],
+        sla_minutes=5,
+        sla_breach_at=compute_sla_breach(5),
+        auto_call_112=True,
+        priority="critical",
+    )
+    db.add(esc)
+    if visit:
+        visit.escalation_triggered = True
+    await audit(
+        db, current.id, current.role.value, "escalation.sos", "escalation", esc.id,
+        {"booking_id": str(b.id), "triggered_by_role": triggered_by_role},
+    )
+    await db.commit()
+    await db.refresh(esc)
+
+    # Notify admins — in-app/push, AND a live WebSocket push to each admin's
+    # existing /ws/user connection so it lands instantly rather than waiting
+    # on the support dashboard's poll interval.
+    admin_ids = await notify_admins(
+        db,
+        template_code="sos_alert",
+        title="🆘 Safety SOS triggered",
+        body=payload.notes or f"A {triggered_by_role} raised a safety SOS on booking {b.booking_ref}.",
+        context={"booking_id": str(b.id), "escalation_id": str(esc.id)},
+    )
+    await db.commit()
+
+    sos_event = {
+        "type": "sos.alert",
+        "escalation_id": str(esc.id),
+        "booking_id": str(b.id),
+        "booking_ref": b.booking_ref,
+        "triggered_by_role": triggered_by_role,
+        "latitude": payload.latitude,
+        "longitude": payload.longitude,
+        "notes": esc.notes,
+        "created_at": esc.created_at.isoformat() if esc.created_at else None,
+    }
+    for admin_id in admin_ids:
+        await manager.broadcast(user_topic(admin_id), sos_event)
+    # Also drop it on the booking's own channel in case anyone (e.g. an
+    # admin already viewing that specific booking) is subscribed there.
+    await manager.broadcast(booking_topic(b.id), {"type": "escalation.created", "level": "emergency", "escalation_id": str(esc.id)})
+
+    return {
+        "id": str(esc.id),
+        "level": esc.level.value,
+        "status": esc.status.value,
+        "auto_call_112": esc.auto_call_112,
+        "sla_breach_at": esc.sla_breach_at.isoformat() if esc.sla_breach_at else None,
+    }

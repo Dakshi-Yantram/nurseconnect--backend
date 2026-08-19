@@ -24,11 +24,16 @@ router = APIRouter(prefix="/escalations", tags=["escalations"])
 
 
 _ADMIN_ROLES = {UserRole.admin}
-_SUPPORT_ROLES = {UserRole.admin}
+_SUPPORT_ROLES = {UserRole.admin, UserRole.support}
+
+# Support-dashboard endpoints (summary/assign/investigate/note/etc.) must be
+# reachable by both admin AND support staff — previously scoped to admin-only,
+# which 403'd every support user hitting /support-escalations.
+require_support = require_roles(*_SUPPORT_ROLES)
 
 @router.get("/open", response_model=List[EscalationOut])
 async def list_open(
-    current: CurrentUser = Depends(require_admin),
+    current: CurrentUser = Depends(require_support),
     db: AsyncSession = Depends(get_db),
 ):
     res = await db.execute(select(Escalation).where(Escalation.status != EscalationStatus.resolved).order_by(Escalation.level.desc(), Escalation.created_at.desc()))
@@ -56,8 +61,8 @@ async def list_escalations(
         conds.append(Escalation.booking_id == booking_id)
 
     # Per-role scoping
-    if current.role in _ADMIN_ROLES:
-        pass  # full access
+    if current.role in _SUPPORT_ROLES:
+        pass  # admin + support → full access
     elif current.role == UserRole.worker:
         wres = await db.execute(select(WorkerProfile).where(WorkerProfile.user_id == current.id))
         wp = wres.scalar_one_or_none()
@@ -87,7 +92,7 @@ async def list_escalations(
 @router.post("/{escalation_id}/acknowledge", response_model=EscalationOut)
 async def acknowledge(
     escalation_id: UUID,
-    current: CurrentUser = Depends(require_admin),
+    current: CurrentUser = Depends(require_support),
     db: AsyncSession = Depends(get_db),
 ):
     res = await db.execute(select(Escalation).where(Escalation.id == escalation_id))
@@ -107,7 +112,7 @@ async def acknowledge(
 async def resolve(
     escalation_id: UUID,
     payload: EscalationResolveRequest,
-    current: CurrentUser = Depends(require_admin),
+    current: CurrentUser = Depends(require_support),
     db: AsyncSession = Depends(get_db),
 ):
     res = await db.execute(select(Escalation).where(Escalation.id == escalation_id))
@@ -126,7 +131,7 @@ async def resolve(
 
 @router.get("/summary", response_model=EscalationSummaryOut)
 async def get_summary(
-    current: CurrentUser = Depends(require_admin),
+    current: CurrentUser = Depends(require_support),
     db: AsyncSession = Depends(get_db),
 ):
     res = await db.execute(select(Escalation))
@@ -147,7 +152,7 @@ async def get_summary(
 
 @router.get("/assigned-to-me", response_model=List[EscalationOut])
 async def assigned_to_me(
-    current: CurrentUser = Depends(require_admin),
+    current: CurrentUser = Depends(require_support),
     db: AsyncSession = Depends(get_db),
 ):
     res = await db.execute(
@@ -160,7 +165,7 @@ async def assigned_to_me(
 
 @router.get("/unassigned", response_model=List[EscalationOut])
 async def unassigned(
-    current: CurrentUser = Depends(require_admin),
+    current: CurrentUser = Depends(require_support),
     db: AsyncSession = Depends(get_db),
 ):
     res = await db.execute(
@@ -178,7 +183,7 @@ async def unassigned(
 async def assign(
     escalation_id: UUID,
     payload: EscalationAssignRequest,
-    current: CurrentUser = Depends(require_admin),
+    current: CurrentUser = Depends(require_support),
     db: AsyncSession = Depends(get_db),
 ):
     res = await db.execute(select(Escalation).where(Escalation.id == escalation_id))
@@ -200,7 +205,7 @@ async def assign(
 @router.post("/{escalation_id}/investigate", response_model=EscalationOut)
 async def investigate(
     escalation_id: UUID,
-    current: CurrentUser = Depends(require_admin),
+    current: CurrentUser = Depends(require_support),
     db: AsyncSession = Depends(get_db),
 ):
     res = await db.execute(select(Escalation).where(Escalation.id == escalation_id))
@@ -218,7 +223,7 @@ async def investigate(
 async def add_note(
     escalation_id: UUID,
     payload: EscalationNoteRequest,
-    current: CurrentUser = Depends(require_admin),
+    current: CurrentUser = Depends(require_support),
     db: AsyncSession = Depends(get_db),
 ):
     res = await db.execute(select(Escalation).where(Escalation.id == escalation_id))
