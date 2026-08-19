@@ -90,8 +90,10 @@ _OPEN_TICKET_STATUSES = ("PENDING_REVIEW", "IN_REVIEW", "NEEDS_CLARIFICATION", "
 # (single source of truth — this dict used to be redeclared here, unused,
 # and had already drifted from the copies actually enforced elsewhere).
 from app.core.provider_types import (
+    CAREGIVER_SPECIALIZATION_GROUPS,
     PROVIDER_TYPE_LABELS,
     required_docs as _required_docs_for_type,
+    specialization_service_code,
 )
 REQUIRED_DOCUMENTS_BY_WORKER_TYPE = {
     WorkerType.nurse: {"aadhaar", "nursing_license", "degree_certificate", "police_verification"},
@@ -199,6 +201,13 @@ async def all_workers(
     # your spec's package list ("Injection", "Physiotherapy", ...) maps to a
     # mix of both in the existing catalogue.
     package: str | None = None,
+    # Caregiver/Mother & Baby Caregiver specialization key from
+    # CAREGIVER_SPECIALIZATION_GROUPS (e.g. "baby_massage"). Internally this
+    # maps to the ServiceCatalogue.service_code convention "spec_<key>" and
+    # is folded into the same qualification-based worker-id lookup as
+    # `package` — kept as its own param so the frontend filter doesn't have
+    # to know about the "spec_" prefix convention.
+    specialization: str | None = None,
     qualification_status: str | None = None,
     limit: int = 200,
     current: CurrentUser = Depends(require_reviewer),
@@ -206,9 +215,14 @@ async def all_workers(
 ):
     """All workers regardless of onboarding status — used by the admin
     Provider list. Supports the combined filter set from the Provider Type /
-    Status / Location / Package / Qualification Status admin filters:
+    Status / Location / Package / Caregiver Specialization / Qualification
+    Status admin filters:
     e.g. provider_type=nurse&city=Hyderabad&onboarding_status=approved&package=injection
     """
+    if specialization:
+        # Fold into the same code path as `package` by resolving to the
+        # convention service_code — avoids a second qualification query.
+        package = specialization_service_code(specialization)
     stmt = (
         select(WorkerProfile, User)
         .join(User, User.id == WorkerProfile.user_id)
@@ -1605,6 +1619,22 @@ async def dashboard_activity(
             "when": l.created_at.isoformat(),
         }
         for l in logs
+    ]
+
+
+@router.get("/caregiver-specializations")
+async def caregiver_specializations(current: CurrentUser = Depends(require_reviewer)):
+    """Reference catalogue for the admin Providers page's Caregiver
+    Specialization filter — grouped {key, label} options. Pass the chosen
+    key straight to GET /admin/workers/all?specialization=<key>.
+    """
+    return [
+        {
+            "group_key": group_key,
+            "group_label": group["label"],
+            "items": [{"value": item_key, "label": item_label} for item_key, item_label in group["items"].items()],
+        }
+        for group_key, group in CAREGIVER_SPECIALIZATION_GROUPS.items()
     ]
 
 
