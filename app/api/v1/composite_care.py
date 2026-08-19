@@ -56,6 +56,7 @@ from app.models.enums import (
     BookingType,
     EscalationLevel,
     EscalationStatus,
+    NotificationChannel,
     PaymentStatus,
     PrescriptionStatus,
     UserRole,
@@ -991,6 +992,11 @@ async def verify_completion_otp(
         {"type": "visit.completed", "booking_id": str(booking_id), "invoice_number": invoice.invoice_number},
     )
 
+    # Step 6 close-out — WhatsApp post-service micro-survey (Interakt). Passing
+    # `channels` explicitly is what actually routes this over WhatsApp — the
+    # notify_parties()/send_notification() default is in-app + push, so
+    # without this the spec's "Automated WhatsApp feedback survey" silently
+    # never reaches WhatsApp even though the audit trail looks identical.
     # Best-effort WhatsApp post-service micro-survey trigger.
     try:
         await notify_parties(
@@ -1000,6 +1006,7 @@ async def verify_completion_otp(
             "post_service_micro_survey",
             title="How was your visit?",
             body=f"Your {booking.booking_ref} visit is complete. Please rate your experience.",
+            channels=[NotificationChannel.whatsapp],
         )
         await db.commit()
     except Exception:  # noqa: BLE001
