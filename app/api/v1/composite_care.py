@@ -997,7 +997,6 @@ async def verify_completion_otp(
     # notify_parties()/send_notification() default is in-app + push, so
     # without this the spec's "Automated WhatsApp feedback survey" silently
     # never reaches WhatsApp even though the audit trail looks identical.
-    # Best-effort WhatsApp post-service micro-survey trigger.
     try:
         await notify_parties(
             db,

@@ -1539,6 +1539,109 @@ async def dashboard_providers(current: CurrentUser = Depends(require_admin), db:
     }
 
 
+@router.get("/regions/detailed")
+async def admin_regions_detailed(
+    package: str | None = None,
+    current: CurrentUser = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """City-wise Provider Type + qualification + availability rollup for the
+    location-based aggregate / CEO dashboard — e.g. "Hyderabad: Nurses 76,
+    Active 52, Injection-qualified 41, Available today 24".
+
+    Distinct from GET /admin/regions (which rolls up patients/visits/revenue
+    by consumer city, for the ops map): this rolls up *providers* by city,
+    provider type, live availability, and — when `package` is passed — an
+    approved-qualification count for that specific package/service, matching
+    the `package` filter convention already used by GET /admin/workers/all
+    (a package_code or service_code substring). Omit `package` to skip that
+    column entirely rather than paying for the extra join on every call.
+    """
+    type_rows = await db.execute(
+        select(WorkerProfile.base_city, WorkerProfile.worker_type, func.count(WorkerProfile.id))
+        .where(WorkerProfile.base_city.is_not(None))
+        .group_by(WorkerProfile.base_city, WorkerProfile.worker_type)
+    )
+    city_type_counts: dict[str, dict[str, int]] = {}
+    for city, wtype, count in type_rows.all():
+        city_type_counts.setdefault(city, {})[wtype.value] = count
+
+    active_rows = await db.execute(
+        select(WorkerProfile.base_city, func.count(WorkerProfile.id))
+        .where(
+            WorkerProfile.base_city.is_not(None),
+            WorkerProfile.onboarding_status == WorkerOnboardingStatus.approved,
+            WorkerProfile.availability != WorkerAvailability.offline,
+        )
+        .group_by(WorkerProfile.base_city)
+    )
+    active_by_city = dict(active_rows.all())
+
+    available_rows = await db.execute(
+        select(WorkerProfile.base_city, func.count(WorkerProfile.id))
+        .where(
+            WorkerProfile.base_city.is_not(None),
+            WorkerProfile.onboarding_status == WorkerOnboardingStatus.approved,
+            WorkerProfile.availability == WorkerAvailability.online,
+        )
+        .group_by(WorkerProfile.base_city)
+    )
+    available_by_city = dict(available_rows.all())
+
+    qualified_by_city: dict[str, int] = {}
+    package_label: str | None = None
+    if package:
+        qual_stmt = (
+            select(WorkerProfile.base_city, func.count(func.distinct(WorkerServiceQualification.worker_id)))
+            .select_from(WorkerServiceQualification)
+            .join(WorkerProfile, WorkerProfile.id == WorkerServiceQualification.worker_id)
+            .join(ServiceCatalogue, ServiceCatalogue.id == WorkerServiceQualification.service_id, isouter=True)
+            .join(CarePackage, CarePackage.id == WorkerServiceQualification.package_id, isouter=True)
+            .where(
+                WorkerProfile.base_city.is_not(None),
+                WorkerServiceQualification.qualification_status == WorkerQualificationStatus.APPROVED,
+                (ServiceCatalogue.service_code.ilike(f"%{package}%"))
+                | (CarePackage.package_code.ilike(f"%{package}%")),
+            )
+            .group_by(WorkerProfile.base_city)
+        )
+        qres = await db.execute(qual_stmt)
+        qualified_by_city = dict(qres.all())
+
+        label_res = await db.execute(
+            select(ServiceCatalogue.name).where(ServiceCatalogue.service_code.ilike(f"%{package}%")).limit(1)
+        )
+        package_label = label_res.scalar_one_or_none()
+        if not package_label:
+            label_res = await db.execute(
+                select(CarePackage.name).where(CarePackage.package_code.ilike(f"%{package}%")).limit(1)
+            )
+            package_label = label_res.scalar_one_or_none()
+
+    return {
+        "package_filter": package,
+        "package_label": package_label,
+        "cities": [
+            {
+                "city": city,
+                "total_providers": sum(city_type_counts[city].values()),
+                "by_provider_type": {
+                    "doctors": city_type_counts[city].get("doctor", 0),
+                    "dentists": city_type_counts[city].get("dentist", 0),
+                    "nurses": city_type_counts[city].get("nurse", 0),
+                    "physiotherapists": city_type_counts[city].get("physiotherapist", 0),
+                    "caregivers": city_type_counts[city].get("caregiver", 0),
+                    "mother_baby_caregivers": city_type_counts[city].get("mother_baby_caregiver", 0),
+                },
+                "active": active_by_city.get(city, 0),
+                "available_now": available_by_city.get(city, 0),
+                "qualified_for_package": qualified_by_city.get(city, 0) if package else None,
+            }
+            for city in sorted(city_type_counts.keys())
+        ],
+    }
+
+
 @router.get("/dashboard/booking-trend")
 async def dashboard_booking_trend(current: CurrentUser = Depends(require_admin), db: AsyncSession = Depends(get_db)):
     """Last 7 calendar days: booking count + completed count per day."""
