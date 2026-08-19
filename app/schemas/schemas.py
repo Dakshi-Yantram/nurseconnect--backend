@@ -802,7 +802,7 @@ class SOSCreateRequest(BaseModel):
 
 
 class EscalationResolveRequest(BaseModel):
-    resolution_notes: str
+    resolution_notes: Optional[str] = None
 
 class EscalationAssignRequest(BaseModel):
     assigned_to: UUID
