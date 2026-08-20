@@ -15,7 +15,7 @@ git clean -fd
 
 echo "📦 Installing dependencies..."
 if [ -f requirements.txt ]; then
-    pip install -r requirements.txt
+    pip install --break-system-packages -r requirements.txt
 fi
 
 echo "🗄️ Running database schema sync..."
