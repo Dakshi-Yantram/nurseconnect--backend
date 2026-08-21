@@ -1,5 +1,4 @@
-﻿@'
-#!/bin/bash
+﻿#!/bin/bash
 
 set -e
 
@@ -40,5 +39,3 @@ curl -f http://localhost:8000/api/health || {
 }
 
 echo "NurseConnect deployment completed successfully!"
-'@ | Set-Content -Encoding utf8 deploy.sh
-(Get-Content deploy.sh -Raw) -replace "`r`n", "`n" | Set-Content -NoNewline -Encoding utf8 deploy.sh
