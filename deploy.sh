@@ -24,20 +24,12 @@ if [ -f add_gate_and_anticheat_schema.py ]; then
 fi
 
 echo "🔄 Restarting backend..."
-
-if command -v supervisorctl >/dev/null 2>&1; then
-    sudo supervisorctl restart backend
-elif command -v systemctl >/dev/null 2>&1 && systemctl list-unit-files | grep -q nurseconnect; then
-    sudo systemctl restart nurseconnect
-else
-    echo "⚠️ Backend restart command not detected."
-    echo "Please restart the existing backend process manually."
-fi
+sudo systemctl restart web.service
 
 echo "🏥 Checking backend health..."
 sleep 5
 
-curl -f http://localhost:8001/api/health || {
+curl -f http://localhost:8000/api/health || {
     echo "❌ Health check failed"
     exit 1
 }
