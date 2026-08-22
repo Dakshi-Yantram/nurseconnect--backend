@@ -359,6 +359,12 @@ class CarePackageOut(ORMModel):
     name: str
     tagline: Optional[str] = None
     description: Optional[str] = None
+    # Expanded-card content — see the equivalent comment on the CarePackage
+    # model. All optional: a package with no important_information simply
+    # omits that section on the card instead of rendering it empty.
+    whats_included: Optional[List[str]] = None
+    service_details_text: Optional[str] = None
+    important_information: Optional[str] = None
     target_condition: Optional[str] = None
     min_tier: WorkerTier
     visit_frequency: Optional[str] = None
