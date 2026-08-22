@@ -27,7 +27,17 @@ async def update_faqs(session) -> int:
                 Faq.audience == data["audience"],
             )
         )
-        row = res.scalar_one_or_none()
+        rows = res.scalars().all()
+        if len(rows) > 1:
+            # Duplicate rows from an earlier run — keep the first (oldest),
+            # deactivate the rest so they stop showing up twice in the app.
+            print(
+                f"  ! found {len(rows)} duplicate rows for {data['question']!r} "
+                f"({data['audience']}) — keeping one, deactivating the others"
+            )
+            for dup in rows[1:]:
+                dup.is_active = False
+        row = rows[0] if rows else None
         if row is None:
             # Doesn't exist yet — create it so this script also covers
             # brand-new FAQ entries added to the list.
