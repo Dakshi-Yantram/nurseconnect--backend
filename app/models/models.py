@@ -512,6 +512,18 @@ class CarePackage(Base):
     name: Mapped[str] = mapped_column(String(255), nullable=False)
     tagline: Mapped[Optional[str]] = mapped_column(String(500))
     description: Mapped[Optional[str]] = mapped_column(Text)
+    # Customer-facing "What's included" bullet list, shown only when the card
+    # is expanded (View details). Distinct from practical_checklist_items,
+    # which is internal nurse-facing sign-off language derived from the
+    # workbook and was never meant for consumer display.
+    whats_included: Mapped[Optional[list]] = mapped_column(ARRAY(String))
+    # One or two sentences under "Service details" in the expanded card —
+    # e.g. visit count, equipment carried, who performs the procedure.
+    service_details_text: Mapped[Optional[str]] = mapped_column(Text)
+    # Shown only when applicable (e.g. "medicine supplied by the customer",
+    # "materials charged separately"). Null/blank means the section is
+    # omitted entirely rather than shown empty.
+    important_information: Mapped[Optional[str]] = mapped_column(Text)
     target_condition: Mapped[Optional[str]] = mapped_column(Text)
     min_tier: Mapped[WorkerTier] = mapped_column(SQLEnum(WorkerTier, name="worker_tier"), default=WorkerTier.tier1)
     gender_restriction: Mapped[GenderRestriction] = mapped_column(SQLEnum(GenderRestriction, name="gender_restriction"), default=GenderRestriction.any)
