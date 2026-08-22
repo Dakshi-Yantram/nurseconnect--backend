@@ -538,71 +538,180 @@ WORKBOOK_PACKAGE_CUSTOMER_COPY: dict[str, dict] = {
         description="A single visit to check blood pressure, pulse, temperature, oxygen "
                      "levels and blood sugar, with a summary of what was found.",
         per_visit_price="299",
+        whats_included=[
+            "Blood pressure check",
+            "Pulse check",
+            "Temperature check",
+            "Respiration check",
+            "SpO₂ check",
+            "Brief symptom and medication review",
+            "Written visit note",
+        ],
+        service_details_text=
+        "One home nursing visit. The nurse carries the required basic monitoring equipment."
     ),
     "PKG-A1-02": dict(
         tagline="One prescribed injection, given at home",
         description="A nurse visits to administer a single prescribed intramuscular or "
                      "subcutaneous injection safely at home.",
         per_visit_price="299",
+        whats_included=[
+            "Administration of one prescribed IM or subcutaneous injection",
+            "Basic observation during the procedure",
+        ],
+        service_details_text=
+        "One prescribed injection per visit.",
+        important_information=
+        "The prescribed medicine is provided by the customer. A syringe and needle can be "
+        "supplied separately if required."
     ),
     "PKG-A1-03": dict(
         tagline="Insulin administration for diabetes management",
         description="A nurse administers your prescribed insulin dose and can check blood "
                      "sugar in the same visit if needed.",
         per_visit_price="329",
+        whats_included=[
+            "Administration of the prescribed insulin dose",
+            "Review of the latest glucose reading",
+        ],
+        service_details_text=
+        "Suitable for daily or recurring insulin administration.",
+        important_information=
+        "The prescribed insulin is provided by the customer. An insulin syringe can be supplied "
+        "separately if required."
     ),
     "PKG-A1-04": dict(
         tagline="Two prescribed injections in a single visit",
         description="For when you have two separate injections prescribed at the same time — "
                      "both are administered safely in one visit.",
         per_visit_price="449",
+        whats_included=[
+            "Administration of two prescribed IM or subcutaneous injections",
+            "Basic observation during the procedure",
+        ],
+        service_details_text=
+        "Two prescribed injections during one visit.",
+        important_information=
+        "The prescribed medicines are provided by the customer. Syringes can be supplied "
+        "separately if required."
     ),
     "PKG-A1-05": dict(
         tagline="Fertility treatment hormonal injections",
         description="A nurse trained in fertility-treatment protocols administers your "
                      "prescribed hormonal injection at home, on your treatment schedule.",
         per_visit_price="499",
+        whats_included=[
+            "Administration of the prescribed subcutaneous hormonal injection",
+            "Careful handling according to the prescribed schedule",
+        ],
+        service_details_text=
+        "One prescribed fertility or IVF hormonal injection per visit.",
+        important_information=
+        "The prescribed medicine is provided by the customer. A syringe can be supplied "
+        "separately if required."
     ),
     "PKG-A1-06": dict(
         tagline="IV antibiotic administration at home",
         description="A nurse administers a prescribed antibiotic through an existing IV line "
                      "and monitors you for the duration of the infusion.",
         per_visit_price="599",
+        whats_included=[
+            "Administration of the prescribed antibiotic through IV access",
+            "Monitoring during the visit",
+        ],
+        service_details_text=
+        "The service can use an existing IV cannula or a freshly placed cannula.",
+        important_information=
+        "If a new cannula is required, the applicable cannula and dressing charge is added "
+        "separately."
     ),
     "PKG-A1-07": dict(
         tagline="IV cannula placed or removed by a trained nurse",
         description="Sterile insertion of an IV cannula (for future medication or fluids) or "
                      "safe removal of an existing one, done at home.",
         per_visit_price="449",
+        whats_included=[
+            "Peripheral IV cannula insertion or removal",
+            "Basic procedure support",
+        ],
+        service_details_text=
+        "The procedure is performed by a cannulation-approved nurse.",
+        important_information=
+        "Cannula and fixing-dressing charges apply separately when supplied by NurseConnect."
     ),
     "PKG-A1-08": dict(
         tagline="A short IV infusion, up to one hour",
         description="Prescribed IV fluids or medication administered and monitored at home for "
                      "infusions lasting up to an hour.",
         per_visit_price="599",
+        whats_included=[
+            "Administration of the prescribed IV fluid or medicine",
+            "Baseline vital checks",
+            "Post-infusion vital checks",
+            "Nursing monitoring during the infusion",
+        ],
+        service_details_text=
+        "Infusion duration of up to 60 minutes.",
+        important_information=
+        "The prescribed medicine is not included. An IV infusion or drip set can be supplied "
+        "separately."
     ),
     "PKG-A1-09": dict(
         tagline="A longer IV infusion, 1 to 3 hours",
         description="Prescribed IV fluids or medication administered and monitored at home, "
                      "with the nurse staying for the full 1–3 hour infusion.",
         per_visit_price="999",
+        whats_included=[
+            "Administration of the prescribed infusion",
+            "Nursing presence throughout the prescribed infusion period",
+        ],
+        service_details_text=
+        "Infusion duration of up to three hours.",
+        important_information=
+        "Prescribed medicine is not included. An infusion or drip set can be supplied separately."
     ),
     "PKG-A1-10": dict(
         tagline="An extended IV infusion, 3 to 6 hours",
         description="For longer prescribed infusions — the nurse stays for the full 3–6 hours, "
                      "monitoring your vitals and the infusion site throughout.",
         per_visit_price="1699",
+        whats_included=[
+            "Administration of the prescribed IV infusion",
+            "Extended nurse presence throughout the prescribed infusion period",
+        ],
+        service_details_text=
+        "Infusion duration of three to six hours.",
+        important_information=
+        "Prescribed medicine is not included. An infusion or drip set can be supplied separately."
     ),
     "PKG-A1-11": dict(
         tagline="Nebuliser therapy for breathing relief",
         description="A nurse sets up and supervises a prescribed nebuliser session to help "
                      "with breathing difficulty, wheezing or congestion.",
         per_visit_price="349",
+        whats_included=[
+            "Nebuliser setup assistance",
+            "Administration of prescribed nebulisation",
+            "Vital checks before and after where appropriate",
+        ],
+        service_details_text=
+        "One nebulisation assistance visit.",
+        important_information=
+        "Prescribed medicine is not included. A disposable nebuliser mask or kit can be supplied "
+        "separately."
     ),
     "PKG-A1-12": dict(
         tagline="Enema administration by a trained nurse",
         description="A prescribed enema is administered safely and hygienically at home.",
         per_visit_price="399",
+        whats_included=[
+            "Administration of the prescribed enema",
+            "Privacy and appropriate infection-control precautions",
+        ],
+        service_details_text=
+        "One home procedure visit.",
+        important_information=
+        "The enema kit can be supplied separately if required."
     ),
     # -- Tier 2: wound, catheter, tube & stoma care --------------------------
     "PKG-A2-01": dict(
@@ -610,18 +719,46 @@ WORKBOOK_PACKAGE_CUSTOMER_COPY: dict[str, dict] = {
         description="Sterile cleaning and re-dressing of a straightforward wound, with the "
                      "nurse checking for signs of infection or delayed healing.",
         per_visit_price="449",
+        whats_included=[
+            "Wound cleaning",
+            "Dressing of the wound",
+            "Basic wound observation",
+        ],
+        service_details_text=
+        "One home nursing visit.",
+        important_information=
+        "For larger, infected or multiple wounds, use the applicable complex wound dressing "
+        "service."
     ),
     "PKG-A2-02": dict(
         tagline="Suture or staple removal once healing is complete",
         description="A nurse removes stitches or staples once your surgeon has confirmed the "
                      "wound is ready, checking the site is healing well.",
         per_visit_price="499",
+        whats_included=[
+            "Removal of prescribed sutures or staples",
+            "Basic post-procedure guidance",
+        ],
+        service_details_text=
+        "One home visit.",
+        important_information=
+        "Removal must be supported by appropriate medical instructions and timing."
     ),
     "PKG-A2-03": dict(
         tagline="Dressing changes for a post-surgical wound",
         description="Sterile dressing changes for a wound from a recent surgery, with close "
                      "monitoring for infection during the healing period.",
         per_visit_price="599",
+        whats_included=[
+            "Surgical incision assessment",
+            "Wound dressing",
+            "Basic red-flag observation",
+            "Documentation for the family",
+        ],
+        service_details_text=
+        "One home nursing visit.",
+        important_information=
+        "The surgical dressing kit is charged separately when supplied by NurseConnect."
     ),
     "PKG-A2-04": dict(
         tagline="Dressing for a complex or large wound",
@@ -629,48 +766,120 @@ WORKBOOK_PACKAGE_CUSTOMER_COPY: dict[str, dict] = {
                      "irrigation or packing — done by a nurse trained in complex wound "
                      "management.",
         per_visit_price="799",
+        whats_included=[
+            "Assessment of the wound details",
+            "Appropriate dressing support",
+            "Documentation of relevant findings",
+        ],
+        service_details_text=
+        "One home nursing visit.",
+        important_information=
+        "Final service price depends on the wound complexity. Extended dressing materials are "
+        "charged separately based on wound size and requirements."
     ),
     "PKG-A2-05": dict(
         tagline="Bed-sore (pressure ulcer) dressing and care",
         description="Assessment and dressing of a pressure ulcer, along with guidance on "
                      "positioning and skin care to prevent it from worsening.",
         per_visit_price="699",
+        whats_included=[
+            "Pressure-ulcer dressing",
+            "Positioning guidance",
+            "Wound documentation",
+        ],
+        service_details_text=
+        "One home nursing visit.",
+        important_information=
+        "Final pricing depends on wound grade, size and number of wounds. Extended dressing "
+        "materials are charged separately where applicable."
     ),
     "PKG-A2-06": dict(
         tagline="Routine urinary catheter care and hygiene",
         description="Cleaning, hygiene checks and monitoring for an existing urinary catheter "
                      "to prevent infection and keep it functioning properly.",
         per_visit_price="499",
+        whats_included=[
+            "Catheter hygiene care",
+            "Urine-bag check",
+            "Urine-output review",
+            "Caregiver education",
+        ],
+        service_details_text=
+        "One home nursing visit.",
+        important_information=
+        "Catheter replacement is not included."
     ),
     "PKG-A2-07": dict(
         tagline="Safe removal of a urinary catheter",
         description="A trained nurse removes an existing urinary catheter once it's no longer "
                      "needed, and checks you're passing urine normally afterward.",
         per_visit_price="449",
+        whats_included=[
+            "Prescribed urinary catheter removal",
+            "Basic after-care guidance",
+        ],
+        service_details_text=
+        "One home nursing visit.",
+        important_information=
+        "The procedure must be supported by appropriate medical instruction."
     ),
     "PKG-A2-08": dict(
         tagline="Sterile catheter insertion or replacement",
         description="Insertion of a new urinary catheter, or replacement of an existing one, "
                      "using sterile technique by a nurse trained in catheterisation.",
         per_visit_price="799",
+        whats_included=[
+            "Urinary catheter insertion or replacement",
+            "Basic procedure support",
+        ],
+        service_details_text=
+        "One home visit by an approved nurse.",
+        important_information=
+        "A Foley catheter can be supplied separately if required."
     ),
     "PKG-A2-09": dict(
         tagline="Routine care for an existing feeding (Ryles/NG) tube",
         description="Checking placement, cleaning, and feed/medication support for an existing "
                      "nasogastric feeding tube.",
         per_visit_price="549",
+        whats_included=[
+            "Feeding assistance",
+            "Tube-site check",
+            "Tube-care education for the family",
+        ],
+        service_details_text=
+        "One home nursing visit.",
+        important_information=
+        "Tube replacement is not included."
     ),
     "PKG-A2-10": dict(
         tagline="Feeding (Ryles/NG) tube insertion or replacement",
         description="Insertion of a new nasogastric feeding tube, or replacement of an "
                      "existing one, with placement confirmed before use.",
         per_visit_price="899",
+        whats_included=[
+            "NG tube insertion or replacement",
+            "Basic procedure support",
+        ],
+        service_details_text=
+        "One home visit by a specifically trained and assessed nurse.",
+        important_information=
+        "An NG tube can be supplied separately if required."
     ),
     "PKG-A2-11": dict(
         tagline="Stoma care and bag change",
         description="Cleaning around the stoma site, bag change, and skin-integrity checks for "
                      "an ostomy, done by a nurse trained in stoma care.",
         per_visit_price="649",
+        whats_included=[
+            "Stoma observation",
+            "Pouch change",
+            "Family education",
+        ],
+        service_details_text=
+        "One home nursing visit.",
+        important_information=
+        "A stoma bag can be supplied separately if required."
     ),
     # -- Tier 3: post-discharge, recovery & specialised support -------------
     "PKG-A3-01": dict(
@@ -679,18 +888,47 @@ WORKBOOK_PACKAGE_CUSTOMER_COPY: dict[str, dict] = {
                      "medication schedule you need, and briefs your family on what to watch "
                      "for in the first few days home.",
         per_visit_price="999",
+        whats_included=[
+            "Review of discharge instructions",
+            "Medicine review",
+            "Baseline vital checks",
+            "Mobility and fall-risk check",
+            "Home-care plan for the family",
+        ],
+        service_details_text=
+        "One post-discharge nursing visit."
     ),
     "PKG-A3-02": dict(
         tagline="A nursing visit focused on post-surgery recovery",
         description="Vitals checks, wound review and general recovery monitoring by a nurse "
                      "experienced in post-operative care.",
         per_visit_price="1099",
+        whats_included=[
+            "Vital checks",
+            "Wound observation",
+            "Medication-adherence check",
+            "Recovery review",
+        ],
+        service_details_text=
+        "One home nursing visit.",
+        important_information=
+        "Dressing or injection services can be added where applicable."
     ),
     "PKG-A3-03": dict(
         tagline="Close monitoring through the critical first 72 hours home",
         description="Frequent vitals and symptom checks during the highest-risk window right "
                      "after discharge, with clear escalation to a doctor if anything looks off.",
         per_visit_price="1499",
+        whats_included=[
+            "3 nurse visits",
+            "Vital monitoring",
+            "Wound review",
+            "Medicine support",
+            "Mobility review",
+            "Red-flag documentation",
+        ],
+        service_details_text=
+        "One nursing visit each day for three days."
     ),
     "PKG-A3-04": dict(
         tagline="Seven days of daily recovery visits",
@@ -698,12 +936,27 @@ WORKBOOK_PACKAGE_CUSTOMER_COPY: dict[str, dict] = {
                      "medication, and flag any complications early.",
         package_price="8499",
         per_visit_price="1214",
+        whats_included=[
+            "7 scheduled nursing visits",
+            "Close recovery monitoring",
+            "Vital and general condition review",
+        ],
+        service_details_text=
+        "One scheduled nursing visit per day for seven days."
     ),
     "PKG-A3-05": dict(
         tagline="Enhanced recovery support with a wider care team",
         description="A more comprehensive recovery visit that can pull in physiotherapy or "
                      "dietary guidance alongside standard nursing care, coordinated for you.",
         per_visit_price="1899",
+        whats_included=[
+            "Hospital-to-home assessment",
+            "5 nursing visits",
+            "2 physiotherapy sessions",
+            "Family home-care plan",
+        ],
+        service_details_text=
+        "Designed as a coordinated post-hospital recovery package."
     ),
     "PKG-A3-06": dict(
         tagline="Home nursing support during cancer treatment",
@@ -711,6 +964,14 @@ WORKBOOK_PACKAGE_CUSTOMER_COPY: dict[str, dict] = {
                      "medication support and general comfort care from a nurse trained in "
                      "oncology home care.",
         per_visit_price="1699",
+        whats_included=[
+            "Vital checks",
+            "Hydration and intake review",
+            "Symptom documentation",
+            "Escalation guidance",
+        ],
+        service_details_text=
+        "One home nursing visit alongside ongoing oncology care."
     ),
     "PKG-A3-07": dict(
         tagline="Home support for stroke recovery",
@@ -718,6 +979,15 @@ WORKBOOK_PACKAGE_CUSTOMER_COPY: dict[str, dict] = {
                      "mobility, swallowing precautions and rehabilitation exercises alongside "
                      "standard nursing checks.",
         per_visit_price="1599",
+        whats_included=[
+            "Nursing assessment",
+            "Mobility assessment",
+            "Caregiver-needs review",
+            "Transfer-needs review",
+            "Rehabilitation-needs identification",
+        ],
+        service_details_text=
+        "One assessment visit."
     ),
     # -- Tier 3/4: nursing shifts ---------------------------------------------
     "PKG-A4-01": dict(
@@ -725,30 +995,67 @@ WORKBOOK_PACKAGE_CUSTOMER_COPY: dict[str, dict] = {
         description="A qualified nurse stays with the patient for a 4-hour shift, handling "
                      "medication, monitoring and hands-on care as needed.",
         per_visit_price="899",
+        whats_included=[
+            "Prescribed medicine support",
+            "Vital monitoring",
+            "Positioning",
+            "Feeding support",
+            "Permitted nursing procedures",
+        ],
+        service_details_text=
+        "4-hour nursing shift."
     ),
     "PKG-A4-02": dict(
         tagline="8 hours of dedicated nursing care at home",
         description="A qualified nurse stays with the patient for a full 8-hour shift, "
                      "handling medication, monitoring and hands-on care as needed.",
         per_visit_price="1599",
+        whats_included=[
+            "Continuous nursing support during the booked shift",
+            "Assistance with applicable prescribed care and monitoring",
+        ],
+        service_details_text=
+        "8 continuous hours."
     ),
     "PKG-A4-03": dict(
         tagline="12-hour daytime nursing shift",
         description="Continuous daytime nursing coverage — vitals, medication, mobility "
                      "support and monitoring across a 12-hour shift.",
         per_visit_price="2199",
+        whats_included=[
+            "Continuous skilled nursing during the shift",
+            "Applicable prescribed care and monitoring",
+        ],
+        service_details_text=
+        "12-hour daytime shift."
     ),
     "PKG-A4-04": dict(
         tagline="12-hour overnight nursing shift",
         description="Continuous overnight nursing coverage, so the patient and family can rest "
                      "while a qualified nurse handles monitoring and care.",
         per_visit_price="2399",
+        whats_included=[
+            "Continuous overnight nursing support",
+            "Applicable prescribed care and monitoring",
+        ],
+        service_details_text=
+        "12-hour night shift.",
+        important_information=
+        "The listed price includes the night premium."
     ),
     "PKG-A4-05": dict(
         tagline="Round-the-clock nursing coverage",
         description="Continuous 24-hour nursing coverage for patients who need care and "
                      "monitoring at all times, day and night.",
         per_visit_price="4299",
+        whats_included=[
+            "One 12-hour day nursing shift",
+            "One 12-hour night nursing shift",
+            "Continuous coverage across the day and night",
+        ],
+        important_information=
+        "This is provided as two separate 12-hour nurses, not one nurse working continuously for "
+        "24 hours."
     ),
     "PKG-A4-06": dict(
         tagline="A 12-hour nursing shift, every day for a week",
@@ -756,6 +1063,12 @@ WORKBOOK_PACKAGE_CUSTOMER_COPY: dict[str, dict] = {
                      "or high-need care, billed as one weekly plan.",
         package_price="13999",
         per_visit_price="2000",
+        whats_included=[
+            "7 pre-booked 12-hour day shifts",
+            "Scheduled nursing coverage throughout the week",
+        ],
+        service_details_text=
+        "Seven 12-hour daytime nursing shifts."
     ),
     "PKG-A4-07": dict(
         tagline="A 12-hour nursing shift, every day for a month",
@@ -763,6 +1076,12 @@ WORKBOOK_PACKAGE_CUSTOMER_COPY: dict[str, dict] = {
                      "long-term home nursing plan, billed as one monthly package.",
         package_price="54999",
         per_visit_price="1833",
+        whats_included=[
+            "Scheduled 12-hour nursing coverage",
+            "Replacement support for continuity of care",
+        ],
+        service_details_text=
+        "Monthly nursing plan."
     ),
     "PKG-A4-08": dict(
         tagline="High-dependency / ICU step-down nursing at home",
@@ -770,6 +1089,17 @@ WORKBOOK_PACKAGE_CUSTOMER_COPY: dict[str, dict] = {
                      "monitoring of vitals and equipment, with rapid escalation to a doctor if "
                      "needed.",
         per_visit_price="3999",
+        whats_included=[
+            "Specialised nursing support",
+            "Closer patient monitoring",
+            "Support for applicable high-dependency care needs",
+        ],
+        service_details_text=
+        "12-hour nursing shift.",
+        important_information=
+        "This service is intended for tracheostomy, oxygen support, frequent monitoring or "
+        "medically dependent patients. The source specifies that this package should launch only "
+        "once appropriate clinical escalation systems are ready."
     ),
 }
 
@@ -798,6 +1128,9 @@ async def seed_workbook_package_requirements(session) -> int:
             "name": data["name"],
             "tagline": customer_copy.get("tagline", data.get("tagline")),
             "description": customer_copy.get("description", data.get("description")),
+            "whats_included": customer_copy.get("whats_included"),
+            "service_details_text": customer_copy.get("service_details_text"),
+            "important_information": customer_copy.get("important_information"),
             "target_condition": data.get("target_condition"),
             "min_tier": _enum_value(WorkerTier, data.get("min_tier"), WorkerTier.tier2),
             "gender_restriction": GenderRestriction.any,
