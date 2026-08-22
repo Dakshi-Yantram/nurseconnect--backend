@@ -1382,132 +1382,76 @@ async def seed_assessment_modules(session) -> int:
 FAQS = [
     dict(
         audience="consumer", category="Bookings", question="How do I book a nurse?",
-        answer=(
-            "Tap 'Book care' on your Home tab (or the medical-bag icon from Home), then choose "
-            "a care package that matches what you need — anything from a one-off vitals check to "
-            "a multi-day recovery plan. Pick the patient, add or select a service address, and "
-            "choose a date and time. Once you confirm and pay, we start matching you with a "
-            "verified nurse nearby, and you'll see their name and photo on the booking as soon "
-            "as one accepts."
-        ),
+        answer="Go to Bookings → New Booking and fill in the details.",
         display_order=1,
     ),
     dict(
         audience="consumer", category="Bookings", question="Can I cancel a booking?",
         answer=(
-            "Yes. Open the booking from your Visits tab and tap 'Cancel booking'. Cancelling "
-            "more than 6 hours before the scheduled visit gets you a full refund of anything "
-            "already paid; cancelling closer to the visit time may be subject to a partial "
-            "cancellation fee, which is shown to you before you confirm. If a nurse hasn't been "
-            "assigned yet, you can cancel anytime with no charge."
+            "Yes, from your Visits tab. Cancel 6+ hours before the visit for a full refund; "
+            "closer to visit time a partial fee may apply."
         ),
         display_order=2,
     ),
     dict(
         audience="consumer", category="Patients", question="How do I add a patient?",
-        answer=(
-            "Go to Profile → Patients → Add patient, and fill in their name, age, gender and any "
-            "relevant medical notes (conditions, allergies, mobility needs). You can add more "
-            "than one patient — for example, yourself and an elderly parent — and choose who "
-            "you're booking care for each time you make a new booking. Keeping this up to date "
-            "helps us match you with a nurse who has the right skills for that patient."
-        ),
+        answer="Go to Profile → Patients → Add patient and fill in their details.",
         display_order=3,
     ),
     dict(
         audience="consumer", category="Trust & Safety", question="How are nurses verified?",
         answer=(
-            "Every nurse and caregiver on NurseConnect goes through identity verification, "
-            "background checks, and document checks (nursing licence/registration where "
-            "applicable) before they can accept a single booking. They're also tiered by skill "
-            "level — only nurses who've passed the relevant clinical training and assessment for "
-            "a given care package are allowed to claim it, so a complex wound-care visit only "
-            "goes to someone qualified for complex wound care."
+            "Every nurse passes identity, background, and document checks, and is tiered by "
+            "skill level for the care they're allowed to take."
         ),
         display_order=4,
     ),
     dict(
         audience="consumer", category="Bookings", question="How do I contact my nurse?",
-        answer=(
-            "Once a nurse has accepted your visit, open the booking from your Visits tab — "
-            "you'll see a chat and call button there. Messages and calls go through the app, so "
-            "your personal phone number stays private. If you can't reach your nurse and the "
-            "visit time is approaching, use Help & support to raise it with our team right away."
-        ),
+        answer="Open the booking in Visits — chat and call buttons are right there.",
         display_order=5,
     ),
     dict(
         audience="consumer", category="Billing", question="What payment methods are accepted?",
-        answer=(
-            "We accept UPI, debit/credit cards, net banking, and popular wallets, all processed "
-            "securely through Razorpay — NurseConnect never sees or stores your card or UPI "
-            "details. Payment is collected once you confirm a booking, and a nurse is only "
-            "dispatched to you after that payment succeeds. You can find receipts for every "
-            "payment under Profile → Payments."
-        ),
+        answer="UPI, cards, net banking, and wallets, securely via Razorpay.",
         display_order=6,
     ),
     dict(
         audience="consumer", category="Billing", question="What if I'm not happy with a visit?",
-        answer=(
-            "Rate the visit and tell us what went wrong from your Visits tab once it's marked "
-            "complete, or raise a request from Help & support at any time. Our team reviews "
-            "every complaint and can arrange a repeat visit, a partial or full refund, or "
-            "further action against the nurse, depending on what happened."
-        ),
+        answer="Rate the visit or raise a request from Help & support — our team will follow up.",
         display_order=7,
     ),
     dict(
         audience="worker", category="Assignments", question="How do I claim a booking?",
-        answer=(
-            "Open Assignments and tap 'Claim' on any open booking that matches your tier and "
-            "location. Claims are first-come, first-served, so bookings can go quickly — turn on "
-            "notifications so you're alerted the moment a new one is posted near you. Once "
-            "you've claimed it, the booking moves to your dashboard with the patient's address "
-            "and visit details."
-        ),
+        answer="Open Assignments and tap Claim on any booking matching your tier and location.",
         display_order=1,
     ),
     dict(
         audience="worker", category="Training", question="Why can't I claim higher-tier bookings?",
         answer=(
-            "Higher-tier and specialised bookings (for example, wound care, IV therapy, or "
-            "post-op shifts) require you to complete the matching training module and pass its "
-            "assessment first — this protects patients and keeps NurseConnect's care quality "
-            "consistent. Go to Training & Certifications from your profile to see exactly which "
-            "modules unlock which bookings, and to start the next one."
+            "Complete the matching training module and pass its assessment first — see "
+            "Training & Certifications on your profile."
         ),
         display_order=2,
     ),
     dict(
         audience="worker", category="Payments", question="When do I get paid?",
-        answer=(
-            "Payouts are processed in batches after each visit is marked complete and reviewed, "
-            "typically settling to your linked bank account within a few business days. Go to "
-            "Earnings to see a running total, the status of each payout (pending, processed, or "
-            "paid), and a full history you can use for your own records."
-        ),
+        answer="After each visit is reviewed, usually within a few business days. See Earnings.",
         display_order=3,
     ),
     dict(
         audience="worker", category="Account", question="How do I go online/offline?",
         answer=(
-            "Use the availability toggle on your home screen — switch it on when you're ready to "
-            "receive bookings, and off when you're not. You'll only be able to go online once "
-            "your account has been fully approved (identity, documents, and any required "
-            "training verified); until then the toggle stays locked and your onboarding status "
-            "screen will tell you what's still pending."
+            "Use the availability toggle on your home screen. Unlocks once your account is "
+            "fully approved."
         ),
         display_order=4,
     ),
     dict(
         audience="all", category="Account", question="How do I reset my password?",
         answer=(
-            "On the sign-in screen, tap 'Forgot password?' and enter the email linked to your "
-            "account. We'll send a reset code to that email — enter it along with a new password "
-            "to regain access. If you signed in with a mobile OTP instead of a password, use "
-            "'Sign in with a mobile code' on the sign-in screen and you won't need a password at "
-            "all."
+            "Tap 'Forgot password?' on sign-in and enter your email for a reset code. OTP "
+            "users don't need a password at all."
         ),
         display_order=1,
     ),
