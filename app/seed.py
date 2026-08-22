@@ -5,10 +5,14 @@ Seeds are idempotent: re-running never creates duplicates.
 """
 import asyncio
 import sys
+import uuid
 from decimal import Decimal
 
 from app.core.database import AsyncSessionLocal, engine, Base
-from app.models.models import ServiceCatalogue, CarePackage, TrainingModule, AssessmentModule, Faq
+from app.models.models import (
+    ServiceCatalogue, CarePackage, TrainingModule, AssessmentModule, Faq,
+    ChecklistTemplate,
+)
 from app.models.enums import (
     ServiceCategory,
     WorkerTier,
@@ -16,6 +20,14 @@ from app.models.enums import (
     ContentStatus,
     GenderRestriction,
     VisitFrequency,
+    ChecklistPhase,
+    QualificationGate,
+)
+from app.seed_question_bank import (
+    GENERATED_ASSESSMENT_MODULES,
+    GENERATED_COMPETENCIES_BY_ID,
+    GENERATED_PACKAGE_REQUIREMENTS,
+    GENERATED_TRAINING_MODULES,
 )
 from sqlalchemy import select
 
@@ -269,6 +281,205 @@ async def link_package_services(session) -> int:
     return linked
 
 
+# ---------------------------------------------------------------------------
+# In-visit questionnaires (ChecklistTemplate) — previously missing entirely,
+# which left the nurse's in-visit questionnaire screen blank for every
+# service/package. Seeded here + linked onto the matching ServiceCatalogue
+# rows via link_service_checklists() below, which (unlike seed_services)
+# updates already-existing rows so this works on a DB that was seeded
+# before this fix shipped.
+# ---------------------------------------------------------------------------
+CHECKLIST_TEMPLATES = [
+    dict(
+        code="CHK-WOUND-DRESSING-V1",
+        name="Wound Dressing — Visit Questionnaire",
+        service_codes=["WOUND_DRESSING"],
+        # Post-op recovery visits also involve wound checks, so reuse this
+        # checklist for that package until/unless a dedicated post-op
+        # checklist is created.
+        package_codes=["POST_OP_7D"],
+        phase=ChecklistPhase.during_visit,
+        questions=[
+            {
+                "id": "wound_photo_captured",
+                "type": "photo",
+                "text": "Photo of the wound before dressing",
+                "required": True,
+                "phase": "during_visit",
+            },
+            {
+                "id": "wound_condition",
+                "type": "single_select",
+                "text": "Current wound condition",
+                "options": ["Healing well", "No change", "Signs of infection", "Worsening"],
+                "required": True,
+                "phase": "during_visit",
+            },
+            {
+                "id": "pain_level",
+                "type": "number",
+                "text": "Patient-reported pain level (0–10)",
+                "required": True,
+                "phase": "during_visit",
+            },
+            {
+                "id": "dressing_type_used",
+                "type": "text",
+                "text": "Dressing material used",
+                "required": True,
+                "phase": "during_visit",
+            },
+            {
+                "id": "signs_of_infection_notes",
+                "type": "textarea",
+                "text": "Notes on any signs of infection (redness, discharge, odour, swelling)",
+                "required": False,
+                "phase": "during_visit",
+            },
+            {
+                "id": "photo_after_dressing",
+                "type": "photo",
+                "text": "Photo of the wound after fresh dressing applied",
+                "required": True,
+                "phase": "post_visit",
+            },
+            {
+                "id": "patient_consent",
+                "type": "consent_confirmation",
+                "text": "Patient/family consented to the procedure and photos",
+                "required": True,
+                "phase": "pre_visit",
+            },
+        ],
+    ),
+    dict(
+        code="CHK-VITALS-CHECK-V1",
+        name="Vitals Monitoring — Visit Questionnaire",
+        service_codes=["VITALS_CHECK"],
+        phase=ChecklistPhase.during_visit,
+        questions=[
+            {
+                "id": "vitals_reading",
+                "type": "vitals_entry",
+                "text": "Record vitals (BP, pulse, SpO2, temperature, blood sugar)",
+                "required": True,
+                "phase": "during_visit",
+            },
+            {
+                "id": "vitals_notes",
+                "type": "textarea",
+                "text": "Any observations to flag for the care team",
+                "required": False,
+                "phase": "during_visit",
+            },
+            {
+                "id": "patient_consent",
+                "type": "consent_confirmation",
+                "text": "Patient/family consented to the check",
+                "required": True,
+                "phase": "pre_visit",
+            },
+        ],
+    ),
+]
+
+
+async def seed_checklist_templates(session) -> int:
+    """Create the ChecklistTemplate rows themselves (idempotent by code)."""
+    created = 0
+    for data in CHECKLIST_TEMPLATES:
+        exists = await session.execute(
+            select(ChecklistTemplate).where(ChecklistTemplate.code == data["code"])
+        )
+        if exists.scalar_one_or_none():
+            print(f"  · checklist template {data['code']} already exists, skipping")
+            continue
+        session.add(ChecklistTemplate(
+            code=data["code"],
+            name=data["name"],
+            service_codes=data["service_codes"],
+            phase=data["phase"],
+            version=1,
+            is_active=True,
+            status=ContentStatus.published,
+            questions=data["questions"],
+        ))
+        created += 1
+        print(f"  + created checklist template {data['code']}")
+    return created
+
+
+async def link_service_checklists(session) -> int:
+    """Point ServiceCatalogue.checklist_template_id at the matching template.
+
+    Unlike seed_services(), this DOES touch already-existing service rows —
+    that's the whole point, since production already has WOUND_DRESSING /
+    VITALS_CHECK seeded from before this fix existed. Never overwrites a
+    checklist_template_id an admin already set some other way.
+    """
+    linked = 0
+    for data in CHECKLIST_TEMPLATES:
+        tres = await session.execute(
+            select(ChecklistTemplate).where(ChecklistTemplate.code == data["code"])
+        )
+        template = tres.scalar_one_or_none()
+        if not template:
+            continue
+        for service_code in data["service_codes"]:
+            sres = await session.execute(
+                select(ServiceCatalogue).where(ServiceCatalogue.service_code == service_code)
+            )
+            service = sres.scalar_one_or_none()
+            if not service:
+                print(f"  ! service {service_code} not found — cannot link checklist {data['code']}")
+                continue
+            if service.checklist_template_id:
+                print(f"  · service {service_code} already has a checklist template linked, skipping")
+                continue
+            service.checklist_template_id = template.id
+            linked += 1
+            print(f"  + linked service {service_code} -> checklist {data['code']}")
+    return linked
+
+
+async def link_package_checklists(session) -> int:
+    """Point CarePackage.checklist_template_id at the matching template.
+
+    Mirrors link_service_checklists() but for care packages. Packages route
+    through their own checklist_template_id independently of any service
+    they're built on top of (see resolve_workflow_for_booking), so a
+    package's questionnaire has to be linked here explicitly — it is NOT
+    inherited from its primary_service automatically. Never overwrites a
+    checklist_template_id an admin already set some other way.
+    """
+    linked = 0
+    for data in CHECKLIST_TEMPLATES:
+        package_codes = data.get("package_codes") or []
+        if not package_codes:
+            continue
+        tres = await session.execute(
+            select(ChecklistTemplate).where(ChecklistTemplate.code == data["code"])
+        )
+        template = tres.scalar_one_or_none()
+        if not template:
+            continue
+        for package_code in package_codes:
+            pres = await session.execute(
+                select(CarePackage).where(CarePackage.package_code == package_code)
+            )
+            package = pres.scalar_one_or_none()
+            if not package:
+                print(f"  ! package {package_code} not found — cannot link checklist {data['code']}")
+                continue
+            if package.checklist_template_id:
+                print(f"  · package {package_code} already has a checklist template linked, skipping")
+                continue
+            package.checklist_template_id = template.id
+            linked += 1
+            print(f"  + linked package {package_code} -> checklist {data['code']}")
+    return linked
+
+
 async def seed_services(session) -> int:
     created = 0
     for data in SERVICES:
@@ -297,6 +508,354 @@ async def seed_packages(session) -> int:
         created += 1
         print(f"  + created package {data['package_code']}")
     return created
+
+
+def _enum_value(enum_cls, value, default):
+    try:
+        return enum_cls(value)
+    except ValueError:
+        return default
+
+
+# ---------------------------------------------------------------------------
+# Customer-facing copy + pricing for the workbook-generated packages.
+#
+# GENERATED_PACKAGE_REQUIREMENTS (seed_question_bank.py) was produced straight
+# from the nurse-qualification workbook: every package's tagline/description
+# came out as "Care package seeded from the NurseConnect workbook.
+# Eligibility: Pass Test A + Test B2 (IV)." and package_price/per_visit_price
+# were left at "0". That's internal gating language, not something a customer
+# booking care should ever see — and a free care package isn't real. This
+# table overrides just the customer-facing fields (tagline, description,
+# price) per package_code; everything else — the training/assessment/
+# competency requirements used to gate which nurses can claim it — is left
+# alone and still comes from the generated data below.
+# ---------------------------------------------------------------------------
+WORKBOOK_PACKAGE_CUSTOMER_COPY: dict[str, dict] = {
+    # -- Tier 1: single-visit injections, IV access & infusions -------------
+    "PKG-A1-01": dict(
+        tagline="A quick check of vitals and general condition",
+        description="A single visit to check blood pressure, pulse, temperature, oxygen "
+                     "levels and blood sugar, with a summary of what was found.",
+        per_visit_price="299",
+    ),
+    "PKG-A1-02": dict(
+        tagline="One prescribed injection, given at home",
+        description="A nurse visits to administer a single prescribed intramuscular or "
+                     "subcutaneous injection safely at home.",
+        per_visit_price="299",
+    ),
+    "PKG-A1-03": dict(
+        tagline="Insulin administration for diabetes management",
+        description="A nurse administers your prescribed insulin dose and can check blood "
+                     "sugar in the same visit if needed.",
+        per_visit_price="329",
+    ),
+    "PKG-A1-04": dict(
+        tagline="Two prescribed injections in a single visit",
+        description="For when you have two separate injections prescribed at the same time — "
+                     "both are administered safely in one visit.",
+        per_visit_price="449",
+    ),
+    "PKG-A1-05": dict(
+        tagline="Fertility treatment hormonal injections",
+        description="A nurse trained in fertility-treatment protocols administers your "
+                     "prescribed hormonal injection at home, on your treatment schedule.",
+        per_visit_price="499",
+    ),
+    "PKG-A1-06": dict(
+        tagline="IV antibiotic administration at home",
+        description="A nurse administers a prescribed antibiotic through an existing IV line "
+                     "and monitors you for the duration of the infusion.",
+        per_visit_price="599",
+    ),
+    "PKG-A1-07": dict(
+        tagline="IV cannula placed or removed by a trained nurse",
+        description="Sterile insertion of an IV cannula (for future medication or fluids) or "
+                     "safe removal of an existing one, done at home.",
+        per_visit_price="449",
+    ),
+    "PKG-A1-08": dict(
+        tagline="A short IV infusion, up to one hour",
+        description="Prescribed IV fluids or medication administered and monitored at home for "
+                     "infusions lasting up to an hour.",
+        per_visit_price="599",
+    ),
+    "PKG-A1-09": dict(
+        tagline="A longer IV infusion, 1 to 3 hours",
+        description="Prescribed IV fluids or medication administered and monitored at home, "
+                     "with the nurse staying for the full 1–3 hour infusion.",
+        per_visit_price="999",
+    ),
+    "PKG-A1-10": dict(
+        tagline="An extended IV infusion, 3 to 6 hours",
+        description="For longer prescribed infusions — the nurse stays for the full 3–6 hours, "
+                     "monitoring your vitals and the infusion site throughout.",
+        per_visit_price="1699",
+    ),
+    "PKG-A1-11": dict(
+        tagline="Nebuliser therapy for breathing relief",
+        description="A nurse sets up and supervises a prescribed nebuliser session to help "
+                     "with breathing difficulty, wheezing or congestion.",
+        per_visit_price="349",
+    ),
+    "PKG-A1-12": dict(
+        tagline="Enema administration by a trained nurse",
+        description="A prescribed enema is administered safely and hygienically at home.",
+        per_visit_price="399",
+    ),
+    # -- Tier 2: wound, catheter, tube & stoma care --------------------------
+    "PKG-A2-01": dict(
+        tagline="Routine wound cleaning and dressing",
+        description="Sterile cleaning and re-dressing of a straightforward wound, with the "
+                     "nurse checking for signs of infection or delayed healing.",
+        per_visit_price="449",
+    ),
+    "PKG-A2-02": dict(
+        tagline="Suture or staple removal once healing is complete",
+        description="A nurse removes stitches or staples once your surgeon has confirmed the "
+                     "wound is ready, checking the site is healing well.",
+        per_visit_price="499",
+    ),
+    "PKG-A2-03": dict(
+        tagline="Dressing changes for a post-surgical wound",
+        description="Sterile dressing changes for a wound from a recent surgery, with close "
+                     "monitoring for infection during the healing period.",
+        per_visit_price="599",
+    ),
+    "PKG-A2-04": dict(
+        tagline="Dressing for a complex or large wound",
+        description="For wounds needing more involved care — larger dressings, wound "
+                     "irrigation or packing — done by a nurse trained in complex wound "
+                     "management.",
+        per_visit_price="799",
+    ),
+    "PKG-A2-05": dict(
+        tagline="Bed-sore (pressure ulcer) dressing and care",
+        description="Assessment and dressing of a pressure ulcer, along with guidance on "
+                     "positioning and skin care to prevent it from worsening.",
+        per_visit_price="699",
+    ),
+    "PKG-A2-06": dict(
+        tagline="Routine urinary catheter care and hygiene",
+        description="Cleaning, hygiene checks and monitoring for an existing urinary catheter "
+                     "to prevent infection and keep it functioning properly.",
+        per_visit_price="499",
+    ),
+    "PKG-A2-07": dict(
+        tagline="Safe removal of a urinary catheter",
+        description="A trained nurse removes an existing urinary catheter once it's no longer "
+                     "needed, and checks you're passing urine normally afterward.",
+        per_visit_price="449",
+    ),
+    "PKG-A2-08": dict(
+        tagline="Sterile catheter insertion or replacement",
+        description="Insertion of a new urinary catheter, or replacement of an existing one, "
+                     "using sterile technique by a nurse trained in catheterisation.",
+        per_visit_price="799",
+    ),
+    "PKG-A2-09": dict(
+        tagline="Routine care for an existing feeding (Ryles/NG) tube",
+        description="Checking placement, cleaning, and feed/medication support for an existing "
+                     "nasogastric feeding tube.",
+        per_visit_price="549",
+    ),
+    "PKG-A2-10": dict(
+        tagline="Feeding (Ryles/NG) tube insertion or replacement",
+        description="Insertion of a new nasogastric feeding tube, or replacement of an "
+                     "existing one, with placement confirmed before use.",
+        per_visit_price="899",
+    ),
+    "PKG-A2-11": dict(
+        tagline="Stoma care and bag change",
+        description="Cleaning around the stoma site, bag change, and skin-integrity checks for "
+                     "an ostomy, done by a nurse trained in stoma care.",
+        per_visit_price="649",
+    ),
+    # -- Tier 3: post-discharge, recovery & specialised support -------------
+    "PKG-A3-01": dict(
+        tagline="One-time setup visit when you first come home",
+        description="A nurse reviews your discharge summary, sets up any equipment or "
+                     "medication schedule you need, and briefs your family on what to watch "
+                     "for in the first few days home.",
+        per_visit_price="999",
+    ),
+    "PKG-A3-02": dict(
+        tagline="A nursing visit focused on post-surgery recovery",
+        description="Vitals checks, wound review and general recovery monitoring by a nurse "
+                     "experienced in post-operative care.",
+        per_visit_price="1099",
+    ),
+    "PKG-A3-03": dict(
+        tagline="Close monitoring through the critical first 72 hours home",
+        description="Frequent vitals and symptom checks during the highest-risk window right "
+                     "after discharge, with clear escalation to a doctor if anything looks off.",
+        per_visit_price="1499",
+    ),
+    "PKG-A3-04": dict(
+        tagline="Seven days of daily recovery visits",
+        description="A nurse visits daily for a week to monitor recovery, manage wound care or "
+                     "medication, and flag any complications early.",
+        package_price="8499",
+        per_visit_price="1214",
+    ),
+    "PKG-A3-05": dict(
+        tagline="Enhanced recovery support with a wider care team",
+        description="A more comprehensive recovery visit that can pull in physiotherapy or "
+                     "dietary guidance alongside standard nursing care, coordinated for you.",
+        per_visit_price="1899",
+    ),
+    "PKG-A3-06": dict(
+        tagline="Home nursing support during cancer treatment",
+        description="Support around chemotherapy or radiation cycles — symptom monitoring, "
+                     "medication support and general comfort care from a nurse trained in "
+                     "oncology home care.",
+        per_visit_price="1699",
+    ),
+    "PKG-A3-07": dict(
+        tagline="Home support for stroke recovery",
+        description="Assessment and hands-on support for a stroke patient at home, covering "
+                     "mobility, swallowing precautions and rehabilitation exercises alongside "
+                     "standard nursing checks.",
+        per_visit_price="1599",
+    ),
+    # -- Tier 3/4: nursing shifts ---------------------------------------------
+    "PKG-A4-01": dict(
+        tagline="4 hours of dedicated nursing care at home",
+        description="A qualified nurse stays with the patient for a 4-hour shift, handling "
+                     "medication, monitoring and hands-on care as needed.",
+        per_visit_price="899",
+    ),
+    "PKG-A4-02": dict(
+        tagline="8 hours of dedicated nursing care at home",
+        description="A qualified nurse stays with the patient for a full 8-hour shift, "
+                     "handling medication, monitoring and hands-on care as needed.",
+        per_visit_price="1599",
+    ),
+    "PKG-A4-03": dict(
+        tagline="12-hour daytime nursing shift",
+        description="Continuous daytime nursing coverage — vitals, medication, mobility "
+                     "support and monitoring across a 12-hour shift.",
+        per_visit_price="2199",
+    ),
+    "PKG-A4-04": dict(
+        tagline="12-hour overnight nursing shift",
+        description="Continuous overnight nursing coverage, so the patient and family can rest "
+                     "while a qualified nurse handles monitoring and care.",
+        per_visit_price="2399",
+    ),
+    "PKG-A4-05": dict(
+        tagline="Round-the-clock nursing coverage",
+        description="Continuous 24-hour nursing coverage for patients who need care and "
+                     "monitoring at all times, day and night.",
+        per_visit_price="4299",
+    ),
+    "PKG-A4-06": dict(
+        tagline="A 12-hour nursing shift, every day for a week",
+        description="Seven consecutive days of 12-hour nursing shifts for sustained recovery "
+                     "or high-need care, billed as one weekly plan.",
+        package_price="13999",
+        per_visit_price="2000",
+    ),
+    "PKG-A4-07": dict(
+        tagline="A 12-hour nursing shift, every day for a month",
+        description="Thirty consecutive days of 12-hour nursing shifts — our most comprehensive "
+                     "long-term home nursing plan, billed as one monthly package.",
+        package_price="54999",
+        per_visit_price="1833",
+    ),
+    "PKG-A4-08": dict(
+        tagline="High-dependency / ICU step-down nursing at home",
+        description="Critical-care-trained nursing for patients stepping down from ICU — close "
+                     "monitoring of vitals and equipment, with rapid escalation to a doctor if "
+                     "needed.",
+        per_visit_price="3999",
+    ),
+}
+
+
+async def seed_workbook_package_requirements(session) -> int:
+    """Upsert care packages from the workbook's grouped package mapping.
+
+    The source sheet has many rows per package because it maps each package to
+    many questions and competencies. Keeping that shape in application code is
+    hard to read, so seed_question_bank.py groups each package into one record
+    with required module codes, assessment codes, question IDs, and competency
+    IDs.
+
+    Customer-facing copy and pricing come from WORKBOOK_PACKAGE_CUSTOMER_COPY
+    above rather than the raw generated data — see the comment on that table
+    for why.
+    """
+    changed = 0
+    for data in GENERATED_PACKAGE_REQUIREMENTS:
+        res = await session.execute(
+            select(CarePackage).where(CarePackage.package_code == data["package_code"])
+        )
+        package = res.scalar_one_or_none()
+        customer_copy = WORKBOOK_PACKAGE_CUSTOMER_COPY.get(data["package_code"], {})
+        payload = {
+            "name": data["name"],
+            "tagline": customer_copy.get("tagline", data.get("tagline")),
+            "description": customer_copy.get("description", data.get("description")),
+            "target_condition": data.get("target_condition"),
+            "min_tier": _enum_value(WorkerTier, data.get("min_tier"), WorkerTier.tier2),
+            "gender_restriction": GenderRestriction.any,
+            "visit_frequency": _enum_value(
+                VisitFrequency,
+                data.get("visit_frequency"),
+                VisitFrequency.as_needed,
+            ),
+            "visits_per_cycle": data.get("visits_per_cycle") or 1,
+            "cycle_duration_days": data.get("cycle_duration_days") or 1,
+            "package_price": Decimal(str(
+                customer_copy.get("package_price", data.get("package_price")) or "0"
+            )),
+            "per_visit_price": Decimal(str(
+                customer_copy.get("per_visit_price", data.get("per_visit_price")) or "0"
+            )),
+            "subsidy_eligible": bool(data.get("subsidy_eligible")),
+            "commission_pct": Decimal(str(data.get("commission_pct") or "20")),
+            "requires_prescription": bool(data.get("requires_prescription")),
+            "insurance_covered": bool(data.get("insurance_covered", True)),
+            "gate": _enum_value(
+                QualificationGate,
+                data.get("gate"),
+                QualificationGate.theory_verified,
+            ),
+            "required_training_module_codes": data.get("required_training_module_codes") or [],
+            "required_assessment_codes": data.get("required_assessment_codes") or [],
+            # Store workbook competency IDs as specialty tags for reporting/search
+            # without making them a hard qualification blocker.
+            "required_specialty_tags": data.get("workbook_competency_ids") or [],
+            "practical_checklist_items": [
+                competency["description"]
+                for competency_id in data.get("workbook_competency_ids", [])
+                if (
+                    (competency := GENERATED_COMPETENCIES_BY_ID.get(competency_id))
+                    and competency.get("practical_assessment") == "Mandatory"
+                    and competency.get("description")
+                )
+            ][:20],
+            "is_active": True,
+        }
+        if package is None:
+            session.add(CarePackage(package_code=data["package_code"], **payload))
+            changed += 1
+            print(f"  + created workbook package {data['package_code']}")
+            continue
+
+        updated = False
+        for key, value in payload.items():
+            if getattr(package, key) != value:
+                setattr(package, key, value)
+                updated = True
+        if updated:
+            changed += 1
+            print(f"  + updated workbook package {data['package_code']}")
+        else:
+            print(f"  · workbook package {data['package_code']} already up to date")
+    return changed
 
 
 # ---------------------------------------------------------------------------
@@ -768,7 +1327,8 @@ TRAINING_MODULES = [
 async def seed_training_modules(session) -> int:
     """Seed training modules with MCQ questions — idempotent."""
     created = 0
-    for data in TRAINING_MODULES:
+    for source in [*TRAINING_MODULES, *GENERATED_TRAINING_MODULES]:
+        data = dict(source)
         exists = await session.execute(
             select(TrainingModule).where(TrainingModule.code == data["code"])
         )
@@ -790,29 +1350,167 @@ async def seed_training_modules(session) -> int:
     return created
 
 
+async def seed_assessment_modules(session) -> int:
+    """Seed workbook assessment modules grouped from Questionnaire to Package."""
+    created = 0
+    for source in GENERATED_ASSESSMENT_MODULES:
+        data = dict(source)
+        exists = await session.execute(
+            select(AssessmentModule).where(AssessmentModule.code == data["code"])
+        )
+        if exists.scalar_one_or_none():
+            print(f"  · assessment module {data['code']} already exists, skipping")
+            continue
+        session.add(AssessmentModule(
+            code=data["code"],
+            title=data["title"],
+            description=data.get("description"),
+            pass_score=data.get("pass_score", 80),
+            questions=data.get("questions") or [],
+            linked_training_module_code=data.get("linked_training_module_code"),
+            questions_per_attempt=data.get("questions_per_attempt"),
+            status=ContentStatus.published,
+            is_active=True,
+            version=1,
+            published_version=1,
+        ))
+        created += 1
+        print(f"  + created assessment module {data['code']}")
+    return created
+
+
 FAQS = [
-    dict(audience="consumer", category="Bookings", question="How do I book a nurse?",
-         answer="Go to Bookings → New Booking and fill in the details.", display_order=1),
-    dict(audience="consumer", category="Bookings", question="Can I cancel a booking?",
-         answer="Yes, you can cancel up to 2 hours before the scheduled time.", display_order=2),
-    dict(audience="consumer", category="Patients", question="How do I add a patient?",
-         answer="Go to Patients → Add Patient and fill in the form.", display_order=3),
-    dict(audience="consumer", category="Trust & Safety", question="How are nurses verified?",
-         answer="All nurses are background-checked and licensed before onboarding.", display_order=4),
-    dict(audience="consumer", category="Bookings", question="How do I contact my nurse?",
-         answer="Open your booking and use the in-app message button to reach your nurse once they've accepted the visit.", display_order=5),
-    dict(audience="consumer", category="Billing", question="What payment methods are accepted?",
-         answer="Cards, UPI, and net banking via Razorpay. Payment is collected after you confirm a booking.", display_order=6),
-    dict(audience="worker", category="Assignments", question="How do I claim a booking?",
-         answer="Open Assignments and tap Claim on any open booking. The first nurse to claim wins it — claims are first-come, first-served.", display_order=1),
-    dict(audience="worker", category="Training", question="Why can't I claim higher-tier bookings?",
-         answer="Higher-tier and specialised bookings require passing the relevant training assessment first. Check Training & Certifications for what's required.", display_order=2),
-    dict(audience="worker", category="Payments", question="When do I get paid?",
-         answer="Payouts are processed in batches after a visit is marked complete. Check Earnings for your payout history and status.", display_order=3),
-    dict(audience="worker", category="Account", question="How do I go online/offline?",
-         answer="Use the availability toggle on your home screen. You must be an approved nurse/caregiver to go online.", display_order=4),
-    dict(audience="all", category="Account", question="How do I reset my password?",
-         answer="Use 'Forgot password' on the login screen — you'll get a reset code by email.", display_order=1),
+    dict(
+        audience="consumer", category="Bookings", question="How do I book a nurse?",
+        answer=(
+            "Tap 'Book care' on your Home tab (or the medical-bag icon from Home), then choose "
+            "a care package that matches what you need — anything from a one-off vitals check to "
+            "a multi-day recovery plan. Pick the patient, add or select a service address, and "
+            "choose a date and time. Once you confirm and pay, we start matching you with a "
+            "verified nurse nearby, and you'll see their name and photo on the booking as soon "
+            "as one accepts."
+        ),
+        display_order=1,
+    ),
+    dict(
+        audience="consumer", category="Bookings", question="Can I cancel a booking?",
+        answer=(
+            "Yes. Open the booking from your Visits tab and tap 'Cancel booking'. Cancelling "
+            "more than 6 hours before the scheduled visit gets you a full refund of anything "
+            "already paid; cancelling closer to the visit time may be subject to a partial "
+            "cancellation fee, which is shown to you before you confirm. If a nurse hasn't been "
+            "assigned yet, you can cancel anytime with no charge."
+        ),
+        display_order=2,
+    ),
+    dict(
+        audience="consumer", category="Patients", question="How do I add a patient?",
+        answer=(
+            "Go to Profile → Patients → Add patient, and fill in their name, age, gender and any "
+            "relevant medical notes (conditions, allergies, mobility needs). You can add more "
+            "than one patient — for example, yourself and an elderly parent — and choose who "
+            "you're booking care for each time you make a new booking. Keeping this up to date "
+            "helps us match you with a nurse who has the right skills for that patient."
+        ),
+        display_order=3,
+    ),
+    dict(
+        audience="consumer", category="Trust & Safety", question="How are nurses verified?",
+        answer=(
+            "Every nurse and caregiver on NurseConnect goes through identity verification, "
+            "background checks, and document checks (nursing licence/registration where "
+            "applicable) before they can accept a single booking. They're also tiered by skill "
+            "level — only nurses who've passed the relevant clinical training and assessment for "
+            "a given care package are allowed to claim it, so a complex wound-care visit only "
+            "goes to someone qualified for complex wound care."
+        ),
+        display_order=4,
+    ),
+    dict(
+        audience="consumer", category="Bookings", question="How do I contact my nurse?",
+        answer=(
+            "Once a nurse has accepted your visit, open the booking from your Visits tab — "
+            "you'll see a chat and call button there. Messages and calls go through the app, so "
+            "your personal phone number stays private. If you can't reach your nurse and the "
+            "visit time is approaching, use Help & support to raise it with our team right away."
+        ),
+        display_order=5,
+    ),
+    dict(
+        audience="consumer", category="Billing", question="What payment methods are accepted?",
+        answer=(
+            "We accept UPI, debit/credit cards, net banking, and popular wallets, all processed "
+            "securely through Razorpay — NurseConnect never sees or stores your card or UPI "
+            "details. Payment is collected once you confirm a booking, and a nurse is only "
+            "dispatched to you after that payment succeeds. You can find receipts for every "
+            "payment under Profile → Payments."
+        ),
+        display_order=6,
+    ),
+    dict(
+        audience="consumer", category="Billing", question="What if I'm not happy with a visit?",
+        answer=(
+            "Rate the visit and tell us what went wrong from your Visits tab once it's marked "
+            "complete, or raise a request from Help & support at any time. Our team reviews "
+            "every complaint and can arrange a repeat visit, a partial or full refund, or "
+            "further action against the nurse, depending on what happened."
+        ),
+        display_order=7,
+    ),
+    dict(
+        audience="worker", category="Assignments", question="How do I claim a booking?",
+        answer=(
+            "Open Assignments and tap 'Claim' on any open booking that matches your tier and "
+            "location. Claims are first-come, first-served, so bookings can go quickly — turn on "
+            "notifications so you're alerted the moment a new one is posted near you. Once "
+            "you've claimed it, the booking moves to your dashboard with the patient's address "
+            "and visit details."
+        ),
+        display_order=1,
+    ),
+    dict(
+        audience="worker", category="Training", question="Why can't I claim higher-tier bookings?",
+        answer=(
+            "Higher-tier and specialised bookings (for example, wound care, IV therapy, or "
+            "post-op shifts) require you to complete the matching training module and pass its "
+            "assessment first — this protects patients and keeps NurseConnect's care quality "
+            "consistent. Go to Training & Certifications from your profile to see exactly which "
+            "modules unlock which bookings, and to start the next one."
+        ),
+        display_order=2,
+    ),
+    dict(
+        audience="worker", category="Payments", question="When do I get paid?",
+        answer=(
+            "Payouts are processed in batches after each visit is marked complete and reviewed, "
+            "typically settling to your linked bank account within a few business days. Go to "
+            "Earnings to see a running total, the status of each payout (pending, processed, or "
+            "paid), and a full history you can use for your own records."
+        ),
+        display_order=3,
+    ),
+    dict(
+        audience="worker", category="Account", question="How do I go online/offline?",
+        answer=(
+            "Use the availability toggle on your home screen — switch it on when you're ready to "
+            "receive bookings, and off when you're not. You'll only be able to go online once "
+            "your account has been fully approved (identity, documents, and any required "
+            "training verified); until then the toggle stays locked and your onboarding status "
+            "screen will tell you what's still pending."
+        ),
+        display_order=4,
+    ),
+    dict(
+        audience="all", category="Account", question="How do I reset my password?",
+        answer=(
+            "On the sign-in screen, tap 'Forgot password?' and enter the email linked to your "
+            "account. We'll send a reset code to that email — enter it along with a new password "
+            "to regain access. If you signed in with a mobile OTP instead of a password, use "
+            "'Sign in with a mobile code' on the sign-in screen and you won't need a password at "
+            "all."
+        ),
+        display_order=1,
+    ),
 ]
 
 
@@ -832,9 +1530,30 @@ async def seed_faqs(session) -> int:
     return created
 
 
+async def _run_pending_column_migrations():
+    """Small, safe, idempotent ALTER TABLE fixes that must run before the app
+    serves traffic. Each statement uses IF NOT EXISTS / WHERE-guarded UPDATE,
+    so re-running on every startup is harmless."""
+    from sqlalchemy import text
+
+    async with engine.begin() as conn:
+        await conn.execute(text(
+            "ALTER TABLE bookings ADD COLUMN IF NOT EXISTS dispatch_started_at TIMESTAMPTZ NULL"
+        ))
+        await conn.execute(text(
+            "UPDATE bookings SET dispatch_started_at = created_at "
+            "WHERE dispatch_started_at IS NULL AND status NOT IN ('draft', 'pending_payment')"
+        ))
+    print("Column migrations: bookings.dispatch_started_at ensured")
+
+
 async def main():
     print("NurseConnect seed runner")
     print("=" * 50)
+
+    print("\nRunning pending column migrations...")
+    await _run_pending_column_migrations()
+
     async with AsyncSessionLocal() as session:
         print("\nSeeding services...")
         services_created = await seed_services(session)
@@ -845,14 +1564,39 @@ async def main():
         print("\nSeeding training modules...")
         training_created = await seed_training_modules(session)
 
+        print("\nSeeding workbook assessment modules...")
+        assessments_created = await seed_assessment_modules(session)
+
+        print("\nUpserting workbook care-package eligibility mapping...")
+        workbook_packages_changed = await seed_workbook_package_requirements(session)
+
         print("\nSeeding FAQs...")
         faqs_created = await seed_faqs(session)
+
+        print("\nSeeding in-visit questionnaires (checklist templates)...")
+        checklists_created = await seed_checklist_templates(session)
+
+        print("\nLinking checklist templates onto services...")
+        checklists_linked = await link_service_checklists(session)
+
+        print("\nLinking checklist templates onto care packages...")
+        checklists_linked += await link_package_checklists(session)
 
         await session.commit()
 
     print("\n" + "=" * 50)
-    print(f"Done. {services_created} services, {packages_created} packages, {training_created} training modules, {faqs_created} FAQs created.")
-    if services_created == 0 and packages_created == 0 and training_created == 0 and faqs_created == 0:
+    print(
+        f"Done. {services_created} services, {packages_created} packages, "
+        f"{training_created} training modules, {assessments_created} assessments, "
+        f"{workbook_packages_changed} workbook package mappings, {faqs_created} FAQs, "
+        f"{checklists_created} checklist templates created, "
+        f"{checklists_linked} service-checklist links created."
+    )
+    if (
+        services_created == 0 and packages_created == 0 and training_created == 0
+        and assessments_created == 0 and workbook_packages_changed == 0
+        and faqs_created == 0 and checklists_created == 0 and checklists_linked == 0
+    ):
         print("(Everything already existed — database was already seeded.)")
 
     await engine.dispose()
