@@ -1,45 +1,61 @@
-#!/bin/bash
+﻿#!/bin/bash
 
 set -e
 
-echo "🚀 Starting NurseConnect deployment..."
+echo "Starting NurseConnect deployment..."
 
 cd ~/nurseconnect--backend
 
-echo "📥 Fetching latest code..."
-git fetch origin
-
-echo "🔄 Syncing EC2 with main..."
-git reset --hard origin/main
-git clean -fd
-
-echo "📦 Installing dependencies..."
+echo "Installing dependencies..."
 if [ -f requirements.txt ]; then
     pip install --break-system-packages -r requirements.txt
 fi
 
-echo "🗄️ Running database schema sync..."
+echo "Running database schema sync..."
 if [ -f add_gate_and_anticheat_schema.py ]; then
     python3 add_gate_and_anticheat_schema.py
 fi
 
-echo "🔄 Restarting backend..."
+echo "DEBUG: hostname is $(hostname)"
+echo "DEBUG: available web-related units:"
+systemctl list-unit-files | grep -i web || echo "(none found)"
 
-if command -v supervisorctl >/dev/null 2>&1; then
-    sudo supervisorctl restart backend
-elif command -v systemctl >/dev/null 2>&1 && systemctl list-unit-files | grep -q nurseconnect; then
-    sudo systemctl restart nurseconnect
-else
-    echo "⚠️ Backend restart command not detected."
-    echo "Please restart the existing backend process manually."
+# --- Self-healing: create web.service if it doesn't exist ---
+if [ ! -f /etc/systemd/system/web.service ]; then
+    echo "web.service not found. Creating it..."
+    sudo tee /etc/systemd/system/web.service > /dev/null << 'EOF'
+[Unit]
+Description=NurseConnect Backend (FastAPI + Gunicorn)
+After=network.target
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/nurseconnect--backend
+EnvironmentFile=/home/ubuntu/nurseconnect--backend/.env
+ExecStart=/home/ubuntu/.local/bin/gunicorn -k uvicorn.workers.UvicornWorker server:app --bind 0.0.0.0:8000 --workers 2
+Restart=always
+RestartSec=5
+StandardOutput=append:/home/ubuntu/uvicorn.log
+StandardError=append:/home/ubuntu/uvicorn.log
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    sudo systemctl daemon-reload
+    sudo systemctl enable web.service
 fi
 
-echo "🏥 Checking backend health..."
+echo "Restarting backend..."
+sudo systemctl restart web.service
+
+echo "Checking backend health..."
 sleep 5
 
-curl -f http://localhost:8001/api/health || {
-    echo "❌ Health check failed"
+curl -f http://localhost:8000/api/health || {
+    echo "Health check failed"
     exit 1
 }
 
-echo "✅ NurseConnect deployment completed successfully!"
+echo "NurseConnect deployment completed successfully!"
