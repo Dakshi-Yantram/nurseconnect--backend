@@ -1382,76 +1382,105 @@ async def seed_assessment_modules(session) -> int:
 FAQS = [
     dict(
         audience="consumer", category="Bookings", question="How do I book a nurse?",
-        answer="Go to Bookings → New Booking and fill in the details.",
+        answer=(
+            "Go to Bookings → New Booking, pick a care package and the patient it's for, then "
+            "choose a date, time, and address. Once you confirm and pay, we start matching you "
+            "with a verified nurse nearby."
+        ),
         display_order=1,
     ),
     dict(
         audience="consumer", category="Bookings", question="Can I cancel a booking?",
         answer=(
-            "Yes, from your Visits tab. Cancel 6+ hours before the visit for a full refund; "
-            "closer to visit time a partial fee may apply."
+            "Yes — open the booking from your Visits tab and tap Cancel booking. Cancelling 6+ "
+            "hours before the visit gets a full refund; closer to the visit time a partial fee "
+            "may apply, and it's shown to you before you confirm."
         ),
         display_order=2,
     ),
     dict(
         audience="consumer", category="Patients", question="How do I add a patient?",
-        answer="Go to Profile → Patients → Add patient and fill in their details.",
+        answer=(
+            "Go to Profile → Patients → Add patient and fill in their name, age, and any "
+            "relevant medical notes. You can add more than one patient and pick who you're "
+            "booking for each time."
+        ),
         display_order=3,
     ),
     dict(
         audience="consumer", category="Trust & Safety", question="How are nurses verified?",
         answer=(
-            "Every nurse passes identity, background, and document checks, and is tiered by "
-            "skill level for the care they're allowed to take."
+            "Every nurse passes identity, background, and document checks before taking any "
+            "booking, and is tiered by skill level — so specialised care only goes to someone "
+            "trained for it."
         ),
         display_order=4,
     ),
     dict(
         audience="consumer", category="Bookings", question="How do I contact my nurse?",
-        answer="Open the booking in Visits — chat and call buttons are right there.",
+        answer=(
+            "Once a nurse accepts your visit, open the booking from Visits — chat and call "
+            "buttons appear there. Calls go through the app, so your personal number stays "
+            "private."
+        ),
         display_order=5,
     ),
     dict(
         audience="consumer", category="Billing", question="What payment methods are accepted?",
-        answer="UPI, cards, net banking, and wallets, securely via Razorpay.",
+        answer=(
+            "UPI, debit/credit cards, net banking, and popular wallets, all processed securely "
+            "via Razorpay. Receipts for every payment are under Profile → Payments."
+        ),
         display_order=6,
     ),
     dict(
         audience="consumer", category="Billing", question="What if I'm not happy with a visit?",
-        answer="Rate the visit or raise a request from Help & support — our team will follow up.",
+        answer=(
+            "Rate the visit from your Visits tab once it's complete, or raise a request from "
+            "Help & support any time. Our team reviews it and can arrange a repeat visit or "
+            "refund."
+        ),
         display_order=7,
     ),
     dict(
         audience="worker", category="Assignments", question="How do I claim a booking?",
-        answer="Open Assignments and tap Claim on any booking matching your tier and location.",
+        answer=(
+            "Open Assignments and tap Claim on any open booking matching your tier and "
+            "location. Claims are first-come, first-served, so turn on notifications to catch "
+            "new ones quickly."
+        ),
         display_order=1,
     ),
     dict(
         audience="worker", category="Training", question="Why can't I claim higher-tier bookings?",
         answer=(
-            "Complete the matching training module and pass its assessment first — see "
-            "Training & Certifications on your profile."
+            "Specialised bookings like wound care or post-op shifts need the matching training "
+            "module and assessment done first. Check Training & Certifications on your profile "
+            "to see what's next."
         ),
         display_order=2,
     ),
     dict(
         audience="worker", category="Payments", question="When do I get paid?",
-        answer="After each visit is reviewed, usually within a few business days. See Earnings.",
+        answer=(
+            "Payouts process after each visit is marked complete and reviewed, usually settling "
+            "within a few business days. Go to Earnings for a running total and payout status."
+        ),
         display_order=3,
     ),
     dict(
         audience="worker", category="Account", question="How do I go online/offline?",
         answer=(
-            "Use the availability toggle on your home screen. Unlocks once your account is "
-            "fully approved."
+            "Use the availability toggle on your home screen. It unlocks once your account is "
+            "fully approved — identity, documents, and any required training verified."
         ),
         display_order=4,
     ),
     dict(
         audience="all", category="Account", question="How do I reset my password?",
         answer=(
-            "Tap 'Forgot password?' on sign-in and enter your email for a reset code. OTP "
-            "users don't need a password at all."
+            "Tap 'Forgot password?' on the sign-in screen and enter your email for a reset "
+            "code. If you sign in with a mobile OTP instead, you won't need a password at all."
         ),
         display_order=1,
     ),
