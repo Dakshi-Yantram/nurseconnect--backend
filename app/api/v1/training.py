@@ -399,6 +399,39 @@ async def get_module(module_id: UUID, db: AsyncSession = Depends(get_db), _=Depe
     }
 
 
+def _grade_module_answer(q: Dict[str, Any], answer: Any) -> bool:
+    """Type-aware grading for a single module-quiz question.
+
+    Mirrors `_score_attempt`'s per-type rules, but works on a single
+    (question, answer) pair so it can be reused by both the legacy flat
+    and adaptive id-keyed submit formats below.
+    """
+    qtype = q.get("type", "single_select")
+    if qtype == "multi_select":
+        if not isinstance(answer, list):
+            return False
+        try:
+            given = {int(x) for x in answer}
+        except (TypeError, ValueError):
+            return False
+        return given == set(int(x) for x in (q.get("correct_indices") or []))
+    if qtype == "boolean":
+        if isinstance(answer, bool):
+            return answer == bool(q.get("correct_bool"))
+        # frontend may send the option index (0=True, 1=False) instead of a bool
+        if isinstance(answer, int):
+            correct_idx = 0 if q.get("correct_bool") else 1
+            return answer == correct_idx
+        return False
+    if qtype == "text":
+        return isinstance(answer, str) and bool(answer.strip())
+    # single_select (default)
+    try:
+        return int(answer) == int(q.get("correct_index", -1))
+    except (TypeError, ValueError):
+        return False
+
+
 @router.post("/modules/{module_id}/assessment/submit")
 async def submit_module_assessment(
     module_id: UUID,
@@ -410,6 +443,11 @@ async def submit_module_assessment(
     - Legacy flat list: [0, 2, 1, ...]  (answer index per question by position)
     - Adaptive list:    [{"id": "ic1", "answer": 2}, ...]  (per-question id + answer)
     Adaptive format scores based on answered questions only.
+
+    Grading is type-aware (single_select / multi_select / boolean / text) via
+    `_grade_module_answer` — previously this only ever compared against
+    `correct_index`, so multi_select and boolean questions were impossible to
+    pass regardless of the answer given.
     """
     res = await db.execute(
         select(TrainingModule).where(
@@ -428,12 +466,12 @@ async def submit_module_assessment(
         qmap = {q.get("id", str(i)): q for i, q in enumerate(m.assessment)}
         for item in answers:
             q = qmap.get(item.get("id"))
-            if q and item.get("answer") == q.get("correct_index"):
+            if q and _grade_module_answer(q, item.get("answer")):
                 correct += 1
         score = int((correct / len(answers)) * 100) if answers else 0
     else:
         for idx, q in enumerate(m.assessment):
-            if idx < len(answers) and answers[idx] == q.get("correct_index"):
+            if idx < len(answers) and _grade_module_answer(q, answers[idx]):
                 correct += 1
         score = int((correct / len(m.assessment)) * 100) if m.assessment else 0
     passed = score >= m.pass_percent
