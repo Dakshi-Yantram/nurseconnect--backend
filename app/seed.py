@@ -385,7 +385,12 @@ CHECKLIST_TEMPLATES = [
 
 
 async def seed_checklist_templates(session) -> int:
-    """Create the ChecklistTemplate rows themselves (idempotent by code)."""
+    """Seed CHECKLIST_TEMPLATES into ChecklistTemplate — idempotent (matches
+    on `code`). This was previously called from main() but never defined,
+    which would raise NameError the moment FAQ seeding stopped failing first.
+    Only inserts new templates; it does NOT touch service/package links —
+    that's link_service_checklists() / link_package_checklists() below.
+    """
     created = 0
     for data in CHECKLIST_TEMPLATES:
         exists = await session.execute(
@@ -397,12 +402,9 @@ async def seed_checklist_templates(session) -> int:
         session.add(ChecklistTemplate(
             code=data["code"],
             name=data["name"],
-            service_codes=data["service_codes"],
             phase=data["phase"],
-            version=1,
-            is_active=True,
-            status=ContentStatus.published,
             questions=data["questions"],
+            is_active=True,
         ))
         created += 1
         print(f"  + created checklist template {data['code']}")
@@ -1835,18 +1837,31 @@ FAQS = [
 
 
 async def seed_faqs(session) -> int:
-    """Seed default help-center FAQs — idempotent (matches on question text)."""
+    """Seed default help-center FAQs — idempotent. Matches on question +
+    audience + is_active=True, so an old inactive duplicate row from before
+    this fix never causes 'Multiple rows were found' and never blocks a
+    fresh active row from being (re)created.
+    """
     created = 0
+
     for data in FAQS:
         exists = await session.execute(
-            select(Faq).where(Faq.question == data["question"], Faq.audience == data["audience"])
+            select(Faq).where(
+                Faq.question == data["question"],
+                Faq.audience == data["audience"],
+                Faq.is_active.is_(True),
+            )
         )
+
         if exists.scalar_one_or_none():
             continue
+
         session.add(Faq(**data, is_active=True))
         created += 1
+
     if created:
         print(f"  + created {created} FAQ entries")
+
     return created
 
 
