@@ -60,6 +60,30 @@ class Settings(BaseSettings):
     RAZORPAY_KEY_SECRET: str = ""
     RAZORPAY_WEBHOOK_SECRET: str = ""
 
+    # ---------------------------------------------------------------------
+    # Worker payouts.
+    #
+    # When a visit is completed a payout is generated for the nurse:
+    #   gross  = booking base + surge amount (the service value)
+    #   comm   = gross * commission%  (from the service/package, or the
+    #            platform default below when the offering doesn't set one)
+    #   tds    = (gross - comm) * TDS%   (India: 194O e-commerce, often 1%)
+    #   net    = gross - comm - tds
+    #
+    # The payout is created as `pending`. Admin reviews and processes it —
+    # optionally auto-transferring via RazorpayX when RAZORPAYX_* is set and
+    # the nurse has bank details on file. Nothing leaves the platform without
+    # an admin action, which is what marketplaces want for hold/dispute control.
+    # ---------------------------------------------------------------------
+    PLATFORM_COMMISSION_PCT: float = 20.0
+    PLATFORM_TDS_PCT: float = 0.0
+
+    # RazorpayX (payouts) — separate product from Razorpay payments above.
+    # Leave blank to keep payouts manual (admin marks them paid after an
+    # out-of-band bank transfer). When set, admin "process" attempts a real
+    # RazorpayX transfer to the nurse's fund account.
+    RAZORPAYX_ACCOUNT_NUMBER: str = ""
+
     # Cloudinary
     CLOUDINARY_CLOUD_NAME: str = ""
     CLOUDINARY_API_KEY: str = ""
@@ -73,6 +97,15 @@ class Settings(BaseSettings):
     # Interakt
     INTERAKT_API_KEY: str = ""
     INTERAKT_BASE_URL: str = "https://api.interakt.ai"
+    # Shared secret configured in the Interakt dashboard (Settings > Webhooks)
+    # so we can verify inbound webhook calls actually come from Interakt.
+    INTERAKT_WEBHOOK_SECRET: str = ""
+    # WhatsApp template used to ask the family for feedback right after a
+    # visit is checked out. Must be a pre-approved template on Interakt.
+    INTERAKT_FEEDBACK_TEMPLATE: str = "service_feedback_request"
+
+    # Deep link base the family taps from the WhatsApp feedback message.
+    FEEDBACK_LINK_BASE_URL: str = "https://app.nurseconnect.in/feedback"
 
     # Firebase
     FIREBASE_PROJECT_ID: str = ""
@@ -82,6 +115,55 @@ class Settings(BaseSettings):
     ABHA_BASE_URL: str = ""
     ABHA_CLIENT_ID: str = ""
     ABHA_CLIENT_SECRET: str = ""
+
+    # Cloudflare RealtimeKit (in-app voice calling) — replaces Dyte.
+    #
+    # As of the Cloudflare-native integration, the old Dyte-style
+    # "org_id : api_key" Basic-auth scheme against api.realtime.cloudflare.com/v2
+    # no longer applies to new accounts (that developer portal has been
+    # retired). RealtimeKit now lives under the standard Cloudflare API:
+    #   https://api.cloudflare.com/client/v4/accounts/{account_id}/realtime/kit/{app_id}/...
+    # authenticated with a Cloudflare API Token (Bearer), scoped to the
+    # "Realtime / Realtime Admin" permission.
+    REALTIMEKIT_ACCOUNT_ID: str = ""
+    REALTIMEKIT_APP_ID: str = ""
+    REALTIMEKIT_API_TOKEN: str = ""
+    REALTIMEKIT_BASE_URL: str = "https://api.cloudflare.com/client/v4"
+    # Deprecated Dyte-era fields — kept only so a pre-migration .env doesn't
+    # crash on load. No longer read by RealtimeKitClient.
+    REALTIMEKIT_ORG_ID: str = ""
+    REALTIMEKIT_API_KEY: str = ""
+    DYTE_ORG_ID: str = ""
+    DYTE_API_KEY: str = ""
+    DYTE_BASE_URL: str = ""
+
+    # Web Push (VAPID) — best-effort background call ping for browser tabs.
+    # NOTE: this does NOT wake a fully force-killed browser; only the native
+    # PushKit / FCM paths below can ring a killed mobile app.
+    VAPID_PUBLIC_KEY: str = ""
+    VAPID_PRIVATE_KEY: str = ""
+    VAPID_SUBJECT: str = "mailto:support@nurseconnect.app"
+
+    # ---------------------------------------------------------------------
+    # APNs — iOS VoIP (PushKit) push.
+    #
+    # This is what lets a *force-killed* iOS app ring. It uses token-based
+    # auth: download a .p8 key from the Apple Developer portal (Keys → new key
+    # with "Apple Push Notifications service" enabled) and set the three
+    # values below. APNS_KEY_P8 accepts either the PEM contents directly or a
+    # path to the .p8 file.
+    #
+    # The push topic is always "<APNS_BUNDLE_ID>.voip" — Apple requires the
+    # .voip suffix for PushKit, and rejects the plain bundle id.
+    # ---------------------------------------------------------------------
+    APNS_KEY_P8: str = ""
+    APNS_KEY_ID: str = ""
+    APNS_TEAM_ID: str = ""
+    APNS_BUNDLE_ID: str = "com.yantrammedtech.nurseconnect"
+    # Apple has separate hosts for sandbox (dev builds) and production
+    # (TestFlight / App Store). A token minted for one is rejected by the
+    # other, so this must match how the installed app was signed.
+    APNS_USE_SANDBOX: bool = True
 
     # Mocks
     MOCK_EXTERNAL_PROVIDERS: bool = True
