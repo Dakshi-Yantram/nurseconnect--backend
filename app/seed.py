@@ -537,7 +537,10 @@ WORKBOOK_PACKAGE_CUSTOMER_COPY: dict[str, dict] = {
         tagline="A quick check of vitals and general condition",
         description="A single visit to check blood pressure, pulse, temperature, oxygen "
                      "levels and blood sugar, with a summary of what was found.",
-        per_visit_price="299",
+        # Deliberately priced at Rs.1 (not the usual Rs.299) - kept as a low-cost
+        # test/entry package so payments can be exercised end-to-end cheaply.
+        package_price="1",
+        per_visit_price="1",
         whats_included=[
             "Blood pressure check",
             "Pulse check",
@@ -1124,6 +1127,21 @@ async def seed_workbook_package_requirements(session) -> int:
         )
         package = res.scalar_one_or_none()
         customer_copy = WORKBOOK_PACKAGE_CUSTOMER_COPY.get(data["package_code"], {})
+        _visits_per_cycle = data.get("visits_per_cycle") or 1
+        _per_visit_price = Decimal(str(
+            customer_copy.get("per_visit_price", data.get("per_visit_price")) or "0"
+        ))
+        _explicit_package_price = customer_copy.get("package_price", data.get("package_price"))
+        # Most workbook-generated packages only ever specified a per-visit price;
+        # package_price was left at "0" (see WORKBOOK_PACKAGE_CUSTOMER_COPY note
+        # above). A package literally priced at ₹0 isn't real, so when no explicit
+        # package_price was set, derive it from per_visit_price * visits_per_cycle
+        # instead of silently showing ₹0 to customers.
+        _package_price = (
+            Decimal(str(_explicit_package_price))
+            if _explicit_package_price not in (None, "", "0", 0)
+            else _per_visit_price * _visits_per_cycle
+        )
         payload = {
             "name": data["name"],
             "tagline": customer_copy.get("tagline", data.get("tagline")),
@@ -1139,14 +1157,10 @@ async def seed_workbook_package_requirements(session) -> int:
                 data.get("visit_frequency"),
                 VisitFrequency.as_needed,
             ),
-            "visits_per_cycle": data.get("visits_per_cycle") or 1,
+            "visits_per_cycle": _visits_per_cycle,
             "cycle_duration_days": data.get("cycle_duration_days") or 1,
-            "package_price": Decimal(str(
-                customer_copy.get("package_price", data.get("package_price")) or "0"
-            )),
-            "per_visit_price": Decimal(str(
-                customer_copy.get("per_visit_price", data.get("per_visit_price")) or "0"
-            )),
+            "package_price": _package_price,
+            "per_visit_price": _per_visit_price,
             "subsidy_eligible": bool(data.get("subsidy_eligible")),
             "commission_pct": Decimal(str(data.get("commission_pct") or "20")),
             "requires_prescription": bool(data.get("requires_prescription")),
