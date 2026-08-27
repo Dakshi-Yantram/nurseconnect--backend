@@ -20,9 +20,26 @@ import logging
 
 from fastapi import HTTPException, Request
 
+from app.core.config import settings
 from app.core.redis_client import redis_client
 
 logger = logging.getLogger(__name__)
+
+
+def _throttling_disabled() -> bool:
+    """Brute-force throttling is meant for production traffic.
+
+    In OTP_DEV_MODE (local dev + CI/automated tests — see .env.example and
+    the GitHub Actions workflow) no real SMS/email credits or production
+    accounts are at risk, and the automated test suite reuses a small,
+    fixed pool of phone numbers/emails across hundreds of test cases. Those
+    would otherwise blow through these limits within seconds of the suite
+    starting and cascade into unrelated failures (stale/wrong-role tokens,
+    403s, etc.) that have nothing to do with the endpoint under test. No
+    test in this repo exercises the throttling behaviour itself, so this is
+    safe to skip outside of real deployments.
+    """
+    return bool(settings.OTP_DEV_MODE)
 
 
 def client_ip(request: Request) -> str:
@@ -48,6 +65,8 @@ async def enforce_rate_limit(
     message: str = "Too many attempts. Please try again later.",
 ) -> None:
     """Increment the counter for (scope, identifier); 429 once over budget."""
+    if _throttling_disabled():
+        return
     key = _key(scope, identifier)
     try:
         count = await redis_client.incr(key)
@@ -72,6 +91,8 @@ async def enforce_rate_limit(
 
 async def ensure_not_locked(scope: str, identifier: str) -> None:
     """403-style 429 if the identifier is currently locked out."""
+    if _throttling_disabled():
+        return
     try:
         locked = await redis_client.get(_key(f"{scope}:lock", identifier))
     except Exception:  # noqa: BLE001
