@@ -459,7 +459,8 @@ async def otp_send(payload: OtpSendRequest, request: Request, db: AsyncSession =
     """
     phone = _normalize_phone(payload.phone_e164)
     # Throttle: 3 codes / 10 min per phone (SMS bombing + credit burn),
-    # 15 sends / hour per IP (mass enumeration).
+    # 15 sends / hour per IP (mass enumeration). (Automatically skipped in
+    # OTP_DEV_MODE — see app/core/rate_limit.py.)
     ip = client_ip(request)
     await enforce_rate_limit(
         "otp_send:phone", phone, 3, 10 * 60,
@@ -508,6 +509,7 @@ async def otp_verify(payload: OtpVerifyRequest, request: Request, db: AsyncSessi
     phone = _normalize_phone(payload.phone_e164)
     # Per-code attempts are capped below (otp.attempts >= 5); this per-IP
     # throttle additionally stops one host cycling many phone numbers.
+    # (Automatically skipped in OTP_DEV_MODE — see app/core/rate_limit.py.)
     await enforce_rate_limit("otp_verify:ip", client_ip(request), 20, 15 * 60)
 
     otp_res = await db.execute(
