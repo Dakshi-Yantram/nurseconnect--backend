@@ -162,18 +162,37 @@ class Msg91Client:
         self.template_id = settings.MSG91_TEMPLATE_ID
 
     async def send_otp(self, phone_e164: str, otp: str) -> Dict[str, Any]:
+        """Send an already-generated OTP via MSG91's SendOTP API.
+
+        MSG91's v5 /otp endpoint is a GET request with query params (NOT a
+        JSON POST body — a POST+json call silently gets ignored/rejected by
+        MSG91). ``otp`` here is OUR own generated code (see auth.py); we pass
+        it through so MSG91 just relays it inside the DLT-approved template
+        rather than generating its own (which would break our own hash-based
+        verification in otp_verify()).
+        """
         if self.mock:
             logger.info("MOCK MSG91 send_otp phone=%s code=%s", phone_e164, otp)
             return {"type": "success", "request_id": f"msg91_mock_{uuid.uuid4().hex[:10]}"}
         import httpx
+        params = {
+            "template_id": self.template_id,
+            "mobile": phone_e164.lstrip("+"),
+            "authkey": self.auth_key,
+            "otp": otp,
+        }
+        if self.sender_id:
+            params["sender"] = self.sender_id
         async with httpx.AsyncClient() as client:
-            resp = await client.post(
+            resp = await client.get(
                 "https://control.msg91.com/api/v5/otp",
-                headers={"authkey": self.auth_key},
-                json={"template_id": self.template_id, "mobile": phone_e164.lstrip("+"), "otp": otp, "sender": self.sender_id},
+                params=params,
                 timeout=10,
             )
-            return resp.json()
+            data = resp.json()
+            if data.get("type") != "success":
+                logger.error("MSG91 send_otp failed phone=%s response=%s", phone_e164, data)
+            return data
 
     async def send_sms(self, phone_e164: str, message: str) -> Dict[str, Any]:
         if self.mock:
