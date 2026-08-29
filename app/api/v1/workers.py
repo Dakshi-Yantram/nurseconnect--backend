@@ -5,7 +5,7 @@ from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
-from sqlalchemy import and_, select
+from sqlalchemy import and_, delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
@@ -19,6 +19,7 @@ from app.integrations import cloudinary_client
 from app.integrations.providers import ExternalProviderError
 from app.models.enums import (
     UserRole,
+    VisitStatus,
     WorkerAvailability,
     WorkerOnboardingStatus,
     WorkerPreferenceStatus,
@@ -26,9 +27,14 @@ from app.models.enums import (
     WorkerQualificationStatus,
 )
 from app.models.models import (
+    Booking,
     CarePackage,
     ServiceCatalogue,
     User,
+    VisitRecord,
+    VitalSignReading,
+    WorkerAlertnessCheck,
+    WorkerAvailabilitySlot,
     WorkerCertificate,
     WorkerDocument,
     WorkerKitItem,
@@ -38,14 +44,22 @@ from app.models.models import (
     WorkerServiceQualification,
 )
 from app.schemas.schemas import (
+    AlertnessCheckOut,
+    AlertnessCheckSubmit,
+    AvailabilitySlotOut,
+    AvailabilitySlotsBulkUpdate,
     AvailabilityToggleRequest,
     BankDetailsUpdate,
+    PatientHistoryOut,
+    PatientOut,
+    PatientVisitHistoryItem,
     WorkerLocationUpdateRequest,
     WorkerProfileOut,
     WorkerProfileUpdate,
     WorkerPublicOut,
     WorkerSearchQuery,
 )
+from app.security.access_control import assert_user_can_access_patient
 from app.services.common_services import audit
 from app.services.qualification import (
     is_worker_opted_in_for_service,
@@ -1088,3 +1102,186 @@ async def set_service_area(
         "home_longitude": float(profile.home_longitude) if profile.home_longitude is not None else None,
         "service_radius_km": profile.service_radius_km,
     }
+
+
+# ============================================================================
+# Weekly availability slots — "which hours am I open to working"
+# ============================================================================
+@router.get("/me/availability-slots", response_model=List[AvailabilitySlotOut])
+async def list_availability_slots(
+    profile: WorkerProfile = Depends(get_worker_profile),
+    db: AsyncSession = Depends(get_db),
+):
+    res = await db.execute(
+        select(WorkerAvailabilitySlot)
+        .where(
+            WorkerAvailabilitySlot.worker_id == profile.id,
+            WorkerAvailabilitySlot.is_active.is_(True),
+        )
+        .order_by(WorkerAvailabilitySlot.day_of_week, WorkerAvailabilitySlot.start_time)
+    )
+    return [AvailabilitySlotOut.model_validate(s) for s in res.scalars().all()]
+
+
+@router.put("/me/availability-slots", response_model=List[AvailabilitySlotOut])
+async def replace_availability_slots(
+    payload: AvailabilitySlotsBulkUpdate,
+    profile: WorkerProfile = Depends(get_worker_profile),
+    db: AsyncSession = Depends(get_db),
+):
+    """Replaces the nurse's whole weekly schedule in one call — simplest
+    correct semantics for a "these are the hours I work" editor screen.
+    Sending an empty list clears the schedule."""
+    for slot in payload.slots:
+        if slot.end_time <= slot.start_time:
+            raise HTTPException(
+                status_code=400,
+                detail=f"End time must be after start time (day {slot.day_of_week})",
+            )
+    await db.execute(
+        delete(WorkerAvailabilitySlot).where(WorkerAvailabilitySlot.worker_id == profile.id)
+    )
+    for slot in payload.slots:
+        db.add(
+            WorkerAvailabilitySlot(
+                worker_id=profile.id,
+                day_of_week=slot.day_of_week,
+                start_time=slot.start_time,
+                end_time=slot.end_time,
+            )
+        )
+    await db.commit()
+    res = await db.execute(
+        select(WorkerAvailabilitySlot)
+        .where(WorkerAvailabilitySlot.worker_id == profile.id)
+        .order_by(WorkerAvailabilitySlot.day_of_week, WorkerAvailabilitySlot.start_time)
+    )
+    return [AvailabilitySlotOut.model_validate(s) for s in res.scalars().all()]
+
+
+# ============================================================================
+# Pre-navigation alertness / fatigue gate
+# ============================================================================
+# A short reaction-tap game shown right before the nurse opens Google Maps
+# for an accepted booking. It never blocks navigation — a nurse should
+# never be stuck unable to reach a patient because of a mini-game — but
+# every attempt is logged so a consistent pattern of slow/missed taps is
+# visible to ops.
+ALERTNESS_REACTION_THRESHOLD_MS = 900
+ALERTNESS_MAX_MISSED_TAPS = 1
+
+
+@router.post("/me/alertness-checks", response_model=AlertnessCheckOut, status_code=201)
+async def submit_alertness_check(
+    payload: AlertnessCheckSubmit,
+    profile: WorkerProfile = Depends(get_worker_profile),
+    db: AsyncSession = Depends(get_db),
+):
+    if payload.booking_id is not None:
+        bres = await db.execute(select(Booking).where(Booking.id == payload.booking_id))
+        booking = bres.scalar_one_or_none()
+        if not booking or booking.worker_id != profile.id:
+            raise HTTPException(status_code=403, detail="Not assigned to this booking")
+
+    times = [t for t in payload.round_reaction_times_ms if t is not None and t >= 0]
+    average = int(round(sum(times) / len(times))) if times else None
+    passed = (
+        bool(times)
+        and average is not None
+        and average <= ALERTNESS_REACTION_THRESHOLD_MS
+        and payload.missed_taps <= ALERTNESS_MAX_MISSED_TAPS
+    )
+
+    check = WorkerAlertnessCheck(
+        worker_id=profile.id,
+        booking_id=payload.booking_id,
+        round_reaction_times_ms=times or None,
+        average_reaction_time_ms=average,
+        missed_taps=payload.missed_taps,
+        passed=passed,
+    )
+    db.add(check)
+    await db.commit()
+    await db.refresh(check)
+    return AlertnessCheckOut.model_validate(check)
+
+
+@router.get("/me/alertness-checks/latest", response_model=Optional[AlertnessCheckOut])
+async def latest_alertness_check(
+    profile: WorkerProfile = Depends(get_worker_profile),
+    db: AsyncSession = Depends(get_db),
+):
+    res = await db.execute(
+        select(WorkerAlertnessCheck)
+        .where(WorkerAlertnessCheck.worker_id == profile.id)
+        .order_by(WorkerAlertnessCheck.created_at.desc())
+        .limit(1)
+    )
+    row = res.scalar_one_or_none()
+    return AlertnessCheckOut.model_validate(row) if row else None
+
+
+# ============================================================================
+# Patient care history — nurse-facing
+# ============================================================================
+@router.get("/patients/{patient_id}/history", response_model=PatientHistoryOut)
+async def worker_patient_history(
+    patient_id: UUID,
+    current: CurrentUser = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Past completed visits for a patient, for a nurse who has (or has had)
+    a booking with them — so she can see what previous nurses recorded
+    before she arrives. Access is enforced by ``assert_user_can_access_patient``:
+    a worker only sees this if she's been assigned to at least one booking
+    for this patient (or is an admin)."""
+    patient = await assert_user_can_access_patient(db, current, patient_id)
+
+    rows = await db.execute(
+        select(VisitRecord, Booking, User.full_name)
+        .join(Booking, Booking.id == VisitRecord.booking_id)
+        .join(WorkerProfile, WorkerProfile.id == VisitRecord.worker_id)
+        .join(User, User.id == WorkerProfile.user_id)
+        .where(
+            VisitRecord.patient_id == patient_id,
+            VisitRecord.status == VisitStatus.completed,
+        )
+        .order_by(Booking.scheduled_date.desc())
+    )
+    rows = rows.all()
+
+    items: List[PatientVisitHistoryItem] = []
+    for visit, booking, worker_name in rows:
+        vres = await db.execute(
+            select(VitalSignReading)
+            .where(VitalSignReading.visit_record_id == visit.id)
+            .order_by(VitalSignReading.recorded_at.asc())
+        )
+        vitals = [
+            {
+                "recorded_at": v.recorded_at.isoformat(),
+                "bp": f"{v.bp_systolic}/{v.bp_diastolic}" if v.bp_systolic and v.bp_diastolic else None,
+                "pulse": v.pulse,
+                "spo2": v.spo2,
+                "temperature_f": float(v.temperature_f) if v.temperature_f is not None else None,
+            }
+            for v in vres.scalars().all()
+        ]
+        items.append(
+            PatientVisitHistoryItem(
+                booking_id=booking.id,
+                visit_id=visit.id,
+                scheduled_date=booking.scheduled_date,
+                status=visit.status,
+                worker_id=visit.worker_id,
+                worker_name=worker_name,
+                care_notes=visit.care_notes,
+                family_summary=visit.family_summary,
+                checklist_responses=visit.checklist_responses,
+                vitals=vitals or None,
+                check_in_at=visit.check_in_at,
+                check_out_at=visit.check_out_at,
+            )
+        )
+
+    return PatientHistoryOut(patient=PatientOut.model_validate(patient), visits=items)
