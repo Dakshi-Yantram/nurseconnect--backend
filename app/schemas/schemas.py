@@ -1045,3 +1045,64 @@ class PageMeta(BaseModel):
 class Paginated(BaseModel):
     items: List[Any]
     meta: PageMeta
+
+
+# ----- WORKER WEEKLY AVAILABILITY SLOTS -----
+class AvailabilitySlotIn(BaseModel):
+    """0=Monday .. 6=Sunday. `start_time`/`end_time` are 24h "HH:MM" local
+    clock times with no timezone — the nurse's own wall-clock day."""
+    day_of_week: int = Field(ge=0, le=6)
+    start_time: time
+    end_time: time
+
+
+class AvailabilitySlotOut(ORMModel):
+    id: UUID
+    day_of_week: int
+    start_time: time
+    end_time: time
+    is_active: bool
+
+
+class AvailabilitySlotsBulkUpdate(BaseModel):
+    """Replaces the worker's entire weekly schedule with this set. Sending
+    an empty list clears it (e.g. "I don't have a fixed schedule right now")."""
+    slots: List[AvailabilitySlotIn] = Field(default_factory=list)
+
+
+# ----- NURSE ALERTNESS / FATIGUE GATE -----
+class AlertnessCheckSubmit(BaseModel):
+    booking_id: Optional[UUID] = None
+    round_reaction_times_ms: List[int] = Field(default_factory=list)
+    missed_taps: int = 0
+
+
+class AlertnessCheckOut(ORMModel):
+    id: UUID
+    booking_id: Optional[UUID] = None
+    round_reaction_times_ms: Optional[List[int]] = None
+    average_reaction_time_ms: Optional[int] = None
+    missed_taps: int
+    passed: bool
+    created_at: datetime
+
+
+# ----- PATIENT CARE HISTORY (nurse-facing) -----
+class PatientVisitHistoryItem(BaseModel):
+    booking_id: UUID
+    visit_id: UUID
+    scheduled_date: date
+    status: VisitStatus
+    worker_id: UUID
+    worker_name: Optional[str] = None
+    care_notes: Optional[str] = None
+    family_summary: Optional[str] = None
+    checklist_responses: Optional[dict] = None
+    vitals: Optional[List[Dict[str, Any]]] = None
+    check_in_at: Optional[datetime] = None
+    check_out_at: Optional[datetime] = None
+
+
+class PatientHistoryOut(BaseModel):
+    patient: PatientOut
+    visits: List[PatientVisitHistoryItem]

@@ -1762,3 +1762,68 @@ class ReviewerAssignmentLog(Base):
     assignment_reason: Mapped[Optional[str]] = mapped_column(String(500))
     assigned_by: Mapped[Optional[UUID]] = mapped_column(PG_UUID(as_uuid=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now, server_default=func.now())
+
+
+# ============================================================================
+# Worker weekly availability slots
+# ============================================================================
+class WorkerAvailabilitySlot(Base):
+    """A recurring weekly window during which a worker is willing to work.
+
+    Distinct from ``WorkerProfile.availability`` (the online/offline/busy/
+    on_leave *live* status used by dispatch right now). This is the nurse's
+    *declared schedule* — e.g. "Mon-Fri 9am-5pm" — so ops and the nurse
+    herself have a record of when she intends to be reachable, independent
+    of whether she has actually toggled herself online at this exact moment.
+    """
+    __tablename__ = "worker_availability_slots"
+    id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), primary_key=True, default=_uuid)
+    worker_id: Mapped[UUID] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("worker_profiles.id", ondelete="CASCADE"), index=True, nullable=False
+    )
+    # 0=Monday .. 6=Sunday (ISO weekday - 1), matches JS Date.getDay() minus
+    # the Sun=0 offset handled client-side — see schemas.py docstring.
+    day_of_week: Mapped[int] = mapped_column(SmallInteger, nullable=False)
+    start_time: Mapped[time] = mapped_column(Time, nullable=False)
+    end_time: Mapped[time] = mapped_column(Time, nullable=False)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True, server_default="true")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now, server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now, onupdate=_now, server_default=func.now())
+
+    __table_args__ = (
+        Index("ix_worker_availability_slots_worker_day", "worker_id", "day_of_week"),
+    )
+
+
+# ============================================================================
+# Nurse alertness / fatigue gate
+# ============================================================================
+class WorkerAlertnessCheck(Base):
+    """One attempt at the pre-navigation reaction-time gate.
+
+    Shown to the nurse right before she opens Google Maps to an accepted
+    booking's address. Purely a fatigue/attention screen — never blocks
+    navigation outright (holding up a nurse's route to a patient on a
+    failed tap-game would itself be a safety problem), but every attempt is
+    logged so ops can see if a nurse is consistently showing signs of
+    fatigue before her visits.
+    """
+    __tablename__ = "worker_alertness_checks"
+    id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), primary_key=True, default=_uuid)
+    worker_id: Mapped[UUID] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("worker_profiles.id", ondelete="CASCADE"), index=True, nullable=False
+    )
+    booking_id: Mapped[Optional[UUID]] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("bookings.id", ondelete="SET NULL"), index=True
+    )
+    # Per-round reaction times in milliseconds, e.g. [412, 388, 705].
+    round_reaction_times_ms: Mapped[Optional[list]] = mapped_column(ARRAY(Integer))
+    average_reaction_time_ms: Mapped[Optional[int]] = mapped_column(Integer)
+    # Taps on the wrong spot / before the target appeared.
+    missed_taps: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    passed: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now, server_default=func.now())
+
+    __table_args__ = (
+        Index("ix_worker_alertness_checks_worker_created", "worker_id", "created_at"),
+    )
