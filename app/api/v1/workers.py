@@ -18,6 +18,7 @@ from app.core.deps import (
 from app.integrations import cloudinary_client
 from app.integrations.providers import ExternalProviderError
 from app.models.enums import (
+    AlertnessTier,
     UserRole,
     VisitStatus,
     WorkerAvailability,
@@ -26,6 +27,7 @@ from app.models.enums import (
     WorkerQualificationSource,
     WorkerQualificationStatus,
 )
+from app.services import fatigue_engine
 from app.models.models import (
     Booking,
     CarePackage,
@@ -1160,17 +1162,18 @@ async def replace_availability_slots(
 
 
 # ============================================================================
-# Pre-navigation alertness / fatigue gate
+# Pre-visit alertness / fatigue gate ("Nurse Safety Check")
 # ============================================================================
-# A short reaction-tap game shown right before the nurse opens Google Maps
-# for an accepted booking. It never blocks navigation — a nurse should
-# never be stuck unable to reach a patient because of a mini-game — but
-# every attempt is logged so a consistent pattern of slow/missed taps is
-# visible to ops.
-ALERTNESS_REACTION_THRESHOLD_MS = 900
-ALERTNESS_MAX_MISSED_TAPS = 1
-
-
+# A combined reaction-tap game + fitness declaration, shown on one screen
+# right when the nurse taps "En Route" for an accepted booking (see
+# POST /bookings/{booking_id}/en-route in app/api/v1/bookings.py, which is
+# the endpoint that actually enforces this — this endpoint just records an
+# attempt and tells the client which tier it landed in).
+#
+# Thresholds live in app/services/fatigue_engine.py so they can be retuned
+# in one place. Legacy ALERTNESS_REACTION_THRESHOLD_MS / _MAX_MISSED_TAPS
+# constants are gone — fatigue_engine.evaluate() is now the single source
+# of truth for pass/warning/fail.
 @router.post("/me/alertness-checks", response_model=AlertnessCheckOut, status_code=201)
 async def submit_alertness_check(
     payload: AlertnessCheckSubmit,
@@ -1183,42 +1186,52 @@ async def submit_alertness_check(
         if not booking or booking.worker_id != profile.id:
             raise HTTPException(status_code=403, detail="Not assigned to this booking")
 
-    times = [t for t in payload.round_reaction_times_ms if t is not None and t >= 0]
-    average = int(round(sum(times) / len(times))) if times else None
-    passed = (
-        bool(times)
-        and average is not None
-        and average <= ALERTNESS_REACTION_THRESHOLD_MS
-        and payload.missed_taps <= ALERTNESS_MAX_MISSED_TAPS
+    result = fatigue_engine.evaluate(
+        payload.round_reaction_times_ms,
+        false_starts=payload.missed_taps or payload.false_starts,
     )
 
     check = WorkerAlertnessCheck(
         worker_id=profile.id,
         booking_id=payload.booking_id,
-        round_reaction_times_ms=times or None,
-        average_reaction_time_ms=average,
+        round_reaction_times_ms=[t for t in payload.round_reaction_times_ms if t is not None and t >= 0] or None,
+        average_reaction_time_ms=result.average_reaction_time_ms,
         missed_taps=payload.missed_taps,
-        passed=passed,
+        false_starts_count=result.false_starts,
+        lapses_count=result.lapses_count,
+        tier=result.tier,
+        passed=(result.tier == AlertnessTier.ok),
+        declaration_confirmed=payload.declaration_confirmed,
+        declaration_confirmed_at=datetime.now(timezone.utc) if payload.declaration_confirmed else None,
     )
     db.add(check)
     await db.commit()
     await db.refresh(check)
-    return AlertnessCheckOut.model_validate(check)
+
+    out = AlertnessCheckOut.model_validate(check)
+    out.retry_allowed = result.retry_allowed
+    out.message = result.message
+    out.tier = result.tier.value
+    return out
 
 
 @router.get("/me/alertness-checks/latest", response_model=Optional[AlertnessCheckOut])
 async def latest_alertness_check(
+    booking_id: Optional[UUID] = None,
     profile: WorkerProfile = Depends(get_worker_profile),
     db: AsyncSession = Depends(get_db),
 ):
-    res = await db.execute(
-        select(WorkerAlertnessCheck)
-        .where(WorkerAlertnessCheck.worker_id == profile.id)
-        .order_by(WorkerAlertnessCheck.created_at.desc())
-        .limit(1)
-    )
+    stmt = select(WorkerAlertnessCheck).where(WorkerAlertnessCheck.worker_id == profile.id)
+    if booking_id is not None:
+        stmt = stmt.where(WorkerAlertnessCheck.booking_id == booking_id)
+    stmt = stmt.order_by(WorkerAlertnessCheck.created_at.desc()).limit(1)
+    res = await db.execute(stmt)
     row = res.scalar_one_or_none()
-    return AlertnessCheckOut.model_validate(row) if row else None
+    if not row:
+        return None
+    out = AlertnessCheckOut.model_validate(row)
+    out.tier = row.tier.value if row.tier else ("pass" if row.passed else "fail")
+    return out
 
 
 # ============================================================================

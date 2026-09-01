@@ -825,6 +825,121 @@ async def accept_booking(
     )
 
 
+# ============================================================================
+# "En Route" — gated behind the Nurse Safety Check (reaction test + fitness
+# declaration). The nurse completes both on one combined screen right when
+# she taps this button; the frontend calls POST /workers/me/alertness-checks
+# first, then this endpoint. This endpoint independently re-checks that a
+# passing, declaration-confirmed attempt exists for this booking, so the
+# gate can't be bypassed by skipping the app-side flow.
+# ============================================================================
+_SAFETY_CHECK_MAX_AGE_MINUTES = 15
+
+
+@router.post("/{booking_id}/en-route", response_model=BookingOut)
+async def mark_worker_en_route(
+    booking_id: UUID,
+    profile: WorkerProfile = Depends(get_worker_profile),
+    db: AsyncSession = Depends(get_db),
+):
+    from app.models.models import WorkerAlertnessCheck
+    from app.models.enums import AlertnessTier, WorkerAvailability
+
+    bres = await db.execute(select(Booking).where(Booking.id == booking_id))
+    b = bres.scalar_one_or_none()
+    if not b:
+        raise HTTPException(status_code=404, detail="Booking not found")
+    if b.worker_id != profile.id:
+        raise HTTPException(status_code=403, detail="Not assigned to this booking")
+
+    # Idempotent — nurse re-tapping after already succeeding.
+    if b.status == BookingStatus.worker_en_route:
+        return JSONResponse(status_code=200, content=BookingOut.model_validate(b).model_dump(mode="json"))
+
+    if b.status != BookingStatus.assigned:
+        return JSONResponse(
+            status_code=409,
+            content={
+                "success": False,
+                "code": "BOOKING_NOT_IN_ASSIGNED_STATE",
+                "message": "This booking can't be started right now.",
+            },
+        )
+
+    cutoff = datetime.now(timezone.utc) - timedelta(minutes=_SAFETY_CHECK_MAX_AGE_MINUTES)
+    cres = await db.execute(
+        select(WorkerAlertnessCheck)
+        .where(
+            WorkerAlertnessCheck.booking_id == booking_id,
+            WorkerAlertnessCheck.worker_id == profile.id,
+            WorkerAlertnessCheck.created_at >= cutoff,
+        )
+        .order_by(WorkerAlertnessCheck.created_at.desc())
+        .limit(1)
+    )
+    check = cres.scalar_one_or_none()
+
+    if not check or not check.declaration_confirmed:
+        return JSONResponse(
+            status_code=403,
+            content={
+                "success": False,
+                "code": "SAFETY_CHECK_REQUIRED",
+                "message": "Complete the reaction test and fitness declaration before heading out.",
+            },
+        )
+
+    if check.tier == AlertnessTier.fail:
+        # Lock the shift and hand the booking back to dispatch for the
+        # nearest standby nurse, per the product spec's decision table.
+        b.status = BookingStatus.rematch_pending
+        b.worker_id = None
+        profile.availability = WorkerAvailability.on_leave
+        await audit(
+            db, profile.user_id, "worker", "booking.safety_check_failed", "booking", b.id,
+            {"tier": check.tier.value, "average_reaction_time_ms": check.average_reaction_time_ms},
+        )
+        await db.commit()
+        try:
+            from app.services.dispatch import notify_nearby_workers
+            await notify_nearby_workers(db, b)
+        except Exception:  # noqa: BLE001
+            pass
+        await manager.broadcast(booking_topic(b.id), {"type": "booking.rematch", "booking_id": str(b.id)})
+        return JSONResponse(
+            status_code=403,
+            content={
+                "success": False,
+                "code": "SAFETY_CHECK_FAILED",
+                "message": "You seem very fatigued — this booking has been reassigned so you can rest. Please take a break before your next visit.",
+            },
+        )
+
+    if check.tier == AlertnessTier.warning:
+        return JSONResponse(
+            status_code=403,
+            content={
+                "success": False,
+                "code": "SAFETY_CHECK_WARNING",
+                "message": "Your reaction time is a little slow. Take a 5-second breather and try the check once more.",
+            },
+        )
+
+    # PASS — unlock navigation and start the journey.
+    now = datetime.now(timezone.utc)
+    b.status = BookingStatus.worker_en_route
+    vres = await db.execute(select(VisitRecord).where(VisitRecord.booking_id == b.id))
+    visit = vres.scalar_one_or_none()
+    if visit:
+        visit.status = VisitStatus.en_route
+        visit.en_route_at = now
+    await audit(db, profile.user_id, "worker", "booking.en_route", "booking", b.id)
+    await db.commit()
+    await db.refresh(b)
+    await manager.broadcast(booking_topic(b.id), {"type": "booking.en_route", "booking_id": str(b.id)})
+    return JSONResponse(status_code=200, content=BookingOut.model_validate(b).model_dump(mode="json"))
+
+
 # Neither the nurse nor the customer may cancel inside this window before
 # the scheduled visit start. Admin/ops can always cancel (support cases).
 _CANCELLATION_CUTOFF_HOURS = 6

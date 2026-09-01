@@ -406,6 +406,21 @@ async def approve_prescription(
     if not prescription:
         raise HTTPException(status_code=404, detail="Prescription not found")
 
+    from app.services.composite_care_workflow import is_prescription_expired
+    if is_prescription_expired(prescription) and not prescription.renewal_consultation_paid:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "PRESCRIPTION_EXPIRED",
+                "message": (
+                    "This prescription is more than 6 months old, so it can't be approved as-is. "
+                    "The patient needs to pay a ₹100 doctor consultation charge to renew it "
+                    "before this can be approved."
+                ),
+                "renewal_consultation_fee_inr": 100,
+            },
+        )
+
     prescription.status = PrescriptionStatus.verified
     prescription.verified_by = current.id
     prescription.verified_at = datetime.now(timezone.utc)
@@ -428,6 +443,110 @@ async def approve_prescription(
 
     await db.refresh(booking)
     return BookingOut.model_validate(booking)
+
+
+# ============================================================================
+# Prescription renewal-consultation fee (₹100) — required before an expired
+# Rx (see composite_care_workflow.is_prescription_expired) can be approved.
+# Mirrors the plain booking-payment flow in app/api/v1/payments.py, but is a
+# small standalone Razorpay order tied to the Prescription row rather than
+# the booking's own total_amount.
+# ============================================================================
+class PrescriptionRenewalOrderResponse(BaseModel):
+    razorpay_order_id: str
+    razorpay_key_id: str
+    amount: int
+    currency: str = "INR"
+    prescription_id: UUID
+
+
+class PrescriptionRenewalVerifyRequest(BaseModel):
+    razorpay_order_id: str
+    razorpay_payment_id: str
+    razorpay_signature: str
+
+
+@router.post("/bookings/{booking_id}/prescription-renewal-order", response_model=PrescriptionRenewalOrderResponse)
+async def create_prescription_renewal_order(
+    booking_id: UUID,
+    profile: ConsumerProfile = Depends(get_consumer_profile),
+    db: AsyncSession = Depends(get_db),
+):
+    from app.core.config import settings
+    from app.integrations import razorpay_client
+    from app.services.composite_care_workflow import (
+        PRESCRIPTION_RENEWAL_CONSULTATION_FEE_INR,
+        is_prescription_expired,
+    )
+
+    bres = await db.execute(select(Booking).where(Booking.id == booking_id, Booking.consumer_id == profile.id))
+    booking = bres.scalar_one_or_none()
+    if not booking or not booking.prescription_id:
+        raise HTTPException(status_code=404, detail="Booking or prescription not found")
+
+    rxres = await db.execute(select(Prescription).where(Prescription.id == booking.prescription_id))
+    prescription = rxres.scalar_one_or_none()
+    if not prescription:
+        raise HTTPException(status_code=404, detail="Prescription not found")
+    if not is_prescription_expired(prescription):
+        raise HTTPException(status_code=400, detail="This prescription is not expired — no renewal fee needed")
+    if prescription.renewal_consultation_paid:
+        raise HTTPException(status_code=400, detail="Renewal consultation already paid")
+
+    amount_paise = PRESCRIPTION_RENEWAL_CONSULTATION_FEE_INR * 100
+    order = await razorpay_client.create_order(
+        amount_paise=amount_paise,
+        currency="INR",
+        receipt=f"rxrenewal-{prescription.id}",
+        notes={"booking_id": str(booking.id), "prescription_id": str(prescription.id), "purpose": "prescription_renewal_consultation"},
+    )
+    prescription.renewal_consultation_order_id = order["id"]
+    await db.commit()
+
+    return PrescriptionRenewalOrderResponse(
+        razorpay_order_id=order["id"],
+        razorpay_key_id=settings.RAZORPAY_KEY_ID or "rzp_test_placeholder",
+        amount=amount_paise,
+        prescription_id=prescription.id,
+    )
+
+
+@router.post("/bookings/{booking_id}/prescription-renewal-verify")
+async def verify_prescription_renewal_payment(
+    booking_id: UUID,
+    payload: PrescriptionRenewalVerifyRequest,
+    profile: ConsumerProfile = Depends(get_consumer_profile),
+    db: AsyncSession = Depends(get_db),
+):
+    from app.integrations import razorpay_client
+
+    bres = await db.execute(select(Booking).where(Booking.id == booking_id, Booking.consumer_id == profile.id))
+    booking = bres.scalar_one_or_none()
+    if not booking or not booking.prescription_id:
+        raise HTTPException(status_code=404, detail="Booking or prescription not found")
+
+    rxres = await db.execute(select(Prescription).where(Prescription.id == booking.prescription_id))
+    prescription = rxres.scalar_one_or_none()
+    if not prescription:
+        raise HTTPException(status_code=404, detail="Prescription not found")
+
+    if prescription.renewal_consultation_paid:
+        return {"verified": True, "idempotent_replay": True}
+
+    if prescription.renewal_consultation_order_id != payload.razorpay_order_id:
+        raise HTTPException(status_code=400, detail="Order mismatch")
+
+    ok = razorpay_client.verify_payment_signature(
+        payload.razorpay_order_id, payload.razorpay_payment_id, payload.razorpay_signature
+    )
+    if not ok:
+        raise HTTPException(status_code=400, detail="Invalid signature")
+
+    prescription.renewal_consultation_paid = True
+    prescription.renewal_consultation_paid_at = datetime.now(timezone.utc)
+    await audit(db, profile.user_id, "consumer", "prescription.renewal_consultation_paid", "prescription", prescription.id)
+    await db.commit()
+    return {"verified": True}
 
 
 class PrescriptionRejectRequest(BaseModel):

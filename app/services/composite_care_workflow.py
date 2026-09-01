@@ -103,6 +103,44 @@ def is_guarded_workflow(booking: Booking) -> bool:
     return bool(booking.material_included) or is_service_only_workflow(booking)
 
 
+# ---------------------------------------------------------------------------
+# Prescription expiry / renewal-consultation fee.
+# ---------------------------------------------------------------------------
+# A prescription with no explicit valid_until date is treated as expired once
+# it is this many months past prescribed_date — old paper Rx's don't always
+# carry an explicit validity date, so we fall back to a flat staleness window
+# rather than treating "no date" as "forever valid".
+PRESCRIPTION_VALIDITY_MONTHS = 6
+PRESCRIPTION_RENEWAL_CONSULTATION_FEE_INR = 100
+
+
+def is_prescription_expired(prescription) -> bool:
+    """True if this Rx is stale enough to need a fresh doctor consultation.
+
+    Priority: an explicit valid_until date always wins if present. Otherwise
+    fall back to prescribed_date + PRESCRIPTION_VALIDITY_MONTHS. If neither
+    date is on file, we can't judge staleness, so it's treated as not
+    expired rather than blocking a booking on missing data.
+    """
+    today = datetime.now(timezone.utc).date()
+    if prescription.valid_until is not None:
+        return prescription.valid_until < today
+    if prescription.prescribed_date is not None:
+        cutoff = _add_months(prescription.prescribed_date, PRESCRIPTION_VALIDITY_MONTHS)
+        return cutoff < today
+    return False
+
+
+def _add_months(d, months: int):
+    """Add calendar months to a date without pulling in python-dateutil."""
+    month_index = d.month - 1 + months
+    year = d.year + month_index // 12
+    month = month_index % 12 + 1
+    day = min(d.day, [31, 29 if year % 4 == 0 and (year % 100 != 0 or year % 400 == 0) else 28,
+                       31, 30, 31, 30, 31, 31, 30, 31, 30, 31][month - 1])
+    return d.replace(year=year, month=month, day=day)
+
+
 async def _next_invoice_number(db: AsyncSession) -> str:
     count = (await db.execute(select(func.count()).select_from(Invoice))).scalar_one()
     today = datetime.now(timezone.utc).strftime("%Y%m%d")
