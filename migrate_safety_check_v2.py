@@ -42,7 +42,7 @@ STATEMENTS = [
     "CREATE INDEX IF NOT EXISTS ix_worker_alertness_checks_booking ON worker_alertness_checks (booking_id)",
     # Backfill tier for any pre-existing rows from before this migration,
     # so historical attempts aren't silently NULL.
-    "UPDATE worker_alertness_checks SET tier = CASE WHEN passed THEN 'pass' ELSE 'fail' END WHERE tier IS NULL",
+    "UPDATE worker_alertness_checks SET tier = (CASE WHEN passed THEN 'pass' ELSE 'fail' END)::alertness_tier WHERE tier IS NULL",
     # Prescription renewal-consultation fee (expired-Rx gate).
     "ALTER TABLE prescriptions ADD COLUMN IF NOT EXISTS renewal_consultation_paid BOOLEAN NOT NULL DEFAULT false",
     "ALTER TABLE prescriptions ADD COLUMN IF NOT EXISTS renewal_consultation_order_id VARCHAR(100)",
