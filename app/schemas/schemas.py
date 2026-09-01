@@ -1075,6 +1075,10 @@ class AlertnessCheckSubmit(BaseModel):
     booking_id: Optional[UUID] = None
     round_reaction_times_ms: List[int] = Field(default_factory=list)
     missed_taps: int = 0
+    # New fields for the combined reaction-test + declaration screen shown
+    # right when a nurse taps "En Route".
+    false_starts: int = 0
+    declaration_confirmed: bool = False
 
 
 class AlertnessCheckOut(ORMModel):
@@ -1084,6 +1088,12 @@ class AlertnessCheckOut(ORMModel):
     average_reaction_time_ms: Optional[int] = None
     missed_taps: int
     passed: bool
+    false_starts_count: int = 0
+    lapses_count: int = 0
+    tier: str
+    declaration_confirmed: bool = False
+    retry_allowed: bool = False
+    message: Optional[str] = None
     created_at: datetime
 
 

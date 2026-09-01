@@ -107,6 +107,17 @@ class DrugAllergyEscalation(str, Enum):
     emergency = "emergency"
 
 
+class AlertnessTier(str, Enum):
+    """Outcome of a pre-visit reaction-time safety check.
+
+    See app/services/fatigue_engine.py for the thresholds that decide
+    which tier a given attempt lands in.
+    """
+    ok = "pass"
+    warning = "warning"
+    fail = "fail"
+
+
 class BookingStatus(str, Enum):
     draft = "draft"
     pending_payment = "pending_payment"
@@ -148,6 +159,12 @@ class PackageBookingStatus(str, Enum):
 
 class VisitStatus(str, Enum):
     scheduled = "scheduled"
+    # Added so VisitRecord.status can actually reach the en_route_at /
+    # arrived_at timestamp columns that already existed on the model —
+    # previously those columns were dead weight because the enum jumped
+    # straight from scheduled to in_progress.
+    en_route = "en_route"
+    arrived = "arrived"
     in_progress = "in_progress"
     completed = "completed"
     cancelled = "cancelled"

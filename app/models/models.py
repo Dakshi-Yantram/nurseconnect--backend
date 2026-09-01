@@ -32,6 +32,7 @@ from app.core.database import Base
 from app.models.enums import (
     WorkerType,
     ProviderStatusChangeReason,
+    AlertnessTier,
     AssessmentQuestionType,
     BillingTrigger,
     BookingStatus,
@@ -1000,6 +1001,12 @@ class Prescription(Base):
     verified_by: Mapped[Optional[UUID]] = mapped_column(PG_UUID(as_uuid=True), ForeignKey("users.id"))
     verified_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
     rejection_reason: Mapped[Optional[str]] = mapped_column(Text)
+    # Renewal-consultation gate: if the Rx is stale (see
+    # composite_care_workflow.is_prescription_expired), the pharmacist can't
+    # approve it until this is paid — a ₹100 doctor consultation charge.
+    renewal_consultation_paid: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false")
+    renewal_consultation_order_id: Mapped[Optional[str]] = mapped_column(String(100))
+    renewal_consultation_paid_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now, server_default=func.now())
 
 
@@ -1819,11 +1826,27 @@ class WorkerAlertnessCheck(Base):
     # Per-round reaction times in milliseconds, e.g. [412, 388, 705].
     round_reaction_times_ms: Mapped[Optional[list]] = mapped_column(ARRAY(Integer))
     average_reaction_time_ms: Mapped[Optional[int]] = mapped_column(Integer)
-    # Taps on the wrong spot / before the target appeared.
+    # Taps on the wrong spot / before the target appeared. Kept for backward
+    # compatibility with the original pass/fail-only check; new attempts also
+    # populate false_starts_count below, which is what the tiered decision
+    # logic in app/services/fatigue_engine.py actually reads.
     missed_taps: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
     passed: Mapped[bool] = mapped_column(Boolean, nullable=False)
+
+    # --- fields added for the tiered pre-visit "En Route" safety gate ---
+    false_starts_count: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    lapses_count: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    tier: Mapped[Optional[AlertnessTier]] = mapped_column(
+        SQLEnum(AlertnessTier, name="alertness_tier"), default=AlertnessTier.ok
+    )
+    # The nurse's Step-2 fitness declaration, captured on the same screen as
+    # the reaction test (see mockup). Required before "En Route" can proceed.
+    declaration_confirmed: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false")
+    declaration_confirmed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now, server_default=func.now())
 
     __table_args__ = (
         Index("ix_worker_alertness_checks_worker_created", "worker_id", "created_at"),
+        Index("ix_worker_alertness_checks_booking", "booking_id"),
     )
