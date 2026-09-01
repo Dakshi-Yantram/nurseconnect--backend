@@ -5,7 +5,7 @@ from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
-from sqlalchemy import and_, select
+from sqlalchemy import and_, delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
@@ -16,34 +16,52 @@ from app.core.deps import (
     require_roles,
 )
 from app.integrations import cloudinary_client
+from app.integrations.providers import ExternalProviderError
 from app.models.enums import (
+    AlertnessTier,
     UserRole,
+    VisitStatus,
     WorkerAvailability,
     WorkerOnboardingStatus,
     WorkerPreferenceStatus,
     WorkerQualificationSource,
     WorkerQualificationStatus,
 )
+from app.services import fatigue_engine
 from app.models.models import (
+    Booking,
     CarePackage,
     ServiceCatalogue,
     User,
+    VisitRecord,
+    VitalSignReading,
+    WorkerAlertnessCheck,
+    WorkerAvailabilitySlot,
     WorkerCertificate,
     WorkerDocument,
     WorkerKitItem,
     WorkerProfile,
+    WorkerReference,
     WorkerServicePreference,
     WorkerServiceQualification,
 )
 from app.schemas.schemas import (
+    AlertnessCheckOut,
+    AlertnessCheckSubmit,
+    AvailabilitySlotOut,
+    AvailabilitySlotsBulkUpdate,
     AvailabilityToggleRequest,
     BankDetailsUpdate,
+    PatientHistoryOut,
+    PatientOut,
+    PatientVisitHistoryItem,
     WorkerLocationUpdateRequest,
     WorkerProfileOut,
     WorkerProfileUpdate,
     WorkerPublicOut,
     WorkerSearchQuery,
 )
+from app.security.access_control import assert_user_can_access_patient
 from app.services.common_services import audit
 from app.services.qualification import (
     is_worker_opted_in_for_service,
@@ -53,37 +71,22 @@ from app.services.qualification import (
 router = APIRouter(prefix="/workers", tags=["workers"])
 
 from app.models.enums import WorkerType
-
-# Required documents differ by worker type. Nurses are clinically qualified;
-# caregivers are non-clinical helpers, so no nursing license is demanded of them.
-REQUIRED_DOCUMENTS_BY_TYPE = {
-    WorkerType.nurse: {"aadhaar", "nursing_license", "degree_certificate", "police_verification"},
-    WorkerType.caregiver: {"aadhaar", "police_verification"},
-}
-# Optional / supporting documents (uploaded to strengthen the profile / unlock
-# more services), never block submission.
-OPTIONAL_DOCUMENTS_BY_TYPE = {
-    WorkerType.nurse: {"experience_certificate", "specialization_certificate"},
-    WorkerType.caregiver: {"caregiver_training_certificate", "degree_certificate", "experience_certificate"},
-}
-# Human-readable labels for the app.
-DOCUMENT_LABELS = {
-    "aadhaar": "Aadhaar Card",
-    "nursing_license": "Nursing Registration / License",
-    "degree_certificate": "Degree / Education Certificate",
-    "police_verification": "Police Verification",
-    "experience_certificate": "Experience Certificate",
-    "specialization_certificate": "Specialization Certificate",
-    "caregiver_training_certificate": "Caregiver Training Certificate",
-}
+from app.core.provider_types import (
+    DOCUMENT_LABELS,
+    LICENSED_PROVIDER_TYPES,
+    OPTIONAL_DOCUMENTS_BY_PROVIDER_TYPE as OPTIONAL_DOCUMENTS_BY_TYPE,
+    REQUIRED_DOCUMENTS_BY_PROVIDER_TYPE as REQUIRED_DOCUMENTS_BY_TYPE,
+    optional_docs as _optional_docs_for_type,
+    required_docs as _required_docs_for_type,
+)
 
 
 def _required_docs(profile) -> set:
-    return REQUIRED_DOCUMENTS_BY_TYPE.get(getattr(profile, "worker_type", WorkerType.nurse), REQUIRED_DOCUMENTS_BY_TYPE[WorkerType.nurse])
+    return _required_docs_for_type(getattr(profile, "worker_type", WorkerType.nurse))
 
 
 def _optional_docs(profile) -> set:
-    return OPTIONAL_DOCUMENTS_BY_TYPE.get(getattr(profile, "worker_type", WorkerType.nurse), set())
+    return _optional_docs_for_type(getattr(profile, "worker_type", WorkerType.nurse))
 
 
 def _all_allowed_docs(profile) -> set:
@@ -92,8 +95,16 @@ def _all_allowed_docs(profile) -> set:
 
 def _doc_catalogue(profile) -> list:
     req, opt = _required_docs(profile), _optional_docs(profile)
-    out = [{"type": t, "label": DOCUMENT_LABELS.get(t, t), "required": True} for t in sorted(req)]
-    out += [{"type": t, "label": DOCUMENT_LABELS.get(t, t), "required": False} for t in sorted(opt)]
+    # Keep both keys for app compatibility: older mobile builds read `type`,
+    # newer screens read `document_type`.
+    out = [
+        {"type": t, "document_type": t, "label": DOCUMENT_LABELS.get(t, t), "required": True}
+        for t in sorted(req)
+    ]
+    out += [
+        {"type": t, "document_type": t, "label": DOCUMENT_LABELS.get(t, t), "required": False}
+        for t in sorted(opt)
+    ]
     return out
 
 
@@ -124,15 +135,26 @@ async def _onboarding_snapshot(
     profile_values = {
         "full_name": user.full_name,
         "date_of_birth": profile.date_of_birth,
-        "registration_no": profile.registration_no,
-        "registration_authority": profile.registration_authority,
-        "registration_valid_until": profile.registration_valid_until,
         "base_city": profile.base_city,
     }
+    worker_type = getattr(profile, "worker_type", WorkerType.nurse)
+    # Registration/license fields only apply to licensed provider types
+    # (Nurse, Doctor, Dentist, Physiotherapist). Caregiver and Mother & Baby
+    # Caregiver never require a degree/registration, per spec — previously
+    # this block required registration_no for every worker type, which
+    # silently blocked caregivers from ever completing onboarding.
+    if worker_type in LICENSED_PROVIDER_TYPES:
+        profile_values["registration_no"] = profile.registration_no
+        profile_values["registration_authority"] = profile.registration_authority
+        profile_values["registration_valid_until"] = profile.registration_valid_until
     for field, value in profile_values.items():
         if value is None or (isinstance(value, str) and not value.strip()):
             missing_profile_fields.append(field)
-    if profile.registration_valid_until and profile.registration_valid_until < date.today():
+    if (
+        worker_type in LICENSED_PROVIDER_TYPES
+        and profile.registration_valid_until
+        and profile.registration_valid_until < date.today()
+    ):
         missing_profile_fields.append("registration_valid_until_not_expired")
 
     missing_documents = sorted(_required_docs(profile) - uploaded_types)
@@ -141,7 +163,8 @@ async def _onboarding_snapshot(
     )
     return {
         "onboarding_status": profile.onboarding_status.value,
-        "worker_type": getattr(profile, "worker_type", WorkerType.nurse).value,
+        "worker_type": worker_type.value,
+        "requires_license": worker_type in LICENSED_PROVIDER_TYPES,
         "background_check_status": profile.background_check_status,
         "documents": _doc_catalogue(profile),
         "missing_profile_fields": missing_profile_fields,
@@ -442,11 +465,16 @@ async def upload_document_file(
             status_code=400,
             detail=f"Unsupported document type. Allowed: {sorted(_all_allowed_docs(profile))}",
         )
-    upload = await cloudinary_client.upload_base64(
-        payload.data_base64,
-        folder=f"nurseconnect/workers/{profile.id}",
-        resource_type="auto",
-    )
+    if not payload.data_base64.strip():
+        raise HTTPException(status_code=400, detail="No document file was attached")
+    try:
+        upload = await cloudinary_client.upload_base64(
+            payload.data_base64,
+            folder=f"nurseconnect/workers/{profile.id}",
+            resource_type="auto",
+        )
+    except ExternalProviderError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
     doc = WorkerDocument(
         worker_id=profile.id,
         document_type=payload.document_type,
@@ -485,6 +513,86 @@ async def list_documents(profile: WorkerProfile = Depends(get_worker_profile), d
         }
         for d in docs
     ]
+
+
+# ----- References (character/employer references — used mainly for
+# Caregiver / Mother & Baby Caregiver onboarding, where there's no degree
+# to verify so a previous employer/character reference carries more weight;
+# not restricted to those provider types). Worker self-service: a worker
+# can add and view their own references. Verifying a reference (or adding
+# one on a worker's behalf, e.g. from a phone call) is admin/reviewer-only
+# — see /admin/workers/{worker_id}/references in admin.py. -----
+class WorkerReferenceCreate(BaseModel):
+    reference_name: str
+    relationship_to_worker: Optional[str] = None
+    phone: Optional[str] = None
+    previous_employer_name: Optional[str] = None
+
+
+def _serialize_own_reference(ref: WorkerReference) -> dict:
+    return {
+        "id": str(ref.id),
+        "reference_name": ref.reference_name,
+        "relationship_to_worker": ref.relationship_to_worker,
+        "phone": ref.phone,
+        "previous_employer_name": ref.previous_employer_name,
+        "verification_status": ref.verification_status,
+        "created_at": ref.created_at.isoformat() if ref.created_at else None,
+    }
+
+
+@router.get("/me/references")
+async def list_my_references(profile: WorkerProfile = Depends(get_worker_profile), db: AsyncSession = Depends(get_db)):
+    res = await db.execute(
+        select(WorkerReference).where(WorkerReference.worker_id == profile.id).order_by(WorkerReference.created_at.desc())
+    )
+    return [_serialize_own_reference(r) for r in res.scalars().all()]
+
+
+@router.post("/me/references", status_code=201)
+async def add_my_reference(
+    payload: WorkerReferenceCreate,
+    profile: WorkerProfile = Depends(get_worker_profile),
+    db: AsyncSession = Depends(get_db),
+):
+    """A worker can add a reference at any time during onboarding, but
+    can't self-verify it — verification_status always starts 'pending' and
+    only moves via the admin endpoint (PATCH /admin/references/{id}/verify)."""
+    ref = WorkerReference(
+        worker_id=profile.id,
+        reference_name=payload.reference_name.strip(),
+        relationship_to_worker=payload.relationship_to_worker,
+        phone=payload.phone,
+        previous_employer_name=payload.previous_employer_name,
+        verification_status="pending",
+    )
+    db.add(ref)
+    await db.commit()
+    await db.refresh(ref)
+    return _serialize_own_reference(ref)
+
+
+@router.delete("/me/references/{reference_id}")
+async def delete_my_reference(
+    reference_id: UUID,
+    profile: WorkerProfile = Depends(get_worker_profile),
+    db: AsyncSession = Depends(get_db),
+):
+    """A worker may only delete their own reference, and only while it's
+    still pending — once admin has verified/rejected it, it becomes part of
+    the onboarding record and stays (consistent with documents, which also
+    can't be silently removed post-review)."""
+    res = await db.execute(
+        select(WorkerReference).where(WorkerReference.id == reference_id, WorkerReference.worker_id == profile.id)
+    )
+    ref = res.scalar_one_or_none()
+    if not ref:
+        raise HTTPException(status_code=404, detail="Reference not found")
+    if ref.verification_status != "pending":
+        raise HTTPException(status_code=409, detail="Can't delete a reference that's already been reviewed")
+    await db.delete(ref)
+    await db.commit()
+    return {"id": str(reference_id), "deleted": True}
 
 
 # ----- Certificates -----
@@ -571,6 +679,48 @@ async def my_earnings(profile: WorkerProfile = Depends(get_worker_profile), db: 
     }
 
 
+@router.get("/me/badges")
+async def my_badges(
+    profile: WorkerProfile = Depends(get_worker_profile),
+    db: AsyncSession = Depends(get_db),
+):
+    """Skill badges for the signed-in worker.
+
+    Badges are created elsewhere (tier badge on approval, assessment badge on
+    a passed assessment). This endpoint was missing entirely, so the nurse
+    dashboard's /workers/me/badges fetch always 404'd and showed "No badges
+    yet" — even for a worker who had genuinely passed an assessment.
+
+    Two guarantees enforced here:
+      * Everyone has at least their current-tier badge. If a worker never got
+        one (e.g. created before the tier-badge award existed, or self-signup
+        that skipped admin approval) it is granted on read, so the floor is
+        always Tier 1.
+      * Higher tiers show as higher badges automatically, because the tier
+        badge label is derived from WorkerProfile.tier, which admin raises as
+        the worker clears more assessments.
+    """
+    from app.models.models import WorkerBadge
+    from app.services.badges import award_tier_badge, serialize_badge
+
+    res = await db.execute(
+        select(WorkerBadge)
+        .where(WorkerBadge.worker_id == profile.id, WorkerBadge.revoked_at.is_(None))
+        .order_by(WorkerBadge.awarded_at.desc())
+    )
+    badges = list(res.scalars().all())
+
+    # Self-heal the tier-badge floor so every worker has a minimum Tier 1 badge.
+    has_tier_badge = any(b.source == "tier" for b in badges)
+    if not has_tier_badge:
+        awarded = await award_tier_badge(db, profile)
+        if awarded is not None:
+            await db.commit()
+            badges.insert(0, awarded)
+
+    return [serialize_badge(b) for b in badges]
+
+
 # ============================================================================
 # Patch 2 — Service eligibility + preference management
 # ============================================================================
@@ -609,14 +759,26 @@ async def my_service_eligibility(
     profile: WorkerProfile = Depends(get_worker_profile),
     db: AsyncSession = Depends(get_db),
 ):
-    """List every active care package (admin-managed, no standalone
-    services) with the worker's current qualification + preference status
-    and whether they may opt in. No price is ever included here — nurses
-    see packages purely as opt-in offerings gated by training/assessments."""
+    """List every active care package AND standalone service (admin-managed)
+    with the worker's current qualification + preference status and whether
+    they may opt in. No price is ever included here — nurses see offerings
+    purely as opt-in items gated by training/assessments.
+
+    BUGFIX: this used to only return CarePackage rows, so standalone
+    micro-visit services (Wound Dressing, Injection, Vitals Monitoring,
+    etc.) never appeared here and workers had no way to opt in to them —
+    even though the PUT /me/service-preferences endpoint already fully
+    supported target_type="service". Booking dispatch (new-requests) filters
+    on opt-in for both services and packages, so without this fix standalone
+    services could never be surfaced to any worker.
+    """
     items: List[ServiceEligibilityItem] = []
 
     pres = await db.execute(select(CarePackage).where(CarePackage.is_active.is_(True)))
     packages = list(pres.scalars().all())
+
+    sres = await db.execute(select(ServiceCatalogue).where(ServiceCatalogue.is_active.is_(True)))
+    services = list(sres.scalars().all())
 
     # Pre-fetch qualifications & preferences for this worker (single-pass).
     qres = await db.execute(
@@ -624,22 +786,61 @@ async def my_service_eligibility(
             WorkerServiceQualification.worker_id == profile.id
         )
     )
-    qmap_pkg = {q.package_id: q for q in qres.scalars().all() if q.package_id is not None}
+    all_quals = list(qres.scalars().all())
+    qmap_pkg = {q.package_id: q for q in all_quals if q.package_id is not None}
+    qmap_svc = {q.service_id: q for q in all_quals if q.service_id is not None}
 
     prres = await db.execute(
         select(WorkerServicePreference).where(
             WorkerServicePreference.worker_id == profile.id
         )
     )
-    pmap_pkg = {p.package_id: p for p in prres.scalars().all() if p.package_id is not None}
+    all_prefs = list(prres.scalars().all())
+    pmap_pkg = {p.package_id: p for p in all_prefs if p.package_id is not None}
+    pmap_svc = {p.service_id: p for p in all_prefs if p.service_id is not None}
+
+    for svc in services:
+        q = qmap_svc.get(svc.id)
+        p = pmap_svc.get(svc.id)
+        q_status = q.qualification_status.value if q else WorkerQualificationStatus.NOT_QUALIFIED.value
+        q_source = q.qualification_source.value if (q and q.qualification_source) else None
+        # An absent preference row means "not yet chosen", and dispatch treats
+        # that as opted-in (see is_worker_opted_in_for_service). Report the
+        # same default here — otherwise this screen tells a nurse they are
+        # opted out of work they are in fact being offered.
+        p_status = p.preference_status.value if p else WorkerPreferenceStatus.OPTED_IN.value
+        willing = bool(p.willing_to_accept) if p else True
+
+        qualified, locked_reason = await is_worker_qualified_for_service(profile, svc, db)
+
+        items.append(ServiceEligibilityItem(
+            target_type="service",
+            id=svc.id,
+            code=svc.service_code,
+            name=svc.name,
+            category=svc.category.value if svc.category else None,
+            min_tier=svc.min_tier.value if svc.min_tier else None,
+            risk_level=svc.risk_level.value if getattr(svc, "risk_level", None) else None,
+            qualification_status=q_status,
+            qualification_source=q_source,
+            preference_status=p_status,
+            willing_to_accept=willing,
+            can_opt_in=qualified,
+            locked_reason=None if qualified else locked_reason,
+            requires_admin_skill_approval=bool(getattr(svc, "requires_admin_skill_approval", False)),
+        ))
 
     for pkg in packages:
         q = qmap_pkg.get(pkg.id)
         p = pmap_pkg.get(pkg.id)
         q_status = q.qualification_status.value if q else WorkerQualificationStatus.NOT_QUALIFIED.value
         q_source = q.qualification_source.value if (q and q.qualification_source) else None
-        p_status = p.preference_status.value if p else WorkerPreferenceStatus.OPTED_OUT.value
-        willing = bool(p.willing_to_accept) if p else False
+        # An absent preference row means "not yet chosen", and dispatch treats
+        # that as opted-in (see is_worker_opted_in_for_service). Report the
+        # same default here — otherwise this screen tells a nurse they are
+        # opted out of work they are in fact being offered.
+        p_status = p.preference_status.value if p else WorkerPreferenceStatus.OPTED_IN.value
+        willing = bool(p.willing_to_accept) if p else True
 
         qualified, locked_reason = await is_worker_qualified_for_service(profile, pkg, db)
 
@@ -873,6 +1074,7 @@ async def request_service_qualification(
 
 
 class ServiceAreaRequest(BaseModel):
+    home_address: Optional[str] = None
     base_city: Optional[str] = None
     latitude: Optional[float] = None
     longitude: Optional[float] = None
@@ -885,6 +1087,8 @@ async def set_service_area(
     profile: WorkerProfile = Depends(get_worker_profile),
     db: AsyncSession = Depends(get_db),
 ):
+    if payload.home_address is not None:
+        profile.home_address = payload.home_address.strip() or None
     if payload.base_city is not None:
         profile.base_city = payload.base_city.strip() or None
     if payload.latitude is not None and payload.longitude is not None:
@@ -894,8 +1098,203 @@ async def set_service_area(
         profile.service_radius_km = max(1, min(int(payload.service_radius_km), 100))
     await db.commit()
     return {
+        "home_address": profile.home_address,
         "base_city": profile.base_city,
         "home_latitude": float(profile.home_latitude) if profile.home_latitude is not None else None,
         "home_longitude": float(profile.home_longitude) if profile.home_longitude is not None else None,
         "service_radius_km": profile.service_radius_km,
     }
+
+
+# ============================================================================
+# Weekly availability slots — "which hours am I open to working"
+# ============================================================================
+@router.get("/me/availability-slots", response_model=List[AvailabilitySlotOut])
+async def list_availability_slots(
+    profile: WorkerProfile = Depends(get_worker_profile),
+    db: AsyncSession = Depends(get_db),
+):
+    res = await db.execute(
+        select(WorkerAvailabilitySlot)
+        .where(
+            WorkerAvailabilitySlot.worker_id == profile.id,
+            WorkerAvailabilitySlot.is_active.is_(True),
+        )
+        .order_by(WorkerAvailabilitySlot.day_of_week, WorkerAvailabilitySlot.start_time)
+    )
+    return [AvailabilitySlotOut.model_validate(s) for s in res.scalars().all()]
+
+
+@router.put("/me/availability-slots", response_model=List[AvailabilitySlotOut])
+async def replace_availability_slots(
+    payload: AvailabilitySlotsBulkUpdate,
+    profile: WorkerProfile = Depends(get_worker_profile),
+    db: AsyncSession = Depends(get_db),
+):
+    """Replaces the nurse's whole weekly schedule in one call — simplest
+    correct semantics for a "these are the hours I work" editor screen.
+    Sending an empty list clears the schedule."""
+    for slot in payload.slots:
+        if slot.end_time <= slot.start_time:
+            raise HTTPException(
+                status_code=400,
+                detail=f"End time must be after start time (day {slot.day_of_week})",
+            )
+    await db.execute(
+        delete(WorkerAvailabilitySlot).where(WorkerAvailabilitySlot.worker_id == profile.id)
+    )
+    for slot in payload.slots:
+        db.add(
+            WorkerAvailabilitySlot(
+                worker_id=profile.id,
+                day_of_week=slot.day_of_week,
+                start_time=slot.start_time,
+                end_time=slot.end_time,
+            )
+        )
+    await db.commit()
+    res = await db.execute(
+        select(WorkerAvailabilitySlot)
+        .where(WorkerAvailabilitySlot.worker_id == profile.id)
+        .order_by(WorkerAvailabilitySlot.day_of_week, WorkerAvailabilitySlot.start_time)
+    )
+    return [AvailabilitySlotOut.model_validate(s) for s in res.scalars().all()]
+
+
+# ============================================================================
+# Pre-visit alertness / fatigue gate ("Nurse Safety Check")
+# ============================================================================
+# A combined reaction-tap game + fitness declaration, shown on one screen
+# right when the nurse taps "En Route" for an accepted booking (see
+# POST /bookings/{booking_id}/en-route in app/api/v1/bookings.py, which is
+# the endpoint that actually enforces this — this endpoint just records an
+# attempt and tells the client which tier it landed in).
+#
+# Thresholds live in app/services/fatigue_engine.py so they can be retuned
+# in one place. Legacy ALERTNESS_REACTION_THRESHOLD_MS / _MAX_MISSED_TAPS
+# constants are gone — fatigue_engine.evaluate() is now the single source
+# of truth for pass/warning/fail.
+@router.post("/me/alertness-checks", response_model=AlertnessCheckOut, status_code=201)
+async def submit_alertness_check(
+    payload: AlertnessCheckSubmit,
+    profile: WorkerProfile = Depends(get_worker_profile),
+    db: AsyncSession = Depends(get_db),
+):
+    if payload.booking_id is not None:
+        bres = await db.execute(select(Booking).where(Booking.id == payload.booking_id))
+        booking = bres.scalar_one_or_none()
+        if not booking or booking.worker_id != profile.id:
+            raise HTTPException(status_code=403, detail="Not assigned to this booking")
+
+    result = fatigue_engine.evaluate(
+        payload.round_reaction_times_ms,
+        false_starts=payload.missed_taps or payload.false_starts,
+    )
+
+    check = WorkerAlertnessCheck(
+        worker_id=profile.id,
+        booking_id=payload.booking_id,
+        round_reaction_times_ms=[t for t in payload.round_reaction_times_ms if t is not None and t >= 0] or None,
+        average_reaction_time_ms=result.average_reaction_time_ms,
+        missed_taps=payload.missed_taps,
+        false_starts_count=result.false_starts,
+        lapses_count=result.lapses_count,
+        tier=result.tier,
+        passed=(result.tier == AlertnessTier.ok),
+        declaration_confirmed=payload.declaration_confirmed,
+        declaration_confirmed_at=datetime.now(timezone.utc) if payload.declaration_confirmed else None,
+    )
+    db.add(check)
+    await db.commit()
+    await db.refresh(check)
+
+    out = AlertnessCheckOut.model_validate(check)
+    out.retry_allowed = result.retry_allowed
+    out.message = result.message
+    out.tier = result.tier.value
+    return out
+
+
+@router.get("/me/alertness-checks/latest", response_model=Optional[AlertnessCheckOut])
+async def latest_alertness_check(
+    booking_id: Optional[UUID] = None,
+    profile: WorkerProfile = Depends(get_worker_profile),
+    db: AsyncSession = Depends(get_db),
+):
+    stmt = select(WorkerAlertnessCheck).where(WorkerAlertnessCheck.worker_id == profile.id)
+    if booking_id is not None:
+        stmt = stmt.where(WorkerAlertnessCheck.booking_id == booking_id)
+    stmt = stmt.order_by(WorkerAlertnessCheck.created_at.desc()).limit(1)
+    res = await db.execute(stmt)
+    row = res.scalar_one_or_none()
+    if not row:
+        return None
+    out = AlertnessCheckOut.model_validate(row)
+    out.tier = row.tier.value if row.tier else ("pass" if row.passed else "fail")
+    return out
+
+
+# ============================================================================
+# Patient care history — nurse-facing
+# ============================================================================
+@router.get("/patients/{patient_id}/history", response_model=PatientHistoryOut)
+async def worker_patient_history(
+    patient_id: UUID,
+    current: CurrentUser = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Past completed visits for a patient, for a nurse who has (or has had)
+    a booking with them — so she can see what previous nurses recorded
+    before she arrives. Access is enforced by ``assert_user_can_access_patient``:
+    a worker only sees this if she's been assigned to at least one booking
+    for this patient (or is an admin)."""
+    patient = await assert_user_can_access_patient(db, current, patient_id)
+
+    rows = await db.execute(
+        select(VisitRecord, Booking, User.full_name)
+        .join(Booking, Booking.id == VisitRecord.booking_id)
+        .join(WorkerProfile, WorkerProfile.id == VisitRecord.worker_id)
+        .join(User, User.id == WorkerProfile.user_id)
+        .where(
+            VisitRecord.patient_id == patient_id,
+            VisitRecord.status == VisitStatus.completed,
+        )
+        .order_by(Booking.scheduled_date.desc())
+    )
+    rows = rows.all()
+
+    items: List[PatientVisitHistoryItem] = []
+    for visit, booking, worker_name in rows:
+        vres = await db.execute(
+            select(VitalSignReading)
+            .where(VitalSignReading.visit_record_id == visit.id)
+            .order_by(VitalSignReading.recorded_at.asc())
+        )
+        vitals = [
+            {
+                "recorded_at": v.recorded_at.isoformat(),
+                "bp": f"{v.bp_systolic}/{v.bp_diastolic}" if v.bp_systolic and v.bp_diastolic else None,
+                "pulse": v.pulse,
+                "spo2": v.spo2,
+                "temperature_f": float(v.temperature_f) if v.temperature_f is not None else None,
+            }
+            for v in vres.scalars().all()
+        ]
+        items.append(
+            PatientVisitHistoryItem(
+                booking_id=booking.id,
+                visit_id=visit.id,
+                scheduled_date=booking.scheduled_date,
+                status=visit.status,
+                worker_id=visit.worker_id,
+                worker_name=worker_name,
+                care_notes=visit.care_notes,
+                family_summary=visit.family_summary,
+                checklist_responses=visit.checklist_responses,
+                vitals=vitals or None,
+                check_in_at=visit.check_in_at,
+                check_out_at=visit.check_out_at,
+            )
+        )
+
+    return PatientHistoryOut(patient=PatientOut.model_validate(patient), visits=items)
