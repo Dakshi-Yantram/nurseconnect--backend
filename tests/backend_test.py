@@ -44,10 +44,10 @@ class TestHealth:
 class TestAuth:
     def test_send_otp_consumer(self):
         r = requests.post(
-            f"{API}/auth/send-otp",
-            json={"phone_e164": "+919999000001", "role": "consumer"},
-            timeout=10,
-        )
+        f"{API}/auth/otp/send",   # ✅ correct
+        json={"phone_e164": "+919999000001", "role": "consumer"},
+        timeout=10,
+    )
         assert r.status_code == 200, r.text
         body = r.json()
         assert body.get("dev_otp") == "123456"
