@@ -162,11 +162,19 @@ class Msg91Client:
         self.template_id = settings.MSG91_TEMPLATE_ID
 
     async def send_otp(self, phone_e164: str, otp: str) -> Dict[str, Any]:
-        """Send an already-generated OTP via MSG91's SendOTP API.
+        """Send an already-generated OTP via MSG91's Flow API.
 
-        MSG91's v5 /otp endpoint is a GET request with query params (NOT a
-        JSON POST body — a POST+json call silently gets ignored/rejected by
-        MSG91). ``otp`` here is OUR own generated code (see auth.py); we pass
+        Our template lives under SMS > Templates in the MSG91 dashboard
+        (created/verified there, and "Test DLT" from that page sends fine).
+        That's MSG91's *Flow* template pool — a totally separate pool from
+        the dedicated "OTP" product's SendOTP templates. Calling
+        /api/v5/otp with a Flow template_id reliably comes back
+        "Template ID Missing or Invalid Template" even though the ID is
+        right there in the request — MSG91 is looking it up in the wrong
+        pool. /api/v5/flow/ is the correct endpoint for a Flow template.
+        The template content is "Your OTP for login is ##number##...", so
+        the variable name the Flow API expects is "number".
+        ``otp`` here is OUR own generated code (see auth.py); we pass
         it through so MSG91 just relays it inside the DLT-approved template
         rather than generating its own (which would break our own hash-based
         verification in otp_verify()).
@@ -175,19 +183,23 @@ class Msg91Client:
             logger.info("MOCK MSG91 send_otp phone=%s code=%s", phone_e164, otp)
             return {"type": "success", "request_id": f"msg91_mock_{uuid.uuid4().hex[:10]}"}
         import httpx
-        params = {
+        payload = {
             "template_id": self.template_id,
-            "mobile": phone_e164.lstrip("+"),
-            "authkey": self.auth_key,
-            "otp": otp,
+            "short_url": "0",
+            "recipients": [
+                {
+                    "mobiles": phone_e164.lstrip("+"),
+                    "number": otp,
+                }
+            ],
         }
         if self.sender_id:
-            params["sender"] = self.sender_id
+            payload["sender"] = self.sender_id
         async with httpx.AsyncClient() as client:
             resp = await client.post(
-                "https://control.msg91.com/api/v5/otp",
-                params=params,
-                headers={"authkey": self.auth_key},
+                "https://control.msg91.com/api/v5/flow/",
+                json=payload,
+                headers={"authkey": self.auth_key, "content-type": "application/json"},
                 timeout=10,
             )
             data = resp.json()
