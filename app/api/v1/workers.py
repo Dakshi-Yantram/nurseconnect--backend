@@ -1,4 +1,5 @@
 """Worker endpoints: profile, search, public, availability, bank, kit, documents."""
+import logging
 from datetime import date, datetime, timezone
 from typing import List, Optional
 from uuid import UUID
@@ -27,7 +28,9 @@ from app.models.enums import (
     WorkerQualificationSource,
     WorkerQualificationStatus,
 )
-from app.services import fatigue_engine
+from app.services import fatigue_engine, ocr_service
+
+logger = logging.getLogger(__name__)
 from app.models.models import (
     Booking,
     CarePackage,
@@ -483,6 +486,31 @@ async def upload_document_file(
         cloudinary_public_id=upload["public_id"],
         valid_until=payload.valid_until,
     )
+
+    # OCR-assisted name/registration-number extraction — degree certificates
+    # and license/registration documents only (no point OCR-ing an Aadhaar
+    # photo or police-verification PDF for a name that's already on file).
+    # This only produces a SUGGESTION; the worker/admin must confirm it via
+    # POST /contracts/me/documents/{id}/apply-ocr before it's used anywhere,
+    # including on contracts. Never blocks or slows down the upload response
+    # in a way the user notices beyond this best-effort pass.
+    _OCR_ELIGIBLE_DOC_TYPES = {
+        "degree_certificate", "nursing_license", "medical_registration",
+        "dental_registration", "physio_registration",
+    }
+    if payload.document_type in _OCR_ELIGIBLE_DOC_TYPES:
+        try:
+            import base64
+
+            raw_bytes = base64.b64decode(payload.data_base64.split(",")[-1])
+            ocr_result = await ocr_service.extract_from_document(raw_bytes)
+            doc.ocr_extracted_name = ocr_result.extracted_name
+            doc.ocr_extracted_registration_no = ocr_result.extracted_registration_no
+            doc.ocr_confidence = ocr_result.confidence
+            doc.ocr_raw_text = ocr_result.raw_text
+        except Exception:
+            logger.exception("OCR pass failed for worker %s document upload; continuing without a suggestion", profile.id)
+
     db.add(doc)
     if profile.onboarding_status in (
         WorkerOnboardingStatus.pending_review,
@@ -494,7 +522,15 @@ async def upload_document_file(
         profile.availability = WorkerAvailability.offline
     await db.commit()
     await db.refresh(doc)
-    return {"id": str(doc.id), "verification_status": doc.verification_status}
+    return {
+        "id": str(doc.id),
+        "verification_status": doc.verification_status,
+        "ocr_suggestion": (
+            {"name": doc.ocr_extracted_name, "registration_no": doc.ocr_extracted_registration_no, "confidence": float(doc.ocr_confidence or 0)}
+            if doc.ocr_extracted_name or doc.ocr_extracted_registration_no
+            else None
+        ),
+    }
 
 
 @router.get("/me/documents")

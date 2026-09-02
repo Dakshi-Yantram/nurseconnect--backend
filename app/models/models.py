@@ -284,6 +284,16 @@ class WorkerDocument(Base):
     verified_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
     rejection_reason: Mapped[Optional[str]] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now, server_default=func.now())
+    # OCR-assisted name extraction (see app/services/ocr_service.py). This is
+    # a SUGGESTION only — never auto-overwrites User.full_name or
+    # WorkerProfile.registration_no. The worker/admin explicitly confirms it
+    # via POST /workers/me/documents/{id}/apply-ocr, which is what actually
+    # writes the value onto the profile. Never silently trusted because a
+    # misread degree certificate must not corrupt a legal name or license no.
+    ocr_extracted_name: Mapped[Optional[str]] = mapped_column(String(255))
+    ocr_extracted_registration_no: Mapped[Optional[str]] = mapped_column(String(100))
+    ocr_confidence: Mapped[Optional[Decimal]] = mapped_column(Numeric(4, 3))
+    ocr_raw_text: Mapped[Optional[str]] = mapped_column(Text)
 
 
 class WorkerCertificate(Base):
@@ -1849,4 +1859,38 @@ class WorkerAlertnessCheck(Base):
     __table_args__ = (
         Index("ix_worker_alertness_checks_worker_created", "worker_id", "created_at"),
         Index("ix_worker_alertness_checks_booking", "booking_id"),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Provider contracts (clickwrap Stage 1 + e-stamp Master Agreement Stage 2).
+# See app/core/contracts.py for the template text + dynamic placeholder
+# rendering (registration number / authority label switches per provider
+# type — e.g. "State Nursing Council Reg No." for nurses, "Medical Council
+# Registration No." for doctors, no license line at all for caregivers).
+# ---------------------------------------------------------------------------
+class WorkerAgreement(Base):
+    __tablename__ = "worker_agreements"
+    id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), primary_key=True, default=_uuid)
+    worker_id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), ForeignKey("worker_profiles.id", ondelete="CASCADE"), index=True)
+    stage: Mapped[int] = mapped_column(Integer, nullable=False)  # 1 = in-app clickwrap, 2 = e-stamp master agreement
+    status: Mapped[str] = mapped_column(String(30), default="pending", server_default="pending", index=True)
+    # pending -> accepted -> voided (voided used if a later off-platform breach nulls it, per clause 2)
+    provider_type_snapshot: Mapped[str] = mapped_column(String(50), nullable=False)
+    rendered_text: Mapped[str] = mapped_column(Text, nullable=False)  # exact text the worker saw & accepted, frozen for audit
+    template_version: Mapped[str] = mapped_column(String(20), nullable=False, default="v1")
+    accepted_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    otp_verified: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false")
+    ip_address: Mapped[Optional[str]] = mapped_column(String(64))
+    # Stage 2 only — e-sign/e-stamp provider reference (Digio/Leegality/ASP)
+    esign_provider: Mapped[Optional[str]] = mapped_column(String(50))
+    esign_reference_id: Mapped[Optional[str]] = mapped_column(String(255))
+    esign_document_url: Mapped[Optional[str]] = mapped_column(Text)
+    onboarding_fee_deducted: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false")
+    voided_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    void_reason: Mapped[Optional[str]] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now, server_default=func.now())
+
+    __table_args__ = (
+        Index("ix_worker_agreements_worker_stage", "worker_id", "stage"),
     )

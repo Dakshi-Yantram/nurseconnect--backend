@@ -32,6 +32,10 @@ class Settings(BaseSettings):
 
     # OTP
     OTP_DEV_MODE: bool = True
+
+    # OCR (degree/license name auto-extraction for onboarding + contracts)
+    OCR_PROVIDER: str = ""  # "google_vision" | "tesseract" | "" (disabled)
+    GOOGLE_VISION_API_KEY: str = ""
     OTP_DEV_FIXED_CODE: str = "123456"
     OTP_EXPIRE_MINUTES: int = 5
 
