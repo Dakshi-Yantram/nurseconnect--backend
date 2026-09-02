@@ -184,9 +184,10 @@ class Msg91Client:
         if self.sender_id:
             params["sender"] = self.sender_id
         async with httpx.AsyncClient() as client:
-            resp = await client.get(
+            resp = await client.post(
                 "https://control.msg91.com/api/v5/otp",
                 params=params,
+                headers={"authkey": self.auth_key},
                 timeout=10,
             )
             data = resp.json()
