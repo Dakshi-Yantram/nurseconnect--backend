@@ -554,6 +554,19 @@ async def checkout(
     try:
         from app.services.payout_service import create_payout_for_booking
         await create_payout_for_booking(db, booking)
+
+        # First-ever completed booking -> Stage 2 (e-stamp Master Agreement)
+        # just unlocked. Nudge the nurse immediately rather than waiting for
+        # her to happen to open the app and notice.
+        if profile.completed_visits_count == 1:
+            await notify_parties(
+                db,
+                ["worker"],
+                {"booking_id": str(booking_id)},
+                "contract.stage2.unlocked",
+                "Complete your Partner Agreement",
+                "Congrats on your first booking! Please e-sign your Master Agreement to unlock future bookings.",
+            )
     except Exception as exc:  # noqa: BLE001
         import logging as _logging
         _logging.getLogger(__name__).warning(

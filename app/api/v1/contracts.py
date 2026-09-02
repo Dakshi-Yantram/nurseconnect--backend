@@ -18,7 +18,7 @@ from app.core.deps import CurrentUser, get_current_user, get_worker_profile, req
 from app.core.provider_types import LICENSED_PROVIDER_TYPES, PROVIDER_TYPE_LABELS
 from app.core.rate_limit import client_ip, enforce_rate_limit
 from app.core.security import hash_password, verify_password
-from app.models.models import OtpCode, User, WorkerAgreement, WorkerDocument, WorkerProfile
+from app.models.models import OtpCode, User, WorkerAgreement, WorkerDocument, WorkerPayout, WorkerProfile
 from app.services import ocr_service
 
 router = APIRouter(prefix="/contracts", tags=["contracts"])
@@ -273,6 +273,15 @@ async def accept_stage2(
         esign_document_url=payload.esign_document_url,
     )
     db.add(agreement)
+
+    # Deduct/record the onboarding enablement fee against Booking #1's
+    # payout the moment the nurse e-signs the Master Agreement.
+    from app.services.payout_service import apply_onboarding_fee
+
+    deducted = await apply_onboarding_fee(db, worker.id)
+    if deducted is not None:
+        agreement.onboarding_fee_deducted = True
+
     await db.commit()
 
     return ContractPreviewOut(stage=2, status="accepted", rendered_text=rendered, unlocked=False)

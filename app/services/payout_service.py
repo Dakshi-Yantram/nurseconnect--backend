@@ -184,3 +184,69 @@ async def process_payout(db: AsyncSession, payout: WorkerPayout) -> dict:
         "razorpay_payout_id": payout.razorpay_payout_id,
         "manual": not (razorpayx_on and has_bank),
     }
+
+
+async def apply_onboarding_fee(db: AsyncSession, worker_id: UUID) -> Optional[Decimal]:
+    """Deduct the Stage 2 onboarding enablement fee from the worker's
+    first-booking payout, the moment Stage 2 (e-stamp Master Agreement) is
+    accepted.
+
+    Looks up the earliest WorkerPayout for this worker (i.e. Booking #1's
+    payout) and reduces its net_amount by settings.ONBOARDING_ENABLEMENT_FEE,
+    clamped so it never goes negative. Idempotent via the caller checking
+    WorkerAgreement.onboarding_fee_deducted before calling this — safe to
+    call once per worker.
+
+    Handles both cases:
+      - Payout still pending/on_hold -> net_amount reduced before it's ever
+        disbursed, so the nurse simply receives less on this payout.
+      - Payout already paid (nurse eSigned late, after payout ran) -> we
+        can't claw back money already sent, so instead we post a
+        platform_fee ledger entry recording the fee owed, so finance can see
+        it and recover it against the worker's next payout.
+    """
+    res = await db.execute(
+        select(WorkerPayout)
+        .where(WorkerPayout.worker_id == worker_id)
+        .order_by(WorkerPayout.created_at.asc())
+        .limit(1)
+    )
+    first_payout = res.scalar_one_or_none()
+    if first_payout is None:
+        return None
+
+    fee = _money(Decimal(str(settings.ONBOARDING_ENABLEMENT_FEE)))
+
+    if first_payout.status == WorkerPayoutStatus.paid:
+        # Already disbursed in full — can't reduce a paid payout. Record the
+        # fee as owed so it's visible to finance/ops for manual recovery or
+        # collection against the worker's next payout.
+        await post_ledger_entry(
+            db,
+            LedgerEntryType.platform_fee,
+            fee,
+            booking_id=first_payout.booking_id,
+            worker_id=worker_id,
+            description=(
+                f"Onboarding enablement fee owed (Stage 2 signed after first "
+                f"payout {first_payout.id} was already paid) — recover from next payout."
+            ),
+        )
+        await db.flush()
+        return fee
+
+    # Pending / on_hold / processing / failed — safe to reduce net_amount
+    # directly, since money hasn't left the platform yet.
+    actual_deduction = min(fee, first_payout.net_amount)
+    first_payout.net_amount = _money(first_payout.net_amount - actual_deduction)
+
+    await post_ledger_entry(
+        db,
+        LedgerEntryType.platform_fee,
+        actual_deduction,
+        booking_id=first_payout.booking_id,
+        worker_id=worker_id,
+        description=f"Onboarding enablement fee deducted from first-booking payout {first_payout.id}",
+    )
+    await db.flush()
+    return actual_deduction

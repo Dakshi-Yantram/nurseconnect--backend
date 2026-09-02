@@ -81,6 +81,7 @@ class Settings(BaseSettings):
     # ---------------------------------------------------------------------
     PLATFORM_COMMISSION_PCT: float = 20.0
     PLATFORM_TDS_PCT: float = 0.0
+    ONBOARDING_ENABLEMENT_FEE: float = 200.0  # ₹ deducted from first-booking payout once Stage 2 is e-signed
 
     # RazorpayX (payouts) — separate product from Razorpay payments above.
     # Leave blank to keep payouts manual (admin marks them paid after an
