@@ -34,6 +34,11 @@ pymongo==4.5.0
 motor==3.3.1
 boto3==1.43.5
 cloudinary==1.44.2
+# E-prescription generation: PDF with the doctor's signature stamped on it,
+# plus a QR code (linking to the public verify endpoint) embedded in the PDF.
+reportlab==4.2.5
+qrcode[pil]==8.0
+Pillow==11.0.0
 stripe==15.1.0
 razorpay==2.0.1
 pytest==9.0.3

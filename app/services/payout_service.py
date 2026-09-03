@@ -1,6 +1,6 @@
-"""Worker payout generation and processing.
+﻿"""Worker payout generation and processing.
 
-Before this existed, no WorkerPayout row was ever created — so a nurse's
+Before this existed, no WorkerPayout row was ever created â€” so a nurse's
 earnings always showed zero no matter how many visits they completed. A payout
 is now generated the moment a visit is checked out, and admin processes it
 (optionally via RazorpayX).
@@ -31,6 +31,7 @@ from app.models.models import (
     Booking,
     CarePackage,
     ServiceCatalogue,
+    WorkerAgreement,
     WorkerPayout,
     WorkerProfile,
 )
@@ -64,7 +65,7 @@ async def create_payout_for_booking(db: AsyncSession, booking: Booking) -> Optio
 
     Idempotent: returns the existing row if one already exists for this
     booking, so a duplicate checkout (retry, offline replay) never pays twice.
-    No-op when the booking has no assigned worker. Flushes but does not commit —
+    No-op when the booking has no assigned worker. Flushes but does not commit â€”
     the caller owns the transaction so the payout lands atomically with checkout.
     """
     if not booking.worker_id:
@@ -124,7 +125,75 @@ async def create_payout_for_booking(db: AsyncSession, booking: Booking) -> Optio
     )
     db.add(payout)
     await db.flush()
+
+    # Spread onboarding fee: take a small bite (settings.ONBOARDING_FEE_INCREMENT)
+    # out of *this* payout if the worker still owes some, instead of the old
+    # one-shot â‚¹200 hit on booking #1.
+    await apply_onboarding_fee_increment(db, booking.worker_id, payout)
+
     return payout
+
+
+async def apply_onboarding_fee_increment(db: AsyncSession, worker_id: UUID, payout: WorkerPayout) -> Optional[Decimal]:
+    """Collect one increment (settings.ONBOARDING_FEE_INCREMENT, â‚¹50 by
+    default) of the Stage 2 onboarding enablement fee from `payout`'s
+    net_amount, if the worker has an accepted Stage 2 (e-stamp Master
+    Agreement) and hasn't fully paid the fee yet.
+
+    Spreads the total (settings.ONBOARDING_ENABLEMENT_FEE, â‚¹200 by default)
+    across successive bookings' payouts instead of taking it all from one â€”
+    so booking #1 doesn't take the full brunt. Deducts less than the full
+    increment on the final bite if that's all that's left to collect, and
+    clamps to the payout's net_amount so a payout never goes negative.
+
+    No-op (returns None) when: no Stage 2 agreement, already fully
+    collected, or this payout's net_amount is already zero.
+    """
+    ares = await db.execute(
+        select(WorkerAgreement)
+        .where(
+            WorkerAgreement.worker_id == worker_id,
+            WorkerAgreement.stage == 2,
+            WorkerAgreement.status == "accepted",
+        )
+        .order_by(WorkerAgreement.created_at.desc())
+        .limit(1)
+    )
+    agreement = ares.scalar_one_or_none()
+    if agreement is None or agreement.onboarding_fee_deducted:
+        return None
+
+    total_fee = _money(Decimal(str(settings.ONBOARDING_ENABLEMENT_FEE)))
+    already_collected = _money(Decimal(agreement.onboarding_fee_collected or 0))
+    remaining = total_fee - already_collected
+    if remaining <= 0:
+        agreement.onboarding_fee_deducted = True
+        return None
+
+    increment = _money(Decimal(str(settings.ONBOARDING_FEE_INCREMENT)))
+    bite = min(increment, remaining)
+    actual_deduction = min(bite, payout.net_amount)
+    if actual_deduction <= 0:
+        return None
+
+    payout.net_amount = _money(payout.net_amount - actual_deduction)
+    agreement.onboarding_fee_collected = _money(already_collected + actual_deduction)
+    if agreement.onboarding_fee_collected >= total_fee:
+        agreement.onboarding_fee_deducted = True
+
+    await post_ledger_entry(
+        db,
+        LedgerEntryType.platform_fee,
+        actual_deduction,
+        booking_id=payout.booking_id,
+        worker_id=worker_id,
+        description=(
+            f"Onboarding enablement fee installment â‚¹{actual_deduction} "
+            f"(â‚¹{agreement.onboarding_fee_collected}/â‚¹{total_fee} collected)"
+        ),
+    )
+    await db.flush()
+    return actual_deduction
 
 
 async def process_payout(db: AsyncSession, payout: WorkerPayout) -> dict:
@@ -132,7 +201,7 @@ async def process_payout(db: AsyncSession, payout: WorkerPayout) -> dict:
 
     Attempts a real RazorpayX transfer when RazorpayX is configured and the
     nurse has bank details; otherwise marks it paid (the admin having settled
-    it out of band). Never pays an on_hold payout — a hold must be released
+    it out of band). Never pays an on_hold payout â€” a hold must be released
     first, which is the whole point of the hold.
     """
     if payout.status == WorkerPayoutStatus.paid:
@@ -185,68 +254,3 @@ async def process_payout(db: AsyncSession, payout: WorkerPayout) -> dict:
         "manual": not (razorpayx_on and has_bank),
     }
 
-
-async def apply_onboarding_fee(db: AsyncSession, worker_id: UUID) -> Optional[Decimal]:
-    """Deduct the Stage 2 onboarding enablement fee from the worker's
-    first-booking payout, the moment Stage 2 (e-stamp Master Agreement) is
-    accepted.
-
-    Looks up the earliest WorkerPayout for this worker (i.e. Booking #1's
-    payout) and reduces its net_amount by settings.ONBOARDING_ENABLEMENT_FEE,
-    clamped so it never goes negative. Idempotent via the caller checking
-    WorkerAgreement.onboarding_fee_deducted before calling this — safe to
-    call once per worker.
-
-    Handles both cases:
-      - Payout still pending/on_hold -> net_amount reduced before it's ever
-        disbursed, so the nurse simply receives less on this payout.
-      - Payout already paid (nurse eSigned late, after payout ran) -> we
-        can't claw back money already sent, so instead we post a
-        platform_fee ledger entry recording the fee owed, so finance can see
-        it and recover it against the worker's next payout.
-    """
-    res = await db.execute(
-        select(WorkerPayout)
-        .where(WorkerPayout.worker_id == worker_id)
-        .order_by(WorkerPayout.created_at.asc())
-        .limit(1)
-    )
-    first_payout = res.scalar_one_or_none()
-    if first_payout is None:
-        return None
-
-    fee = _money(Decimal(str(settings.ONBOARDING_ENABLEMENT_FEE)))
-
-    if first_payout.status == WorkerPayoutStatus.paid:
-        # Already disbursed in full — can't reduce a paid payout. Record the
-        # fee as owed so it's visible to finance/ops for manual recovery or
-        # collection against the worker's next payout.
-        await post_ledger_entry(
-            db,
-            LedgerEntryType.platform_fee,
-            fee,
-            booking_id=first_payout.booking_id,
-            worker_id=worker_id,
-            description=(
-                f"Onboarding enablement fee owed (Stage 2 signed after first "
-                f"payout {first_payout.id} was already paid) — recover from next payout."
-            ),
-        )
-        await db.flush()
-        return fee
-
-    # Pending / on_hold / processing / failed — safe to reduce net_amount
-    # directly, since money hasn't left the platform yet.
-    actual_deduction = min(fee, first_payout.net_amount)
-    first_payout.net_amount = _money(first_payout.net_amount - actual_deduction)
-
-    await post_ledger_entry(
-        db,
-        LedgerEntryType.platform_fee,
-        actual_deduction,
-        booking_id=first_payout.booking_id,
-        worker_id=worker_id,
-        description=f"Onboarding enablement fee deducted from first-booking payout {first_payout.id}",
-    )
-    await db.flush()
-    return actual_deduction

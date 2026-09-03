@@ -1,4 +1,4 @@
-"""All SQLAlchemy ORM models for NurseConnect platform.
+﻿"""All SQLAlchemy ORM models for NurseConnect platform.
 
 Per the technical architecture v2, all rules are DB-driven.
 This file consolidates all production models in one place for easy navigation.
@@ -64,7 +64,9 @@ from app.models.enums import (
     PaymentStatus,
     AssessmentSessionStatus,
     PayoutBatchStatus,
+    PayoutApprovalStatus,
     PrescriptionStatus,
+    TeleConsultationStage,
     QualificationGate,
     RetentionAction,
     ServiceCategory,
@@ -232,7 +234,7 @@ class WorkerProfile(Base):
     registration_authority: Mapped[Optional[str]] = mapped_column(String(255))
     registration_valid_until: Mapped[Optional[date]] = mapped_column(Date)
     # The degree/qualification name (e.g. "BDS", "MDS", "GNM", "BSc Nursing",
-    # "BPT", "MPT"). Deliberately NOT used to derive worker_type — worker_type
+    # "BPT", "MPT"). Deliberately NOT used to derive worker_type â€” worker_type
     # is set explicitly at registration per the "Provider Type must NOT be
     # inferred from degree" rule. Caregivers/Mother & Baby Caregivers leave
     # this null (no degree required).
@@ -249,7 +251,7 @@ class WorkerProfile(Base):
     service_radius_km: Mapped[int] = mapped_column(Integer, default=10)
     home_latitude: Mapped[Optional[Decimal]] = mapped_column(Numeric(10, 8))
     home_longitude: Mapped[Optional[Decimal]] = mapped_column(Numeric(11, 8))
-    # Patch 3 — Worker current-location awareness (for Haversine proximity).
+    # Patch 3 â€” Worker current-location awareness (for Haversine proximity).
     current_latitude: Mapped[Optional[Decimal]] = mapped_column(Numeric(10, 8))
     current_longitude: Mapped[Optional[Decimal]] = mapped_column(Numeric(11, 8))
     current_location_updated_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
@@ -266,6 +268,13 @@ class WorkerProfile(Base):
     onboarding_submitted_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
     onboarding_reviewed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
     onboarding_rejection_reason: Mapped[Optional[str]] = mapped_column(Text)
+    # Doctor's saved signature (PNG, transparent background) â€” captured once
+    # during onboarding, reused to stamp every e-prescription so the doctor
+    # doesn't have to re-sign each time. Only meaningful for worker_type=doctor
+    # but left generic in case dentists/physios also start writing e-Rx later.
+    signature_url: Mapped[Optional[str]] = mapped_column(Text)
+    signature_public_id: Mapped[Optional[str]] = mapped_column(Text)
+    signature_uploaded_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now, server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now, onupdate=_now, server_default=func.now())
 
@@ -285,7 +294,7 @@ class WorkerDocument(Base):
     rejection_reason: Mapped[Optional[str]] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now, server_default=func.now())
     # OCR-assisted name extraction (see app/services/ocr_service.py). This is
-    # a SUGGESTION only — never auto-overwrites User.full_name or
+    # a SUGGESTION only â€” never auto-overwrites User.full_name or
     # WorkerProfile.registration_no. The worker/admin explicitly confirms it
     # via POST /workers/me/documents/{id}/apply-ocr, which is what actually
     # writes the value onto the profile. Never silently trusted because a
@@ -320,7 +329,7 @@ class WorkerKitItem(Base):
 
 
 class WorkerReference(Base):
-    """Previous-employer / character references — mainly used for Caregiver
+    """Previous-employer / character references â€” mainly used for Caregiver
     and Mother & Baby Caregiver onboarding (no degree, so references carry
     more verification weight), but not restricted to those types."""
     __tablename__ = "worker_references"
@@ -340,7 +349,7 @@ class WorkerReference(Base):
 class ProviderStatusHistory(Base):
     """Append-only audit trail of every WorkerProfile.onboarding_status (and
     related qualification/availability) transition. Nothing reads this to
-    make eligibility decisions — it's audit/observability only, written by
+    make eligibility decisions â€” it's audit/observability only, written by
     the same services that already change status (worker_approval.py,
     qualification.py) so admin can see the full history per provider."""
     __tablename__ = "provider_status_history"
@@ -393,7 +402,7 @@ class ChecklistTemplate(Base):
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
     questions: Mapped[list] = mapped_column(JSONB, nullable=False)
     created_by: Mapped[Optional[UUID]] = mapped_column(PG_UUID(as_uuid=True), ForeignKey("users.id"))
-    # Patch 4B — content lifecycle fields
+    # Patch 4B â€” content lifecycle fields
     status: Mapped[ContentStatus] = mapped_column(
         SQLEnum(ContentStatus, name="content_status"),
         default=ContentStatus.published,
@@ -439,7 +448,7 @@ class DocumentationTemplate(Base):
     photo_consent_required: Mapped[bool] = mapped_column(Boolean, default=False)
     wound_image_mandatory: Mapped[bool] = mapped_column(Boolean, default=False)
     created_by: Mapped[Optional[UUID]] = mapped_column(PG_UUID(as_uuid=True), ForeignKey("users.id"))
-    # Patch 4B — content lifecycle fields
+    # Patch 4B â€” content lifecycle fields
     status: Mapped[ContentStatus] = mapped_column(
         SQLEnum(ContentStatus, name="content_status"),
         default=ContentStatus.published,
@@ -481,14 +490,14 @@ class ServiceCatalogue(Base):
     icon: Mapped[Optional[str]] = mapped_column(String(100))
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
     version: Mapped[int] = mapped_column(Integer, default=1)
-    # Patch 2 — service-level qualification gating
+    # Patch 2 â€” service-level qualification gating
     required_training_module_codes: Mapped[Optional[list]] = mapped_column(ARRAY(String))
     required_certificate_codes: Mapped[Optional[list]] = mapped_column(ARRAY(String))
     required_specialty_tags: Mapped[Optional[list]] = mapped_column(ARRAY(String))
     requires_admin_skill_approval: Mapped[bool] = mapped_column(Boolean, default=False)
     risk_level: Mapped[ServiceRiskLevel] = mapped_column(SQLEnum(ServiceRiskLevel, name="service_risk_level"), default=ServiceRiskLevel.LOW)
     lower_tier_override_allowed: Mapped[bool] = mapped_column(Boolean, default=False)
-    # Patch 4B — assessment linkage (extends Patch 2 qualification engine)
+    # Patch 4B â€” assessment linkage (extends Patch 2 qualification engine)
     required_assessment_codes: Mapped[Optional[list]] = mapped_column(ARRAY(String))
     minimum_pass_score: Mapped[Optional[int]] = mapped_column(Integer)
     # Three-gate qualification model
@@ -499,14 +508,14 @@ class ServiceCatalogue(Base):
         nullable=False,
     )
     practical_checklist_items: Mapped[Optional[list]] = mapped_column(ARRAY(String))
-    # Provider Type gate — the "Provider Type Allowed" leg of booking
+    # Provider Type gate â€” the "Provider Type Allowed" leg of booking
     # eligibility. NULL/empty = no restriction (back-compat: every existing
     # service row defaults to unrestricted, so nothing that qualifies today
     # stops qualifying). Once set, only workers whose WorkerProfile.worker_type
     # is in this list can ever hold an APPROVED WorkerServiceQualification for
-    # this service — enforced in app/services/qualification.py.
+    # this service â€” enforced in app/services/qualification.py.
     allowed_provider_types: Mapped[Optional[list]] = mapped_column(ARRAY(String))
-    # Soft-delete — same pattern as CarePackage below. A real DELETE would
+    # Soft-delete â€” same pattern as CarePackage below. A real DELETE would
     # break Booking/WorkerServiceQualification/etc. rows that reference this
     # service, so admin "delete" only ever sets these.
     is_deleted: Mapped[bool] = mapped_column(Boolean, default=False, index=True, server_default="false")
@@ -528,7 +537,7 @@ class CarePackage(Base):
     # which is internal nurse-facing sign-off language derived from the
     # workbook and was never meant for consumer display.
     whats_included: Mapped[Optional[list]] = mapped_column(ARRAY(String))
-    # One or two sentences under "Service details" in the expanded card —
+    # One or two sentences under "Service details" in the expanded card â€”
     # e.g. visit count, equipment carried, who performs the procedure.
     service_details_text: Mapped[Optional[str]] = mapped_column(Text)
     # Shown only when applicable (e.g. "medicine supplied by the customer",
@@ -553,7 +562,7 @@ class CarePackage(Base):
     documentation_template_id: Mapped[Optional[UUID]] = mapped_column(PG_UUID(as_uuid=True), ForeignKey("documentation_templates.id"))
     requires_prescription: Mapped[bool] = mapped_column(Boolean, default=False)
     prescription_review_required: Mapped[bool] = mapped_column(Boolean, default=False)
-    # Workflow 1 — true for Composite Care Packages that bundle the nursing
+    # Workflow 1 â€” true for Composite Care Packages that bundle the nursing
     # visit fee together with a procedural kit (single bundled Package_Fee).
     material_included: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false")
     missed_visit_policy_id: Mapped[Optional[UUID]] = mapped_column(PG_UUID(as_uuid=True), ForeignKey("missed_visit_policies.id"))
@@ -565,21 +574,21 @@ class CarePackage(Base):
     previous_version_id: Mapped[Optional[UUID]] = mapped_column(PG_UUID(as_uuid=True), ForeignKey("care_packages.id"))
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
     # Soft-delete. Distinct from is_active: a disabled (is_active=False) package
-    # is still listed (greyed out, read-only) — a deleted one is gone from every
+    # is still listed (greyed out, read-only) â€” a deleted one is gone from every
     # list. Never hard-delete: existing CarePackageBooking rows reference this row.
     is_deleted: Mapped[bool] = mapped_column(Boolean, default=False, index=True, server_default="false")
     deleted_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
     deleted_by: Mapped[Optional[UUID]] = mapped_column(PG_UUID(as_uuid=True), ForeignKey("users.id"))
     available_cities: Mapped[Optional[list]] = mapped_column(ARRAY(String))
     created_by: Mapped[Optional[UUID]] = mapped_column(PG_UUID(as_uuid=True), ForeignKey("users.id"))
-    # Patch 2 — package-level qualification gating
+    # Patch 2 â€” package-level qualification gating
     required_training_module_codes: Mapped[Optional[list]] = mapped_column(ARRAY(String))
     required_certificate_codes: Mapped[Optional[list]] = mapped_column(ARRAY(String))
     required_specialty_tags: Mapped[Optional[list]] = mapped_column(ARRAY(String))
     requires_admin_skill_approval: Mapped[bool] = mapped_column(Boolean, default=False)
     risk_level: Mapped[ServiceRiskLevel] = mapped_column(SQLEnum(ServiceRiskLevel, name="service_risk_level"), default=ServiceRiskLevel.LOW)
     lower_tier_override_allowed: Mapped[bool] = mapped_column(Boolean, default=False)
-    # Patch 4B — assessment linkage (extends Patch 2 qualification engine)
+    # Patch 4B â€” assessment linkage (extends Patch 2 qualification engine)
     required_assessment_codes: Mapped[Optional[list]] = mapped_column(ARRAY(String))
     minimum_pass_score: Mapped[Optional[int]] = mapped_column(Integer)
     # Three-gate qualification model
@@ -590,11 +599,11 @@ class CarePackage(Base):
         nullable=False,
     )
     practical_checklist_items: Mapped[Optional[list]] = mapped_column(ARRAY(String))
-    # Provider Type gate — same semantics as ServiceCatalogue.allowed_provider_types.
+    # Provider Type gate â€” same semantics as ServiceCatalogue.allowed_provider_types.
     # e.g. Baby Massage & Bath package: ["mother_baby_caregiver"].
     # Elder Companion package: ["caregiver"] by default; admin can add
     # "nurse" explicitly per your "Nurse should only be allowed if Admin
-    # explicitly enables Nurse" rule — that's exactly what adding "nurse"
+    # explicitly enables Nurse" rule â€” that's exactly what adding "nurse"
     # to this array does, nothing special-cased.
     allowed_provider_types: Mapped[Optional[list]] = mapped_column(ARRAY(String))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now, server_default=func.now())
@@ -602,7 +611,7 @@ class CarePackage(Base):
 
 
 # ============================================================================
-# Patch 2 — Worker service/package qualification + preference
+# Patch 2 â€” Worker service/package qualification + preference
 # ============================================================================
 class WorkerServiceQualification(Base):
     __tablename__ = "worker_service_qualifications"
@@ -639,7 +648,7 @@ class PracticalSignOff(Base):
     """Gate 3 ("practical_verified") requirement: a trainer observes the
     worker perform the skill in person/video and signs off a checklist
     (ServiceCatalogue.practical_checklist_items / CarePackage.practical_checklist_items).
-    Only counts toward qualification when `passed=True` — a failed sign-off
+    Only counts toward qualification when `passed=True` â€” a failed sign-off
     is kept for audit history, the worker needs a new passing one.
     """
     __tablename__ = "practical_sign_offs"
@@ -647,7 +656,7 @@ class PracticalSignOff(Base):
     worker_id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), ForeignKey("worker_profiles.id", ondelete="CASCADE"), index=True, nullable=False)
     service_id: Mapped[Optional[UUID]] = mapped_column(PG_UUID(as_uuid=True), ForeignKey("service_catalogue.id"), index=True)
     package_id: Mapped[Optional[UUID]] = mapped_column(PG_UUID(as_uuid=True), ForeignKey("care_packages.id"), index=True)
-    # checklist_responses: {item_text: bool} — one entry per
+    # checklist_responses: {item_text: bool} â€” one entry per
     # practical_checklist_items entry on the service/package at sign-off time.
     checklist_responses: Mapped[dict] = mapped_column(JSONB, nullable=False)
     passed: Mapped[bool] = mapped_column(Boolean, nullable=False)
@@ -721,10 +730,10 @@ class Booking(Base):
     rule_set_id_snapshot: Mapped[Optional[UUID]] = mapped_column(PG_UUID(as_uuid=True))
     checklist_template_id_snapshot: Mapped[Optional[UUID]] = mapped_column(PG_UUID(as_uuid=True))
     documentation_template_id_snapshot: Mapped[Optional[UUID]] = mapped_column(PG_UUID(as_uuid=True))
-    # Patch 3 — Radius-wave dispatch tracking.
+    # Patch 3 â€” Radius-wave dispatch tracking.
     assignment_wave: Mapped[int] = mapped_column(Integer, default=1, server_default="1")
     assignment_escalated_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
-    # When the booking became dispatchable to workers (payment captured →
+    # When the booking became dispatchable to workers (payment captured â†’
     # status confirmed). The wave clock runs from here, NOT created_at:
     # workers only see confirmed bookings, so counting waves from creation
     # burned the whole 20-minute wave window while the consumer was still
@@ -733,14 +742,14 @@ class Booking(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now, server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now, onupdate=_now, server_default=func.now())
 
-    # ── Workflow 1: Composite Care Package (material_included bookings) ──
+    # â”€â”€ Workflow 1: Composite Care Package (material_included bookings) â”€â”€
     material_included: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false")
     prescription_id: Mapped[Optional[UUID]] = mapped_column(PG_UUID(as_uuid=True), ForeignKey("prescriptions.id"))
     fulfillment_route: Mapped[Optional[FulfillmentRoute]] = mapped_column(
         SQLEnum(FulfillmentRoute, name="fulfillment_route")
     )
 
-    # ── Workflow 2: Service-Only (patient supplies their own materials) ──
+    # â”€â”€ Workflow 2: Service-Only (patient supplies their own materials) â”€â”€
     # The booking-time supply guardrail. The patient ticks that they have the
     # prescribed medicine, cannula/catheter, drip set and Rx ready, and must
     # attach one photo of those supplies next to the prescription. Payment is
@@ -808,7 +817,7 @@ class VisitRecord(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now, server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now, onupdate=_now, server_default=func.now())
 
-    # ── Workflow 1 — Step 4: synchronized nurse/patient safety checklist ──
+    # â”€â”€ Workflow 1 â€” Step 4: synchronized nurse/patient safety checklist â”€â”€
     # Nurse's 5-item pre-procedure questionnaire, e.g.
     # {"hand_hygiene": true, "sterile_gloves": true, "identity_verified": true,
     #  "allergy_history_checked": true, "prescription_expiry_verified": true}
@@ -822,7 +831,7 @@ class VisitRecord(Base):
     quality_discrepancy_reviewed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
     quality_discrepancy_reviewed_by: Mapped[Optional[UUID]] = mapped_column(PG_UUID(as_uuid=True), ForeignKey("users.id"))
 
-    # ── Step 5/6: mandatory photo proof ──
+    # â”€â”€ Step 5/6: mandatory photo proof â”€â”€
     # Workflow 1 frames the sealed, unopened kit + the Rx; Workflow 2 frames
     # the patient's own supplies with the expiry label visible + the Rx.
     pre_procedure_photo_url: Mapped[Optional[str]] = mapped_column(Text)
@@ -830,7 +839,7 @@ class VisitRecord(Base):
     post_procedure_photo_url: Mapped[Optional[str]] = mapped_column(Text)  # dressed/completed site
     post_procedure_photo_meta: Mapped[Optional[dict]] = mapped_column(JSONB)
 
-    # ── Workflow 2 — Step 4: nurse-reported problem with the patient's own
+    # â”€â”€ Workflow 2 â€” Step 4: nurse-reported problem with the patient's own
     # supplies (broken sterile packaging, expired medicine). Distinct from
     # `quality_discrepancy`, which is the patient disputing the nurse's
     # hygiene self-report. Both block the procedure pending ops review.
@@ -839,7 +848,7 @@ class VisitRecord(Base):
 
 
 # ============================================================================
-# Workflow 1 — Step 7: Automated Invoicing
+# Workflow 1 â€” Step 7: Automated Invoicing
 # ============================================================================
 class Invoice(Base):
     __tablename__ = "invoices"
@@ -884,10 +893,10 @@ class CallSession(Base):
 
 
 class PushSubscription(Base):
-    """Web Push (VAPID) subscription — one row per browser/device the user has
+    """Web Push (VAPID) subscription â€” one row per browser/device the user has
     granted notification permission on. Separate from UserSession.fcm_token
     (native FCM). Used for the best-effort "ring while backgrounded" call
-    ping — see the accompanying writeup for the ceiling on what this can and
+    ping â€” see the accompanying writeup for the ceiling on what this can and
     can't do (it cannot wake a force-killed app)."""
     __tablename__ = "push_subscriptions"
     id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), primary_key=True, default=_uuid)
@@ -901,7 +910,7 @@ class PushSubscription(Base):
 
 
 # ============================================================================
-# Patch 4 — Dynamic checklist / documentation engine
+# Patch 4 â€” Dynamic checklist / documentation engine
 # Per-question + per-field response rows, kept versioned & immutable per visit.
 # Schema is offline-sync ready (is_offline_submitted + synced_at + template_version).
 # ============================================================================
@@ -1013,11 +1022,58 @@ class Prescription(Base):
     rejection_reason: Mapped[Optional[str]] = mapped_column(Text)
     # Renewal-consultation gate: if the Rx is stale (see
     # composite_care_workflow.is_prescription_expired), the pharmacist can't
-    # approve it until this is paid — a ₹100 doctor consultation charge.
+    # approve it until this is paid â€” a â‚¹100 doctor consultation charge.
     renewal_consultation_paid: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false")
     renewal_consultation_order_id: Mapped[Optional[str]] = mapped_column(String(100))
     renewal_consultation_paid_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    # --- E-prescription (doctor-generated, in-app) fields -----------------
+    # cloudinary_url/cloudinary_public_id above stay in use for the OLD flow
+    # (patient uploads a photo of a paper prescription). is_doctor_generated
+    # distinguishes the NEW flow: a tele-doctor writes the Rx inside the app
+    # during/after a Dyte call, we render it to PDF with their saved
+    # signature stamped on it, and store that PDF here instead.
+    is_doctor_generated: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false", index=True)
+    issued_by_worker_id: Mapped[Optional[UUID]] = mapped_column(PG_UUID(as_uuid=True), ForeignKey("worker_profiles.id"))
+    diet_notes: Mapped[Optional[str]] = mapped_column(Text)
+    patient_issues: Mapped[Optional[str]] = mapped_column(Text)  # free text, or "All okay" when nothing flagged
+    signature_url: Mapped[Optional[str]] = mapped_column(Text)  # doctor's signature PNG stamped onto the PDF
+    pdf_url: Mapped[Optional[str]] = mapped_column(Text)
+    pdf_public_id: Mapped[Optional[str]] = mapped_column(Text)
+    verification_hash: Mapped[Optional[str]] = mapped_column(String(64), index=True)  # SHA-256 of the canonical Rx payload
+    qr_code_url: Mapped[Optional[str]] = mapped_column(Text)  # QR image (also embedded in the PDF) encoding the verify URL
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now, server_default=func.now())
+
+
+class TeleConsultation(Base):
+    """One tele-doctor consultation queue item, one row per booking.
+
+    Drives the admin dashboard's teledoctor tab: bookings assigned to a
+    teledoctor start in `waiting`, and the doctor moves them forward stage by
+    stage during/after the Dyte call â€” diet review, then patient issues (or
+    "all okay"), then the e-prescription. Stage only ever moves forward;
+    the admin queue groups/filters on `stage` to show doctors what's next.
+    """
+    __tablename__ = "tele_consultations"
+    id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), primary_key=True, default=_uuid)
+    booking_id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), ForeignKey("bookings.id", ondelete="CASCADE"), unique=True, index=True)
+    doctor_worker_id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), ForeignKey("worker_profiles.id"), index=True)
+    patient_id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), ForeignKey("patients.id"), index=True)
+    stage: Mapped[TeleConsultationStage] = mapped_column(
+        SQLEnum(TeleConsultationStage, name="tele_consultation_stage"),
+        default=TeleConsultationStage.waiting,
+        server_default="waiting",
+        index=True,
+    )
+    diet_notes: Mapped[Optional[str]] = mapped_column(Text)
+    patient_issues: Mapped[Optional[str]] = mapped_column(Text)  # free text, or "All okay"
+    patient_all_okay: Mapped[Optional[bool]] = mapped_column(Boolean)
+    prescription_id: Mapped[Optional[UUID]] = mapped_column(PG_UUID(as_uuid=True), ForeignKey("prescriptions.id"))
+    started_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    diet_reviewed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    patient_assessed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    completed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now, server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now, onupdate=_now, server_default=func.now())
 
 
 class MedicationAdministration(Base):
@@ -1117,7 +1173,7 @@ class Escalation(Base):
     resolved_by: Mapped[Optional[UUID]] = mapped_column(PG_UUID(as_uuid=True), ForeignKey("users.id"))
     resolved_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
     resolution_notes: Mapped[Optional[str]] = mapped_column(Text)
-    # Patch 6 — Support dashboard
+    # Patch 6 â€” Support dashboard
     assigned_to: Mapped[Optional[UUID]] = mapped_column(PG_UUID(as_uuid=True), ForeignKey("users.id"))
     assigned_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
     internal_notes: Mapped[Optional[str]] = mapped_column(Text)
@@ -1132,7 +1188,7 @@ class FinancialLedger(Base):
     __tablename__ = "financial_ledger"
     # Hard concurrency guard: at most one 'payment_collected' row per razorpay_payment_id.
     # Partial unique index complements the application-level idempotency in
-    # /payments/verify + webhook handlers — closes the race window between
+    # /payments/verify + webhook handlers â€” closes the race window between
     # simultaneous verify + webhook callbacks for the same payment.
     __table_args__ = (
         Index(
@@ -1188,6 +1244,18 @@ class WorkerPayout(Base):
     net_amount: Mapped[Decimal] = mapped_column(Numeric(10, 2), nullable=False)
     razorpay_payout_id: Mapped[Optional[str]] = mapped_column(Text)
     status: Mapped[WorkerPayoutStatus] = mapped_column(SQLEnum(WorkerPayoutStatus, name="worker_payout_status"), default=WorkerPayoutStatus.pending, index=True)
+    # Two-step release: an admin must approve() a payout before process()
+    # will pay it â€” separate from `status`/hold so "approved, not yet paid"
+    # stays visible as its own state in the admin queue.
+    approval_status: Mapped[PayoutApprovalStatus] = mapped_column(
+        SQLEnum(PayoutApprovalStatus, name="payout_approval_status"),
+        default=PayoutApprovalStatus.pending_approval,
+        server_default="pending_approval",
+        index=True,
+    )
+    approved_by: Mapped[Optional[UUID]] = mapped_column(PG_UUID(as_uuid=True), ForeignKey("users.id"))
+    approved_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    approval_rejection_reason: Mapped[Optional[str]] = mapped_column(Text)
     hold_reason: Mapped[Optional[str]] = mapped_column(Text)
     hold_initiated_by: Mapped[Optional[UUID]] = mapped_column(PG_UUID(as_uuid=True), ForeignKey("users.id"))
     hold_initiated_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
@@ -1266,7 +1334,7 @@ class RoleDefinition(Base):
     """Metadata (display name, description, permission list) for the
     admin-manageable staff roles: operations, support,
     clinical_training_lead, clinical_trainer. role_key must be one of
-    those UserRole enum values — the enum itself is the source of truth
+    those UserRole enum values â€” the enum itself is the source of truth
     for which roles can exist; this table lets admin configure how each
     one presents and what it's permitted to do, without a code deploy.
     """
@@ -1285,10 +1353,10 @@ class RoleDefinition(Base):
 class Message(Base):
     """In-app chat between the assigned worker and the consumer, scoped to
     either a single booking (one-off visit) or a care package booking
-    (multi-visit package — same worker/consumer thread across the whole
+    (multi-visit package â€” same worker/consumer thread across the whole
     package). Exactly one of booking_id / package_booking_id is set.
 
-    Sending is blocked once the booking/package reaches a terminal status —
+    Sending is blocked once the booking/package reaches a terminal status â€”
     enforced at request time in app/api/v1/messaging.py by checking the
     live Booking/CarePackageBooking status, not a stored "closed" flag, so
     it can never drift out of sync with the booking's real status.
@@ -1347,7 +1415,7 @@ class SupportTicket(Base):
 
 
 class SupportTicketMessage(Base):
-    """Thread of replies on a support ticket — raiser and support staff
+    """Thread of replies on a support ticket â€” raiser and support staff
     exchange messages here."""
     __tablename__ = "support_ticket_messages"
     id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), primary_key=True, default=_uuid)
@@ -1460,12 +1528,12 @@ class TrainingModule(Base):
     is_mandatory: Mapped[bool] = mapped_column(Boolean, default=False)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
     version: Mapped[int] = mapped_column(Integer, default=1, server_default="1", nullable=False)
-    # Provider Type system — which WorkerType values this module is shown to
+    # Provider Type system â€” which WorkerType values this module is shown to
     # (worker-facing GET /training/modules filters on this). NULL/empty =
     # visible to every provider type, same unrestricted-by-default semantics
     # as ServiceCatalogue.allowed_provider_types / CarePackage.allowed_provider_types.
     allowed_provider_types: Mapped[Optional[list]] = mapped_column(ARRAY(String))
-    # Patch 4B — content lifecycle fields
+    # Patch 4B â€” content lifecycle fields
     status: Mapped[ContentStatus] = mapped_column(
         SQLEnum(ContentStatus, name="content_status"),
         default=ContentStatus.published,
@@ -1484,7 +1552,7 @@ class TrainingModule(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now, onupdate=_now, server_default=func.now())
 
 
-# Patch 4B — Assessment / Test engine. Separate table from TrainingModule.assessment
+# Patch 4B â€” Assessment / Test engine. Separate table from TrainingModule.assessment
 # so assessments have their own lifecycle, versioning and worker attempt history.
 class AssessmentModule(Base):
     __tablename__ = "assessment_modules"
@@ -1497,14 +1565,14 @@ class AssessmentModule(Base):
     # questions: [{id, type, text, options?, correct_index?, correct_indices?, correct_bool?, weight?,
     #              variants?: [{text, options, correct_index}]}]
     # `variants` lets a question have several equivalent versions with
-    # different numbers/wording — the session engine picks one per worker
+    # different numbers/wording â€” the session engine picks one per worker
     # per attempt so two workers rarely see byte-identical questions.
     questions: Mapped[list] = mapped_column(JSONB, nullable=False)
     linked_training_module_code: Mapped[Optional[str]] = mapped_column(String(100), index=True)
-    # Provider Type system — same semantics as TrainingModule.allowed_provider_types.
+    # Provider Type system â€” same semantics as TrainingModule.allowed_provider_types.
     # NULL/empty = visible to every provider type.
     allowed_provider_types: Mapped[Optional[list]] = mapped_column(ARRAY(String))
-    # ── Anti-cheat assessment mechanics (Gate 2/3 "theory-verified") ──────
+    # â”€â”€ Anti-cheat assessment mechanics (Gate 2/3 "theory-verified") â”€â”€â”€â”€â”€â”€
     randomize_options: Mapped[bool] = mapped_column(Boolean, default=True, server_default="true", nullable=False)
     questions_per_attempt: Mapped[Optional[int]] = mapped_column(Integer)  # null = use every question in the bank
     time_limit_minutes: Mapped[Optional[int]] = mapped_column(Integer)     # null = no time limit
@@ -1550,7 +1618,7 @@ class WorkerAssessmentSession(Base):
     """Server-held state for one in-progress or completed anti-cheat
     assessment attempt. Questions are delivered one at a time; the client
     never receives correct answers, unshuffled option order, or unpicked
-    question variants — everything needed to score fairly lives here.
+    question variants â€” everything needed to score fairly lives here.
     """
     __tablename__ = "worker_assessment_sessions"
     id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), primary_key=True, default=_uuid)
@@ -1565,11 +1633,11 @@ class WorkerAssessmentSession(Base):
         index=True,
     )
     # question_order: [{question_id, variant_index|null, option_order: [orig_idx,...]}]
-    # — the picked variant + shuffled option order for every question in
+    # â€” the picked variant + shuffled option order for every question in
     # this attempt, fixed at session start so scoring is deterministic.
     question_order: Mapped[list] = mapped_column(JSONB, nullable=False)
     current_index: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
-    # answers: [{question_id, selected_option_index|null, correct: bool}] — appended as the worker answers.
+    # answers: [{question_id, selected_option_index|null, correct: bool}] â€” appended as the worker answers.
     answers: Mapped[list] = mapped_column(JSONB, default=list)
     score: Mapped[Optional[int]] = mapped_column(Integer)
     passed: Mapped[Optional[bool]] = mapped_column(Boolean)
@@ -1723,7 +1791,7 @@ class ConsumerAddress(Base):
 
 
 # ---------------------------------------------------------------------------
-# Reviewer assignment engine — models
+# Reviewer assignment engine â€” models
 # ---------------------------------------------------------------------------
 
 class ReviewerProfile(Base):
@@ -1767,7 +1835,7 @@ class NurseReviewTicket(Base):
 
 
 class ReviewerAssignmentLog(Base):
-    """Immutable audit log of every assignment action — auto or manual."""
+    """Immutable audit log of every assignment action â€” auto or manual."""
     __tablename__ = "reviewer_assignment_logs"
     id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), primary_key=True, default=_uuid)
     ticket_id: Mapped[UUID] = mapped_column(
@@ -1789,7 +1857,7 @@ class WorkerAvailabilitySlot(Base):
 
     Distinct from ``WorkerProfile.availability`` (the online/offline/busy/
     on_leave *live* status used by dispatch right now). This is the nurse's
-    *declared schedule* — e.g. "Mon-Fri 9am-5pm" — so ops and the nurse
+    *declared schedule* â€” e.g. "Mon-Fri 9am-5pm" â€” so ops and the nurse
     herself have a record of when she intends to be reachable, independent
     of whether she has actually toggled herself online at this exact moment.
     """
@@ -1799,7 +1867,7 @@ class WorkerAvailabilitySlot(Base):
         PG_UUID(as_uuid=True), ForeignKey("worker_profiles.id", ondelete="CASCADE"), index=True, nullable=False
     )
     # 0=Monday .. 6=Sunday (ISO weekday - 1), matches JS Date.getDay() minus
-    # the Sun=0 offset handled client-side — see schemas.py docstring.
+    # the Sun=0 offset handled client-side â€” see schemas.py docstring.
     day_of_week: Mapped[int] = mapped_column(SmallInteger, nullable=False)
     start_time: Mapped[time] = mapped_column(Time, nullable=False)
     end_time: Mapped[time] = mapped_column(Time, nullable=False)
@@ -1819,7 +1887,7 @@ class WorkerAlertnessCheck(Base):
     """One attempt at the pre-navigation reaction-time gate.
 
     Shown to the nurse right before she opens Google Maps to an accepted
-    booking's address. Purely a fatigue/attention screen — never blocks
+    booking's address. Purely a fatigue/attention screen â€” never blocks
     navigation outright (holding up a nurse's route to a patient on a
     failed tap-game would itself be a safety problem), but every attempt is
     logged so ops can see if a nurse is consistently showing signs of
@@ -1866,7 +1934,7 @@ class WorkerAlertnessCheck(Base):
 # Provider contracts (clickwrap Stage 1 + e-stamp Master Agreement Stage 2).
 # See app/core/contracts.py for the template text + dynamic placeholder
 # rendering (registration number / authority label switches per provider
-# type — e.g. "State Nursing Council Reg No." for nurses, "Medical Council
+# type â€” e.g. "State Nursing Council Reg No." for nurses, "Medical Council
 # Registration No." for doctors, no license line at all for caregivers).
 # ---------------------------------------------------------------------------
 class WorkerAgreement(Base):
@@ -1882,11 +1950,20 @@ class WorkerAgreement(Base):
     accepted_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
     otp_verified: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false")
     ip_address: Mapped[Optional[str]] = mapped_column(String(64))
-    # Stage 2 only — e-sign/e-stamp provider reference (Digio/Leegality/ASP)
+    # Stage 2 only â€” e-sign/e-stamp provider reference (Digio/Leegality/ASP)
     esign_provider: Mapped[Optional[str]] = mapped_column(String(50))
     esign_reference_id: Mapped[Optional[str]] = mapped_column(String(255))
     esign_document_url: Mapped[Optional[str]] = mapped_column(Text)
+    # onboarding_fee_deducted now means "fully collected" (kept for backward
+    # compatibility with existing reads/filters). The fee is no longer taken
+    # in one lump sum from booking #1 â€” it's spread in small increments
+    # (settings.ONBOARDING_FEE_INCREMENT, â‚¹50 by default) across successive
+    # bookings' payouts so a single booking never "eats" the whole â‚¹200.
+    # onboarding_fee_collected tracks running progress toward
+    # settings.ONBOARDING_ENABLEMENT_FEE; onboarding_fee_deducted flips to
+    # True once collected >= the total fee.
     onboarding_fee_deducted: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false")
+    onboarding_fee_collected: Mapped[Decimal] = mapped_column(Numeric(6, 2), default=0, server_default="0")
     voided_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
     void_reason: Mapped[Optional[str]] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now, server_default=func.now())

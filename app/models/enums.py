@@ -189,6 +189,29 @@ class PrescriptionStatus(str, Enum):
     expired = "expired"
 
 
+class TeleConsultationStage(str, Enum):
+    """Stages of a tele-doctor's in-call workflow for one booking, driven
+    from the admin dashboard: doctor picks up a booking from the waiting
+    queue, records diet notes, records patient issues (or marks all okay),
+    then issues the e-prescription. Strictly forward-moving (no skipping
+    stages) so the admin queue view always reflects real progress."""
+    waiting = "waiting"
+    diet_review = "diet_review"
+    patient_assessment = "patient_assessment"
+    prescription = "prescription"
+    completed = "completed"
+
+
+class PayoutApprovalStatus(str, Enum):
+    """Gate in front of WorkerPayout release: a payout must be explicitly
+    approved by an admin before /process can pay it out. Kept separate from
+    WorkerPayoutStatus (which tracks the money-movement state machine) so
+    'approved but not yet paid' and 'on hold' remain distinguishable."""
+    pending_approval = "pending_approval"
+    approved = "approved"
+    rejected = "rejected"
+
+
 class ConsentType(str, Enum):
     service = "service"
     photo = "photo"

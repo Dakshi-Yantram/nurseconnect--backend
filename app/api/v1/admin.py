@@ -36,6 +36,7 @@ from app.models.enums import (
     VisitStatus,
     WorkerAvailability,
     WorkerOnboardingStatus,
+    PayoutApprovalStatus,
     WorkerPayoutStatus,
     WorkerQualificationStatus,
     WorkerTier,
@@ -2052,6 +2053,8 @@ async def list_worker_payouts(
             "tds_deducted": float(p.tds_deducted),
             "net_amount": float(p.net_amount),
             "status": p.status.value,
+            "approval_status": p.approval_status.value,
+            "approved_at": p.approved_at.isoformat() if p.approved_at else None,
             "paid_at": p.paid_at.isoformat() if p.paid_at else None,
             "created_at": p.created_at.isoformat(),
         }
@@ -2059,18 +2062,72 @@ async def list_worker_payouts(
     ]
 
 
+@router.post("/worker-payouts/{payout_id}/approve")
+async def approve_worker_payout(
+    payout_id: UUID,
+    current: CurrentUser = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Step 1 of 2: admin approves a payout. Money still hasn't moved — this
+    just unlocks /process for this payout. Nurse gets 80% (platform's cut
+    of 20% via commission, see payout_service._commission_pct) only after
+    both approve and process have happened."""
+    res = await db.execute(select(WorkerPayout).where(WorkerPayout.id == payout_id))
+    payout = res.scalar_one_or_none()
+    if not payout:
+        raise HTTPException(status_code=404, detail="Payout not found")
+    if payout.status == WorkerPayoutStatus.paid:
+        raise HTTPException(status_code=409, detail="Already paid")
+    payout.approval_status = PayoutApprovalStatus.approved
+    payout.approved_by = current.id
+    payout.approved_at = datetime.now(timezone.utc)
+    payout.approval_rejection_reason = None
+    await audit(db, current.id, current.role.value, "payout.approve", "worker_payout", payout.id, {})
+    await db.commit()
+    return {"approval_status": payout.approval_status.value, "approved_at": payout.approved_at.isoformat()}
+
+
+class PayoutRejectRequest(BaseModel):
+    reason: str
+
+
+@router.post("/worker-payouts/{payout_id}/reject-approval")
+async def reject_worker_payout_approval(
+    payout_id: UUID,
+    body: PayoutRejectRequest,
+    current: CurrentUser = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    res = await db.execute(select(WorkerPayout).where(WorkerPayout.id == payout_id))
+    payout = res.scalar_one_or_none()
+    if not payout:
+        raise HTTPException(status_code=404, detail="Payout not found")
+    if payout.status == WorkerPayoutStatus.paid:
+        raise HTTPException(status_code=409, detail="Already paid")
+    payout.approval_status = PayoutApprovalStatus.rejected
+    payout.approval_rejection_reason = body.reason
+    payout.approved_by = current.id
+    payout.approved_at = datetime.now(timezone.utc)
+    await audit(db, current.id, current.role.value, "payout.reject_approval", "worker_payout", payout.id, {"reason": body.reason})
+    await db.commit()
+    return {"approval_status": payout.approval_status.value}
+
+    
 @router.post("/worker-payouts/{payout_id}/process")
 async def process_worker_payout(
     payout_id: UUID,
     current: CurrentUser = Depends(require_admin),
     db: AsyncSession = Depends(get_db),
 ):
-    """Pay a pending/failed payout — via RazorpayX when configured and the
-    nurse has bank details, otherwise mark it settled manually."""
+    """Step 2 of 2 — pay a pending/failed payout via RazorpayX (when
+    configured and the nurse has bank details) or mark it settled manually.
+    Requires the payout to already be admin-approved (see /approve)."""
     res = await db.execute(select(WorkerPayout).where(WorkerPayout.id == payout_id))
     payout = res.scalar_one_or_none()
     if not payout:
         raise HTTPException(status_code=404, detail="Payout not found")
+    if payout.approval_status != PayoutApprovalStatus.approved:
+        raise HTTPException(status_code=409, detail="Payout must be approved before it can be processed")
 
     from app.services.payout_service import process_payout
     result = await process_payout(db, payout)
