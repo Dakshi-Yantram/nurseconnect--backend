@@ -1083,20 +1083,20 @@ async def approve_module(
     current: CurrentUser = Depends(require_reviewer),
     db: AsyncSession = Depends(get_db),
 ):
-    """Approving a module publishes it immediately — approved content
-    reaches nurses automatically, no separate publish step needed."""
+    """Approves a module for publishing. This does NOT publish it — a
+    separate call to /{id}/publish is required to make it live for
+    nurses. Keeping approve and publish as distinct steps lets a reviewer
+    sign off on content ahead of a scheduled release."""
     res = await db.execute(select(TrainingModule).where(TrainingModule.id == id))
     m = res.scalar_one_or_none()
     if not m:
         raise HTTPException(status_code=404, detail="Module not found")
     if m.status != ContentStatus.under_review:
         raise HTTPException(status_code=409, detail=f"Cannot approve module in status {m.status.value}")
-    m.status = ContentStatus.published
+    m.status = ContentStatus.approved
     m.reviewed_by = current.id
     m.reviewed_at = _now()
     m.review_notes = body.notes
-    m.published_at = _now()
-    m.published_version = m.version
     await db.commit()
     return _serialize_module(m, include_admin_fields=True, include_full_assessment=True)
 
@@ -1308,20 +1308,19 @@ async def approve_assessment(
     current: CurrentUser = Depends(require_reviewer),
     db: AsyncSession = Depends(get_db),
 ):
-    """Approving an assessment publishes it immediately — same
-    auto-publish-on-approve behavior as training modules."""
+    """Approves an assessment for publishing. This does NOT publish it —
+    a separate call to /{id}/publish is required to make it live for
+    nurses, mirroring the training-module lifecycle."""
     res = await db.execute(select(AssessmentModule).where(AssessmentModule.id == id))
     a = res.scalar_one_or_none()
     if not a:
         raise HTTPException(status_code=404, detail="Assessment not found")
     if a.status != ContentStatus.under_review:
         raise HTTPException(status_code=409, detail=f"Cannot approve assessment in status {a.status.value}")
-    a.status = ContentStatus.published
+    a.status = ContentStatus.approved
     a.reviewed_by = current.id
     a.reviewed_at = _now()
     a.review_notes = body.notes
-    a.published_at = _now()
-    a.published_version = a.version
     await db.commit()
     return _serialize_assessment(a, include_admin_fields=True, include_correct=True)
 
