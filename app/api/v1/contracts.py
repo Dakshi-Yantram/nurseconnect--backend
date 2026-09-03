@@ -13,7 +13,10 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core import contracts as contract_templates
+<<<<<<< HEAD
 from app.core.config import settings
+=======
+>>>>>>> origin/staging
 from app.core.database import get_db
 from app.core.deps import CurrentUser, get_current_user, get_worker_profile, require_operations
 from app.core.provider_types import LICENSED_PROVIDER_TYPES, PROVIDER_TYPE_LABELS
@@ -66,8 +69,11 @@ class AdminAgreementRow(BaseModel):
     stage1_accepted_at: Optional[datetime] = None
     stage2_accepted_at: Optional[datetime] = None
     completed_visits_count: int
+<<<<<<< HEAD
     onboarding_fee_collected: float = 0.0
     onboarding_fee_target: float = 200.0
+=======
+>>>>>>> origin/staging
 
 
 # ---------------------------------------------------------------------------
@@ -277,7 +283,11 @@ async def accept_stage2(
     )
     db.add(agreement)
 
+<<<<<<< HEAD
     # The onboarding enablement fee is no longer taken in one lump sum here.
+=======
+# The onboarding enablement fee is no longer taken in one lump sum here.
+>>>>>>> origin/staging
     # It's now collected in small increments (settings.ONBOARDING_FEE_INCREMENT,
     # e.g. ₹50/booking) automatically from each booking's payout as it's
     # created — see payout_service.apply_onboarding_fee_increment(), called
@@ -366,7 +376,10 @@ async def admin_list_agreements(
         stage2_status = (
             stage2.status if stage2 else ("pending" if worker.completed_visits_count >= 1 else "not_applicable")
         )
+<<<<<<< HEAD
         agreement_for_fee = stage2
+=======
+>>>>>>> origin/staging
         out.append(
             AdminAgreementRow(
                 worker_id=str(worker.id),
@@ -379,8 +392,11 @@ async def admin_list_agreements(
                 stage1_accepted_at=stage1.accepted_at if stage1 else None,
                 stage2_accepted_at=stage2.accepted_at if stage2 else None,
                 completed_visits_count=worker.completed_visits_count,
+<<<<<<< HEAD
                 onboarding_fee_collected=float(agreement_for_fee.onboarding_fee_collected) if agreement_for_fee else 0.0,
                 onboarding_fee_target=float(settings.ONBOARDING_ENABLEMENT_FEE),
+=======
+>>>>>>> origin/staging
             )
         )
     return out

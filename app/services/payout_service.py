@@ -1,6 +1,12 @@
+<<<<<<< HEAD
 """Worker payout generation and processing.
 
 Before this existed, no WorkerPayout row was ever created — so a nurse's
+=======
+﻿"""Worker payout generation and processing.
+
+Before this existed, no WorkerPayout row was ever created â€” so a nurse's
+>>>>>>> origin/staging
 earnings always showed zero no matter how many visits they completed. A payout
 is now generated the moment a visit is checked out, and admin processes it
 (optionally via RazorpayX).
@@ -65,7 +71,11 @@ async def create_payout_for_booking(db: AsyncSession, booking: Booking) -> Optio
 
     Idempotent: returns the existing row if one already exists for this
     booking, so a duplicate checkout (retry, offline replay) never pays twice.
+<<<<<<< HEAD
     No-op when the booking has no assigned worker. Flushes but does not commit —
+=======
+    No-op when the booking has no assigned worker. Flushes but does not commit â€”
+>>>>>>> origin/staging
     the caller owns the transaction so the payout lands atomically with checkout.
     """
     if not booking.worker_id:
@@ -128,20 +138,33 @@ async def create_payout_for_booking(db: AsyncSession, booking: Booking) -> Optio
 
     # Spread onboarding fee: take a small bite (settings.ONBOARDING_FEE_INCREMENT)
     # out of *this* payout if the worker still owes some, instead of the old
+<<<<<<< HEAD
     # one-shot ₹200 hit on booking #1.
+=======
+    # one-shot â‚¹200 hit on booking #1.
+>>>>>>> origin/staging
     await apply_onboarding_fee_increment(db, booking.worker_id, payout)
 
     return payout
 
 
 async def apply_onboarding_fee_increment(db: AsyncSession, worker_id: UUID, payout: WorkerPayout) -> Optional[Decimal]:
+<<<<<<< HEAD
     """Collect one increment (settings.ONBOARDING_FEE_INCREMENT, ₹50 by
+=======
+    """Collect one increment (settings.ONBOARDING_FEE_INCREMENT, â‚¹50 by
+>>>>>>> origin/staging
     default) of the Stage 2 onboarding enablement fee from `payout`'s
     net_amount, if the worker has an accepted Stage 2 (e-stamp Master
     Agreement) and hasn't fully paid the fee yet.
 
+<<<<<<< HEAD
     Spreads the total (settings.ONBOARDING_ENABLEMENT_FEE, ₹200 by default)
     across successive bookings' payouts instead of taking it all from one —
+=======
+    Spreads the total (settings.ONBOARDING_ENABLEMENT_FEE, â‚¹200 by default)
+    across successive bookings' payouts instead of taking it all from one â€”
+>>>>>>> origin/staging
     so booking #1 doesn't take the full brunt. Deducts less than the full
     increment on the final bite if that's all that's left to collect, and
     clamps to the payout's net_amount so a payout never goes negative.
@@ -188,8 +211,13 @@ async def apply_onboarding_fee_increment(db: AsyncSession, worker_id: UUID, payo
         booking_id=payout.booking_id,
         worker_id=worker_id,
         description=(
+<<<<<<< HEAD
             f"Onboarding enablement fee installment ₹{actual_deduction} "
             f"(₹{agreement.onboarding_fee_collected}/₹{total_fee} collected)"
+=======
+            f"Onboarding enablement fee installment â‚¹{actual_deduction} "
+            f"(â‚¹{agreement.onboarding_fee_collected}/â‚¹{total_fee} collected)"
+>>>>>>> origin/staging
         ),
     )
     await db.flush()
@@ -201,7 +229,11 @@ async def process_payout(db: AsyncSession, payout: WorkerPayout) -> dict:
 
     Attempts a real RazorpayX transfer when RazorpayX is configured and the
     nurse has bank details; otherwise marks it paid (the admin having settled
+<<<<<<< HEAD
     it out of band). Never pays an on_hold payout — a hold must be released
+=======
+    it out of band). Never pays an on_hold payout â€” a hold must be released
+>>>>>>> origin/staging
     first, which is the whole point of the hold.
     """
     if payout.status == WorkerPayoutStatus.paid:
