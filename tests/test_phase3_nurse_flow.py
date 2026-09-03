@@ -79,7 +79,7 @@ def ctx(nurse_auth, family_auth):
 class TestAuthAndProfile:
     def test_send_otp_and_verify_for_worker(self):
         r = requests.post(
-            f"{API}/auth/send-otp",
+            f"{API}/auth/otp/send",
             json={"phone_e164": "+919999000002", "role": "worker", "purpose": "login"},
             timeout=10,
         )
@@ -88,7 +88,7 @@ class TestAuthAndProfile:
         assert body.get("sent") is True
         # verify
         r = requests.post(
-            f"{API}/auth/verify-otp",
+            f"{API}/auth/otp/verify",
             json={"phone_e164": "+919999000002", "code": "123456", "role": "worker"},
             timeout=10,
         )
