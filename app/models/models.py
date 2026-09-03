@@ -234,7 +234,11 @@ class WorkerProfile(Base):
     registration_authority: Mapped[Optional[str]] = mapped_column(String(255))
     registration_valid_until: Mapped[Optional[date]] = mapped_column(Date)
     # The degree/qualification name (e.g. "BDS", "MDS", "GNM", "BSc Nursing",
+<<<<<<< HEAD
+    # "BPT", "MPT"). Deliberately NOT used to derive worker_type — worker_type
+=======
     # "BPT", "MPT"). Deliberately NOT used to derive worker_type â€” worker_type
+>>>>>>> origin/staging
     # is set explicitly at registration per the "Provider Type must NOT be
     # inferred from degree" rule. Caregivers/Mother & Baby Caregivers leave
     # this null (no degree required).
@@ -268,7 +272,11 @@ class WorkerProfile(Base):
     onboarding_submitted_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
     onboarding_reviewed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
     onboarding_rejection_reason: Mapped[Optional[str]] = mapped_column(Text)
+<<<<<<< HEAD
+    # Doctor's saved signature (PNG, transparent background) — captured once
+=======
     # Doctor's saved signature (PNG, transparent background) â€” captured once
+>>>>>>> origin/staging
     # during onboarding, reused to stamp every e-prescription so the doctor
     # doesn't have to re-sign each time. Only meaningful for worker_type=doctor
     # but left generic in case dentists/physios also start writing e-Rx later.
@@ -294,7 +302,11 @@ class WorkerDocument(Base):
     rejection_reason: Mapped[Optional[str]] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now, server_default=func.now())
     # OCR-assisted name extraction (see app/services/ocr_service.py). This is
+<<<<<<< HEAD
+    # a SUGGESTION only — never auto-overwrites User.full_name or
+=======
     # a SUGGESTION only â€” never auto-overwrites User.full_name or
+>>>>>>> origin/staging
     # WorkerProfile.registration_no. The worker/admin explicitly confirms it
     # via POST /workers/me/documents/{id}/apply-ocr, which is what actually
     # writes the value onto the profile. Never silently trusted because a
@@ -329,7 +341,11 @@ class WorkerKitItem(Base):
 
 
 class WorkerReference(Base):
+<<<<<<< HEAD
+    """Previous-employer / character references — mainly used for Caregiver
+=======
     """Previous-employer / character references â€” mainly used for Caregiver
+>>>>>>> origin/staging
     and Mother & Baby Caregiver onboarding (no degree, so references carry
     more verification weight), but not restricted to those types."""
     __tablename__ = "worker_references"
@@ -349,7 +365,11 @@ class WorkerReference(Base):
 class ProviderStatusHistory(Base):
     """Append-only audit trail of every WorkerProfile.onboarding_status (and
     related qualification/availability) transition. Nothing reads this to
+<<<<<<< HEAD
+    make eligibility decisions — it's audit/observability only, written by
+=======
     make eligibility decisions â€” it's audit/observability only, written by
+>>>>>>> origin/staging
     the same services that already change status (worker_approval.py,
     qualification.py) so admin can see the full history per provider."""
     __tablename__ = "provider_status_history"
@@ -508,14 +528,24 @@ class ServiceCatalogue(Base):
         nullable=False,
     )
     practical_checklist_items: Mapped[Optional[list]] = mapped_column(ARRAY(String))
+<<<<<<< HEAD
+    # Provider Type gate — the "Provider Type Allowed" leg of booking
+=======
     # Provider Type gate â€” the "Provider Type Allowed" leg of booking
+>>>>>>> origin/staging
     # eligibility. NULL/empty = no restriction (back-compat: every existing
     # service row defaults to unrestricted, so nothing that qualifies today
     # stops qualifying). Once set, only workers whose WorkerProfile.worker_type
     # is in this list can ever hold an APPROVED WorkerServiceQualification for
+<<<<<<< HEAD
+    # this service — enforced in app/services/qualification.py.
+    allowed_provider_types: Mapped[Optional[list]] = mapped_column(ARRAY(String))
+    # Soft-delete — same pattern as CarePackage below. A real DELETE would
+=======
     # this service â€” enforced in app/services/qualification.py.
     allowed_provider_types: Mapped[Optional[list]] = mapped_column(ARRAY(String))
     # Soft-delete â€” same pattern as CarePackage below. A real DELETE would
+>>>>>>> origin/staging
     # break Booking/WorkerServiceQualification/etc. rows that reference this
     # service, so admin "delete" only ever sets these.
     is_deleted: Mapped[bool] = mapped_column(Boolean, default=False, index=True, server_default="false")
@@ -537,7 +567,11 @@ class CarePackage(Base):
     # which is internal nurse-facing sign-off language derived from the
     # workbook and was never meant for consumer display.
     whats_included: Mapped[Optional[list]] = mapped_column(ARRAY(String))
+<<<<<<< HEAD
+    # One or two sentences under "Service details" in the expanded card —
+=======
     # One or two sentences under "Service details" in the expanded card â€”
+>>>>>>> origin/staging
     # e.g. visit count, equipment carried, who performs the procedure.
     service_details_text: Mapped[Optional[str]] = mapped_column(Text)
     # Shown only when applicable (e.g. "medicine supplied by the customer",
@@ -562,7 +596,11 @@ class CarePackage(Base):
     documentation_template_id: Mapped[Optional[UUID]] = mapped_column(PG_UUID(as_uuid=True), ForeignKey("documentation_templates.id"))
     requires_prescription: Mapped[bool] = mapped_column(Boolean, default=False)
     prescription_review_required: Mapped[bool] = mapped_column(Boolean, default=False)
+<<<<<<< HEAD
+    # Workflow 1 — true for Composite Care Packages that bundle the nursing
+=======
     # Workflow 1 â€” true for Composite Care Packages that bundle the nursing
+>>>>>>> origin/staging
     # visit fee together with a procedural kit (single bundled Package_Fee).
     material_included: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false")
     missed_visit_policy_id: Mapped[Optional[UUID]] = mapped_column(PG_UUID(as_uuid=True), ForeignKey("missed_visit_policies.id"))
@@ -574,7 +612,11 @@ class CarePackage(Base):
     previous_version_id: Mapped[Optional[UUID]] = mapped_column(PG_UUID(as_uuid=True), ForeignKey("care_packages.id"))
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
     # Soft-delete. Distinct from is_active: a disabled (is_active=False) package
+<<<<<<< HEAD
+    # is still listed (greyed out, read-only) — a deleted one is gone from every
+=======
     # is still listed (greyed out, read-only) â€” a deleted one is gone from every
+>>>>>>> origin/staging
     # list. Never hard-delete: existing CarePackageBooking rows reference this row.
     is_deleted: Mapped[bool] = mapped_column(Boolean, default=False, index=True, server_default="false")
     deleted_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
@@ -599,11 +641,19 @@ class CarePackage(Base):
         nullable=False,
     )
     practical_checklist_items: Mapped[Optional[list]] = mapped_column(ARRAY(String))
+<<<<<<< HEAD
+    # Provider Type gate — same semantics as ServiceCatalogue.allowed_provider_types.
+    # e.g. Baby Massage & Bath package: ["mother_baby_caregiver"].
+    # Elder Companion package: ["caregiver"] by default; admin can add
+    # "nurse" explicitly per your "Nurse should only be allowed if Admin
+    # explicitly enables Nurse" rule — that's exactly what adding "nurse"
+=======
     # Provider Type gate â€” same semantics as ServiceCatalogue.allowed_provider_types.
     # e.g. Baby Massage & Bath package: ["mother_baby_caregiver"].
     # Elder Companion package: ["caregiver"] by default; admin can add
     # "nurse" explicitly per your "Nurse should only be allowed if Admin
     # explicitly enables Nurse" rule â€” that's exactly what adding "nurse"
+>>>>>>> origin/staging
     # to this array does, nothing special-cased.
     allowed_provider_types: Mapped[Optional[list]] = mapped_column(ARRAY(String))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now, server_default=func.now())
@@ -733,7 +783,11 @@ class Booking(Base):
     # Patch 3 â€” Radius-wave dispatch tracking.
     assignment_wave: Mapped[int] = mapped_column(Integer, default=1, server_default="1")
     assignment_escalated_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+<<<<<<< HEAD
+    # When the booking became dispatchable to workers (payment captured →
+=======
     # When the booking became dispatchable to workers (payment captured â†’
+>>>>>>> origin/staging
     # status confirmed). The wave clock runs from here, NOT created_at:
     # workers only see confirmed bookings, so counting waves from creation
     # burned the whole 20-minute wave window while the consumer was still
@@ -742,14 +796,22 @@ class Booking(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now, server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now, onupdate=_now, server_default=func.now())
 
+<<<<<<< HEAD
+    # ── Workflow 1: Composite Care Package (material_included bookings) ──
+=======
     # â”€â”€ Workflow 1: Composite Care Package (material_included bookings) â”€â”€
+>>>>>>> origin/staging
     material_included: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false")
     prescription_id: Mapped[Optional[UUID]] = mapped_column(PG_UUID(as_uuid=True), ForeignKey("prescriptions.id"))
     fulfillment_route: Mapped[Optional[FulfillmentRoute]] = mapped_column(
         SQLEnum(FulfillmentRoute, name="fulfillment_route")
     )
 
+<<<<<<< HEAD
+    # ── Workflow 2: Service-Only (patient supplies their own materials) ──
+=======
     # â”€â”€ Workflow 2: Service-Only (patient supplies their own materials) â”€â”€
+>>>>>>> origin/staging
     # The booking-time supply guardrail. The patient ticks that they have the
     # prescribed medicine, cannula/catheter, drip set and Rx ready, and must
     # attach one photo of those supplies next to the prescription. Payment is
@@ -817,7 +879,11 @@ class VisitRecord(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now, server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now, onupdate=_now, server_default=func.now())
 
+<<<<<<< HEAD
+    # ── Workflow 1 — Step 4: synchronized nurse/patient safety checklist ──
+=======
     # â”€â”€ Workflow 1 â€” Step 4: synchronized nurse/patient safety checklist â”€â”€
+>>>>>>> origin/staging
     # Nurse's 5-item pre-procedure questionnaire, e.g.
     # {"hand_hygiene": true, "sterile_gloves": true, "identity_verified": true,
     #  "allergy_history_checked": true, "prescription_expiry_verified": true}
@@ -831,7 +897,11 @@ class VisitRecord(Base):
     quality_discrepancy_reviewed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
     quality_discrepancy_reviewed_by: Mapped[Optional[UUID]] = mapped_column(PG_UUID(as_uuid=True), ForeignKey("users.id"))
 
+<<<<<<< HEAD
+    # ── Step 5/6: mandatory photo proof ──
+=======
     # â”€â”€ Step 5/6: mandatory photo proof â”€â”€
+>>>>>>> origin/staging
     # Workflow 1 frames the sealed, unopened kit + the Rx; Workflow 2 frames
     # the patient's own supplies with the expiry label visible + the Rx.
     pre_procedure_photo_url: Mapped[Optional[str]] = mapped_column(Text)
@@ -839,13 +909,82 @@ class VisitRecord(Base):
     post_procedure_photo_url: Mapped[Optional[str]] = mapped_column(Text)  # dressed/completed site
     post_procedure_photo_meta: Mapped[Optional[dict]] = mapped_column(JSONB)
 
+<<<<<<< HEAD
+    # ── Workflow 2 — Step 4: nurse-reported problem with the patient's own
+=======
     # â”€â”€ Workflow 2 â€” Step 4: nurse-reported problem with the patient's own
+>>>>>>> origin/staging
     # supplies (broken sterile packaging, expired medicine). Distinct from
     # `quality_discrepancy`, which is the patient disputing the nurse's
     # hygiene self-report. Both block the procedure pending ops review.
     supply_issue_reported: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false")
     supply_issue_details: Mapped[Optional[dict]] = mapped_column(JSONB)  # {issue_type, notes, reported_at}
 
+<<<<<<< HEAD
+
+# ============================================================================
+# Workflow 1 — Step 7: Automated Invoicing
+# ============================================================================
+class Invoice(Base):
+    __tablename__ = "invoices"
+    id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), primary_key=True, default=_uuid)
+    booking_id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), ForeignKey("bookings.id", ondelete="CASCADE"), unique=True, index=True)
+    invoice_number: Mapped[str] = mapped_column(String(40), unique=True, index=True)
+    # "composite_healthcare_service" (Workflow 1 material_included bundle,
+    # 0% GST), "paramedical_nursing_service" (Workflow 2 service-only, 0% GST
+    # exempt) or "professional_service" (other bookings, taxable per local
+    # rules).
+    invoice_type: Mapped[str] = mapped_column(String(50), default="professional_service")
+    gst_percent: Mapped[Decimal] = mapped_column(Numeric(5, 2), default=0)
+    subtotal_amount: Mapped[Decimal] = mapped_column(Numeric(10, 2), nullable=False)
+    tax_amount: Mapped[Decimal] = mapped_column(Numeric(10, 2), default=0)
+    total_amount: Mapped[Decimal] = mapped_column(Numeric(10, 2), nullable=False)
+    line_items: Mapped[list] = mapped_column(JSONB, nullable=False)
+    pdf_url: Mapped[Optional[str]] = mapped_column(Text)
+    generated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now, server_default=func.now())
+
+
+# ============================================================================
+# In-app calling (Dyte) + best-effort background call push
+# ============================================================================
+class CallSession(Base):
+    """One row per call attempt on a booking. A booking can have many rows
+    (redials). dyte_meeting_id is reused across redials within the same
+    booking so history stays on one Dyte meeting."""
+    __tablename__ = "call_sessions"
+    id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), primary_key=True, default=_uuid)
+    booking_id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), ForeignKey("bookings.id", ondelete="CASCADE"), index=True, nullable=False)
+    dyte_meeting_id: Mapped[str] = mapped_column(String(120), nullable=False, index=True)
+    initiated_by_user_id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), ForeignKey("users.id"), nullable=False)
+    initiated_by_role: Mapped[str] = mapped_column(String(20), nullable=False)  # consumer | worker
+    callee_user_id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), ForeignKey("users.id"), nullable=False)
+    status: Mapped[str] = mapped_column(String(20), default="ringing", index=True)  # ringing|joined|missed|ended|failed
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now, server_default=func.now())
+    callee_joined_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    ended_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    duration_seconds: Mapped[Optional[int]] = mapped_column(Integer)
+    end_reason: Mapped[Optional[str]] = mapped_column(String(30))  # completed|no_answer|declined|failed
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now, server_default=func.now())
+
+
+class PushSubscription(Base):
+    """Web Push (VAPID) subscription — one row per browser/device the user has
+    granted notification permission on. Separate from UserSession.fcm_token
+    (native FCM). Used for the best-effort "ring while backgrounded" call
+    ping — see the accompanying writeup for the ceiling on what this can and
+    can't do (it cannot wake a force-killed app)."""
+    __tablename__ = "push_subscriptions"
+    id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), primary_key=True, default=_uuid)
+    user_id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), index=True, nullable=False)
+    endpoint: Mapped[str] = mapped_column(Text, nullable=False, unique=True)
+    p256dh_key: Mapped[str] = mapped_column(Text, nullable=False)
+    auth_key: Mapped[str] = mapped_column(Text, nullable=False)
+    user_agent: Mapped[Optional[str]] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now, server_default=func.now())
+    last_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now, onupdate=_now, server_default=func.now())
+
+=======
+>>>>>>> origin/staging
 
 # ============================================================================
 # Workflow 1 â€” Step 7: Automated Invoicing
@@ -1022,7 +1161,11 @@ class Prescription(Base):
     rejection_reason: Mapped[Optional[str]] = mapped_column(Text)
     # Renewal-consultation gate: if the Rx is stale (see
     # composite_care_workflow.is_prescription_expired), the pharmacist can't
+<<<<<<< HEAD
+    # approve it until this is paid — a ₹100 doctor consultation charge.
+=======
     # approve it until this is paid â€” a â‚¹100 doctor consultation charge.
+>>>>>>> origin/staging
     renewal_consultation_paid: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false")
     renewal_consultation_order_id: Mapped[Optional[str]] = mapped_column(String(100))
     renewal_consultation_paid_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
@@ -1049,7 +1192,11 @@ class TeleConsultation(Base):
 
     Drives the admin dashboard's teledoctor tab: bookings assigned to a
     teledoctor start in `waiting`, and the doctor moves them forward stage by
+<<<<<<< HEAD
+    stage during/after the Dyte call — diet review, then patient issues (or
+=======
     stage during/after the Dyte call â€” diet review, then patient issues (or
+>>>>>>> origin/staging
     "all okay"), then the e-prescription. Stage only ever moves forward;
     the admin queue groups/filters on `stage` to show doctors what's next.
     """
@@ -1245,7 +1392,11 @@ class WorkerPayout(Base):
     razorpay_payout_id: Mapped[Optional[str]] = mapped_column(Text)
     status: Mapped[WorkerPayoutStatus] = mapped_column(SQLEnum(WorkerPayoutStatus, name="worker_payout_status"), default=WorkerPayoutStatus.pending, index=True)
     # Two-step release: an admin must approve() a payout before process()
+<<<<<<< HEAD
+    # will pay it — separate from `status`/hold so "approved, not yet paid"
+=======
     # will pay it â€” separate from `status`/hold so "approved, not yet paid"
+>>>>>>> origin/staging
     # stays visible as its own state in the admin queue.
     approval_status: Mapped[PayoutApprovalStatus] = mapped_column(
         SQLEnum(PayoutApprovalStatus, name="payout_approval_status"),
@@ -1528,12 +1679,20 @@ class TrainingModule(Base):
     is_mandatory: Mapped[bool] = mapped_column(Boolean, default=False)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
     version: Mapped[int] = mapped_column(Integer, default=1, server_default="1", nullable=False)
+<<<<<<< HEAD
+    # Provider Type system — which WorkerType values this module is shown to
+=======
     # Provider Type system â€” which WorkerType values this module is shown to
+>>>>>>> origin/staging
     # (worker-facing GET /training/modules filters on this). NULL/empty =
     # visible to every provider type, same unrestricted-by-default semantics
     # as ServiceCatalogue.allowed_provider_types / CarePackage.allowed_provider_types.
     allowed_provider_types: Mapped[Optional[list]] = mapped_column(ARRAY(String))
+<<<<<<< HEAD
+    # Patch 4B — content lifecycle fields
+=======
     # Patch 4B â€” content lifecycle fields
+>>>>>>> origin/staging
     status: Mapped[ContentStatus] = mapped_column(
         SQLEnum(ContentStatus, name="content_status"),
         default=ContentStatus.published,
@@ -1569,10 +1728,17 @@ class AssessmentModule(Base):
     # per attempt so two workers rarely see byte-identical questions.
     questions: Mapped[list] = mapped_column(JSONB, nullable=False)
     linked_training_module_code: Mapped[Optional[str]] = mapped_column(String(100), index=True)
+<<<<<<< HEAD
+    # Provider Type system — same semantics as TrainingModule.allowed_provider_types.
+    # NULL/empty = visible to every provider type.
+    allowed_provider_types: Mapped[Optional[list]] = mapped_column(ARRAY(String))
+    # ── Anti-cheat assessment mechanics (Gate 2/3 "theory-verified") ──────
+=======
     # Provider Type system â€” same semantics as TrainingModule.allowed_provider_types.
     # NULL/empty = visible to every provider type.
     allowed_provider_types: Mapped[Optional[list]] = mapped_column(ARRAY(String))
     # â”€â”€ Anti-cheat assessment mechanics (Gate 2/3 "theory-verified") â”€â”€â”€â”€â”€â”€
+>>>>>>> origin/staging
     randomize_options: Mapped[bool] = mapped_column(Boolean, default=True, server_default="true", nullable=False)
     questions_per_attempt: Mapped[Optional[int]] = mapped_column(Integer)  # null = use every question in the bank
     time_limit_minutes: Mapped[Optional[int]] = mapped_column(Integer)     # null = no time limit
@@ -1857,7 +2023,11 @@ class WorkerAvailabilitySlot(Base):
 
     Distinct from ``WorkerProfile.availability`` (the online/offline/busy/
     on_leave *live* status used by dispatch right now). This is the nurse's
+<<<<<<< HEAD
+    *declared schedule* — e.g. "Mon-Fri 9am-5pm" — so ops and the nurse
+=======
     *declared schedule* â€” e.g. "Mon-Fri 9am-5pm" â€” so ops and the nurse
+>>>>>>> origin/staging
     herself have a record of when she intends to be reachable, independent
     of whether she has actually toggled herself online at this exact moment.
     """
@@ -1867,7 +2037,11 @@ class WorkerAvailabilitySlot(Base):
         PG_UUID(as_uuid=True), ForeignKey("worker_profiles.id", ondelete="CASCADE"), index=True, nullable=False
     )
     # 0=Monday .. 6=Sunday (ISO weekday - 1), matches JS Date.getDay() minus
+<<<<<<< HEAD
+    # the Sun=0 offset handled client-side — see schemas.py docstring.
+=======
     # the Sun=0 offset handled client-side â€” see schemas.py docstring.
+>>>>>>> origin/staging
     day_of_week: Mapped[int] = mapped_column(SmallInteger, nullable=False)
     start_time: Mapped[time] = mapped_column(Time, nullable=False)
     end_time: Mapped[time] = mapped_column(Time, nullable=False)
@@ -1887,7 +2061,11 @@ class WorkerAlertnessCheck(Base):
     """One attempt at the pre-navigation reaction-time gate.
 
     Shown to the nurse right before she opens Google Maps to an accepted
+<<<<<<< HEAD
+    booking's address. Purely a fatigue/attention screen — never blocks
+=======
     booking's address. Purely a fatigue/attention screen â€” never blocks
+>>>>>>> origin/staging
     navigation outright (holding up a nurse's route to a patient on a
     failed tap-game would itself be a safety problem), but every attempt is
     logged so ops can see if a nurse is consistently showing signs of
@@ -1934,7 +2112,11 @@ class WorkerAlertnessCheck(Base):
 # Provider contracts (clickwrap Stage 1 + e-stamp Master Agreement Stage 2).
 # See app/core/contracts.py for the template text + dynamic placeholder
 # rendering (registration number / authority label switches per provider
+<<<<<<< HEAD
+# type — e.g. "State Nursing Council Reg No." for nurses, "Medical Council
+=======
 # type â€” e.g. "State Nursing Council Reg No." for nurses, "Medical Council
+>>>>>>> origin/staging
 # Registration No." for doctors, no license line at all for caregivers).
 # ---------------------------------------------------------------------------
 class WorkerAgreement(Base):
@@ -1950,15 +2132,25 @@ class WorkerAgreement(Base):
     accepted_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
     otp_verified: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false")
     ip_address: Mapped[Optional[str]] = mapped_column(String(64))
+<<<<<<< HEAD
+    # Stage 2 only — e-sign/e-stamp provider reference (Digio/Leegality/ASP)
+=======
     # Stage 2 only â€” e-sign/e-stamp provider reference (Digio/Leegality/ASP)
+>>>>>>> origin/staging
     esign_provider: Mapped[Optional[str]] = mapped_column(String(50))
     esign_reference_id: Mapped[Optional[str]] = mapped_column(String(255))
     esign_document_url: Mapped[Optional[str]] = mapped_column(Text)
     # onboarding_fee_deducted now means "fully collected" (kept for backward
     # compatibility with existing reads/filters). The fee is no longer taken
+<<<<<<< HEAD
+    # in one lump sum from booking #1 — it's spread in small increments
+    # (settings.ONBOARDING_FEE_INCREMENT, ₹50 by default) across successive
+    # bookings' payouts so a single booking never "eats" the whole ₹200.
+=======
     # in one lump sum from booking #1 â€” it's spread in small increments
     # (settings.ONBOARDING_FEE_INCREMENT, â‚¹50 by default) across successive
     # bookings' payouts so a single booking never "eats" the whole â‚¹200.
+>>>>>>> origin/staging
     # onboarding_fee_collected tracks running progress toward
     # settings.ONBOARDING_ENABLEMENT_FEE; onboarding_fee_deducted flips to
     # True once collected >= the total fee.
