@@ -84,28 +84,45 @@ def effective_origin_for_worker(worker) -> Optional[Tuple[float, float]]:
 
 
 def radius_for_wave(wave: int, is_urgent: bool) -> Optional[int]:
-    """Radius (km) for a given wave. Returns ``None`` once escalated."""
+    """Radius (km) for a given wave.
+
+    Past the last wave the booking is flagged as escalated for admin
+    attention (assignment_escalated_at), but it STAYS visible to workers at
+    the widest radius — returning ``None`` here used to hide it from every
+    worker forever, so any booking not claimed within ~20 minutes could
+    only be rescued by manual admin assignment.
+    """
     table = URGENT_WAVE_RADII_KM if is_urgent else NORMAL_WAVE_RADII_KM
     if 1 <= wave <= len(table):
         return table[wave - 1]
-    return None  # escalated / past last wave
+    if wave > len(table):
+        return table[-1]  # escalated: keep serving at max radius
+    return None  # wave < 1 — defensive, never produced by compute_current_wave
 
 
 def compute_current_wave(booking, now: Optional[datetime] = None) -> int:
-    """Compute which wave this booking is in given elapsed minutes since
-    ``booking.created_at``. Returns 1..3 or 4 (escalated/past last wave).
+    """Compute which wave this booking is in given elapsed minutes since it
+    became dispatchable. Returns 1..3 or 4 (escalated/past last wave).
+
+    The clock starts at ``dispatch_started_at`` (set when payment is
+    captured and the booking flips to confirmed) — falling back to
+    ``created_at`` only for legacy rows that predate the column. Using
+    created_at unconditionally meant the wave window was already burning
+    while the consumer was still paying.
 
     Spec: progress opportunistically when worker new-requests endpoint is
-    called — so this is a pure function of (now - created_at, is_urgent).
+    called — so this is a pure function of (now - clock start, is_urgent).
     """
-    if booking is None or booking.created_at is None:
+    if booking is None:
+        return 1
+    started = getattr(booking, "dispatch_started_at", None) or booking.created_at
+    if started is None:
         return 1
     if now is None:
         now = datetime.now(timezone.utc)
-    created = booking.created_at
-    if created.tzinfo is None:
-        created = created.replace(tzinfo=timezone.utc)
-    elapsed_min = (now - created).total_seconds() / 60.0
+    if started.tzinfo is None:
+        started = started.replace(tzinfo=timezone.utc)
+    elapsed_min = (now - started).total_seconds() / 60.0
     thresholds = URGENT_WAVE_TIME_MIN if booking.is_urgent else NORMAL_WAVE_TIME_MIN
     if elapsed_min < thresholds[0]:
         return 1

@@ -66,6 +66,26 @@ async def _clear_defaults(db: AsyncSession, consumer_id: UUID) -> None:
     )
 
 
+def _mirror_default_to_profile(profile: ConsumerProfile, addr: ConsumerAddress) -> None:
+    """Keep the legacy profile.address_* / latitude / longitude columns in
+    sync with whichever ConsumerAddress is currently the default.
+
+    These profile-level columns are NOT read anywhere in the booking or
+    dispatch path (address_id / booking.latitude / booking.longitude are
+    the source of truth there) — this exists purely so any legacy or
+    external code that still reads profile.latitude/longitude never sees a
+    stale account-level location. Every place that can change which
+    address is the default must call this so the mirror never drifts.
+    """
+    profile.address_line1 = addr.line1
+    profile.address_line2 = addr.line2
+    profile.city = addr.city
+    profile.state = addr.state
+    profile.pincode = addr.pincode
+    profile.latitude = addr.latitude
+    profile.longitude = addr.longitude
+
+
 @router.get("")
 async def list_addresses(
     profile: ConsumerProfile = Depends(get_consumer_profile),
@@ -100,13 +120,7 @@ async def create_address(
 
     # Mirror the default onto the profile for back-compat with older code paths.
     if make_default:
-        profile.address_line1 = addr.line1
-        profile.address_line2 = addr.line2
-        profile.city = addr.city
-        profile.state = addr.state
-        profile.pincode = addr.pincode
-        profile.latitude = addr.latitude
-        profile.longitude = addr.longitude
+        _mirror_default_to_profile(profile, addr)
 
     await db.commit()
     return _serialize(addr)
@@ -133,6 +147,10 @@ async def update_address(
 
     for field, value in payload.model_dump().items():
         setattr(addr, field, value)
+
+    if addr.is_default:
+        _mirror_default_to_profile(profile, addr)
+
     await db.commit()
     return _serialize(addr)
 
@@ -153,6 +171,7 @@ async def set_default(
         raise HTTPException(status_code=404, detail="Address not found")
     await _clear_defaults(db, profile.id)
     addr.is_default = True
+    _mirror_default_to_profile(profile, addr)
     await db.commit()
     return _serialize(addr)
 
@@ -181,5 +200,16 @@ async def delete_address(
         )).scalar_one_or_none()
         if nxt:
             nxt.is_default = True
+            _mirror_default_to_profile(profile, nxt)
+        else:
+            # No addresses left — clear the stale mirror rather than leaving
+            # it pointed at the just-deleted address's coordinates.
+            profile.address_line1 = None
+            profile.address_line2 = None
+            profile.city = None
+            profile.state = None
+            profile.pincode = None
+            profile.latitude = None
+            profile.longitude = None
     await db.commit()
     return {"deleted": True}
