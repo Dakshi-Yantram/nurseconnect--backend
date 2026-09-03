@@ -19,8 +19,8 @@ Direct DB access (psycopg2) is used to:
 from __future__ import annotations
 
 import os
-import subprocess
 from datetime import date, timedelta
+from pathlib import Path
 
 import psycopg2
 import pytest
@@ -393,17 +393,26 @@ class TestUrgentNoCoordsExclusion:
 # ---------- No paid Google Maps API usage in backend ----------
 class TestNoPaidMapsBackend:
     def test_no_google_maps_backend_calls(self):
+        # Pure-Python scan instead of shelling out to `grep`: portable across
+        # OSes (the CI runner and local Windows dev boxes both lack a
+        # guaranteed `grep` on PATH), and anchored to the actual repo `app/`
+        # directory next to this test file rather than a hardcoded
+        # `/app/backend/app` container path that doesn't exist outside the
+        # Docker image — with the old subprocess approach a missing path
+        # silently made `grep` exit non-zero and the assertion pass
+        # vacuously, so this was never really checking anything in CI.
         forbidden = ["GOOGLE_MAPS_API_KEY", "maps.googleapis.com", "geocoding", "distance-matrix"]
-        # grep ignoring caches/venvs
-        for needle in forbidden:
-            res = subprocess.run(
-                [
-                    "grep", "-rI", "--exclude-dir=__pycache__",
-                    "--exclude-dir=.venv", "--exclude-dir=venv",
-                    "--include=*.py", needle, "/app/backend/app",
-                ],
-                capture_output=True, text=True,
-            )
-            assert res.returncode != 0 or not res.stdout.strip(), (
-                f"Forbidden token '{needle}' found in backend:\n{res.stdout}"
-            )
+        app_dir = Path(__file__).resolve().parent.parent / "app"
+        skip_dirs = {"__pycache__", ".venv", "venv"}
+        hits: list[str] = []
+        for py_file in app_dir.rglob("*.py"):
+            if skip_dirs & set(py_file.parts):
+                continue
+            try:
+                text = py_file.read_text(encoding="utf-8", errors="ignore")
+            except OSError:
+                continue
+            for needle in forbidden:
+                if needle in text:
+                    hits.append(f"{py_file}: {needle}")
+        assert not hits, f"Forbidden token(s) found in backend:\n" + "\n".join(hits)
