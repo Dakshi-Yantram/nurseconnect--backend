@@ -274,14 +274,13 @@ async def accept_stage2(
     )
     db.add(agreement)
 
-    # Deduct/record the onboarding enablement fee against Booking #1's
-    # payout the moment the nurse e-signs the Master Agreement.
-    from app.services.payout_service import apply_onboarding_fee
-
-    deducted = await apply_onboarding_fee(db, worker.id)
-    if deducted is not None:
-        agreement.onboarding_fee_deducted = True
-
+# The onboarding enablement fee is no longer taken in one lump sum here.
+    # It's now collected in small increments (settings.ONBOARDING_FEE_INCREMENT,
+    # e.g. ₹50/booking) automatically from each booking's payout as it's
+    # created — see payout_service.apply_onboarding_fee_increment(), called
+    # from create_payout_for_booking() — until the running total reaches
+    # settings.ONBOARDING_ENABLEMENT_FEE. This avoids one single booking
+    # bearing the full ₹200 hit.
     await db.commit()
 
     return ContractPreviewOut(stage=2, status="accepted", rendered_text=rendered, unlocked=False)

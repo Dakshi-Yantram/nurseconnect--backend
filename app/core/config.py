@@ -1,4 +1,4 @@
-"""Application configuration."""
+﻿"""Application configuration."""
 from functools import lru_cache
 from typing import List
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -44,7 +44,7 @@ class Settings(BaseSettings):
     EMAIL_DEV_MODE: bool = True
     EMAIL_DEV_FIXED_CODE: str = "654321"
 
-    # Legacy SMTP settings — kept for reference / fallback. Render's free
+    # Legacy SMTP settings â€” kept for reference / fallback. Render's free
     # tier blocks outbound SMTP ports (25/465/587), so these are unused
     # by email_service.py now in favour of the Resend HTTP API below.
     SMTP_HOST: str = ""
@@ -55,7 +55,7 @@ class Settings(BaseSettings):
     SMTP_FROM_NAME: str = "NurseConnect"
     SMTP_USE_TLS: bool = True
 
-    # Resend (transactional email over HTTPS — works on Render free tier)
+    # Resend (transactional email over HTTPS â€” works on Render free tier)
     RESEND_API_KEY: str = ""
     EMAIL_FROM_ADDRESS: str = "onboarding@resend.dev"
 
@@ -74,16 +74,25 @@ class Settings(BaseSettings):
     #   tds    = (gross - comm) * TDS%   (India: 194O e-commerce, often 1%)
     #   net    = gross - comm - tds
     #
-    # The payout is created as `pending`. Admin reviews and processes it —
+    # The payout is created as `pending`. Admin reviews and processes it â€”
     # optionally auto-transferring via RazorpayX when RAZORPAYX_* is set and
     # the nurse has bank details on file. Nothing leaves the platform without
     # an admin action, which is what marketplaces want for hold/dispute control.
     # ---------------------------------------------------------------------
     PLATFORM_COMMISSION_PCT: float = 20.0
     PLATFORM_TDS_PCT: float = 0.0
-    ONBOARDING_ENABLEMENT_FEE: float = 200.0  # ₹ deducted from first-booking payout once Stage 2 is e-signed
+    ONBOARDING_ENABLEMENT_FEE: float = 200.0  # â‚¹ total collected over several bookings once Stage 2 is e-signed
+    # Spread the onboarding fee across bookings instead of taking it all from
+    # booking #1 â€” deduct this much per completed booking's payout until the
+    # running total reaches ONBOARDING_ENABLEMENT_FEE. â‚¹50/booking by default
+    # (4 bookings to clear â‚¹200); raise to 100 for a faster 2-booking payoff.
+    ONBOARDING_FEE_INCREMENT: float = 50.0
 
-    # RazorpayX (payouts) — separate product from Razorpay payments above.
+    # App URL used to build the public e-prescription verification link
+    # embedded in the Rx PDF's QR code (e.g. https://app.nurseconnect.in).
+    PUBLIC_APP_URL: str = "https://app.nurseconnect.in"
+
+    # RazorpayX (payouts) â€” separate product from Razorpay payments above.
     # Leave blank to keep payouts manual (admin marks them paid after an
     # out-of-band bank transfer). When set, admin "process" attempts a real
     # RazorpayX transfer to the nurse's fund account.
@@ -121,7 +130,7 @@ class Settings(BaseSettings):
     ABHA_CLIENT_ID: str = ""
     ABHA_CLIENT_SECRET: str = ""
 
-    # Cloudflare RealtimeKit (in-app voice calling) — replaces Dyte.
+    # Cloudflare RealtimeKit (in-app voice calling) â€” replaces Dyte.
     #
     # As of the Cloudflare-native integration, the old Dyte-style
     # "org_id : api_key" Basic-auth scheme against api.realtime.cloudflare.com/v2
@@ -134,7 +143,7 @@ class Settings(BaseSettings):
     REALTIMEKIT_APP_ID: str = ""
     REALTIMEKIT_API_TOKEN: str = ""
     REALTIMEKIT_BASE_URL: str = "https://api.cloudflare.com/client/v4"
-    # Deprecated Dyte-era fields — kept only so a pre-migration .env doesn't
+    # Deprecated Dyte-era fields â€” kept only so a pre-migration .env doesn't
     # crash on load. No longer read by RealtimeKitClient.
     REALTIMEKIT_ORG_ID: str = ""
     REALTIMEKIT_API_KEY: str = ""
@@ -142,7 +151,7 @@ class Settings(BaseSettings):
     DYTE_API_KEY: str = ""
     DYTE_BASE_URL: str = ""
 
-    # Web Push (VAPID) — best-effort background call ping for browser tabs.
+    # Web Push (VAPID) â€” best-effort background call ping for browser tabs.
     # NOTE: this does NOT wake a fully force-killed browser; only the native
     # PushKit / FCM paths below can ring a killed mobile app.
     VAPID_PUBLIC_KEY: str = ""
@@ -150,15 +159,15 @@ class Settings(BaseSettings):
     VAPID_SUBJECT: str = "mailto:support@nurseconnect.app"
 
     # ---------------------------------------------------------------------
-    # APNs — iOS VoIP (PushKit) push.
+    # APNs â€” iOS VoIP (PushKit) push.
     #
     # This is what lets a *force-killed* iOS app ring. It uses token-based
-    # auth: download a .p8 key from the Apple Developer portal (Keys → new key
+    # auth: download a .p8 key from the Apple Developer portal (Keys â†’ new key
     # with "Apple Push Notifications service" enabled) and set the three
     # values below. APNS_KEY_P8 accepts either the PEM contents directly or a
     # path to the .p8 file.
     #
-    # The push topic is always "<APNS_BUNDLE_ID>.voip" — Apple requires the
+    # The push topic is always "<APNS_BUNDLE_ID>.voip" â€” Apple requires the
     # .voip suffix for PushKit, and rejects the plain bundle id.
     # ---------------------------------------------------------------------
     APNS_KEY_P8: str = ""
