@@ -51,7 +51,9 @@ NEARBY_WORKER_LNG = 72.8235
 
 
 def _login(phone: str, role: str) -> dict:
-    r = requests.post(f"{API}/auth/login", json={"phone_e164": phone, "code": "123456", "role": role}, timeout=15)
+    # NOTE: /auth/login is email+password only (see app/api/v1/auth.py).
+    # Phone-number login for the mobile-app contract is /auth/phone-login.
+    r = requests.post(f"{API}/auth/phone-login", json={"phone_e164": phone, "code": "123456", "role": role}, timeout=15)
     assert r.status_code == 200, f"login {phone}/{role} failed: {r.status_code} {r.text}"
     return r.json()
 
