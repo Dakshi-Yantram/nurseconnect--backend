@@ -274,7 +274,7 @@ async def accept_stage2(
     )
     db.add(agreement)
 
-    # The onboarding enablement fee is no longer taken in one lump sum here.
+# The onboarding enablement fee is no longer taken in one lump sum here.
     # It's now collected in small increments (settings.ONBOARDING_FEE_INCREMENT,
     # e.g. ₹50/booking) automatically from each booking's payout as it's
     # created — see payout_service.apply_onboarding_fee_increment(), called

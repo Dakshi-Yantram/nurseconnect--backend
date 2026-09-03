@@ -1,4 +1,4 @@
-"""FastAPI application factory."""
+﻿"""FastAPI application factory."""
 import logging
 import os
 import subprocess
@@ -87,7 +87,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title=settings.APP_NAME,
     version="2.0.0",
-    description="NurseConnect backend — production-grade healthcare marketplace platform",
+    description="NurseConnect backend â€” production-grade healthcare marketplace platform",
     lifespan=lifespan,
     debug=True,
 )
@@ -140,7 +140,7 @@ async def health():
     from app.integrations import cloudinary_client
     storage_mock = cloudinary_client.mock
     # Mock storage in production means uploads "succeed" but nothing is
-    # actually stored — that's a degraded state worth surfacing here, not
+    # actually stored â€” that's a degraded state worth surfacing here, not
     # just in logs.
     is_prod = settings.APP_ENV.lower() in ("production", "prod")
     overall = "ok" if (db_ok and redis_ok and not (storage_mock and is_prod)) else "degraded"
@@ -202,7 +202,7 @@ for r in [
     app.include_router(r, prefix=_API_PREFIX)
 
 
-# Patch 4 — serve uploaded documentation files locally. Public URL prefix
+# Patch 4 â€” serve uploaded documentation files locally. Public URL prefix
 # matches the urls returned by POST /care/workflow/{booking_id}/documentation/file.
 _UPLOAD_DIR = os.environ.get("UPLOAD_DIR", "./uploads")
 os.makedirs(_UPLOAD_DIR, exist_ok=True)

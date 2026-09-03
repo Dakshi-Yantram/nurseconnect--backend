@@ -2112,7 +2112,7 @@ async def reject_worker_payout_approval(
     await db.commit()
     return {"approval_status": payout.approval_status.value}
 
-
+    
 @router.post("/worker-payouts/{payout_id}/process")
 async def process_worker_payout(
     payout_id: UUID,
