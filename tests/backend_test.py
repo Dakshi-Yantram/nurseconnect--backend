@@ -58,10 +58,10 @@ class TestAuth:
         roles = [
             ("+919999000001", "consumer"),
             ("+919999000002", "worker"),
-            ("+919999000003", "admin_ops"),
-            ("+919999000004", "admin_super"),
-            ("+919999000005", "admin_finance"),
-            ("+919999000006", "admin_clinical"),
+            ("+919999000003", "admin"),
+            ("+919999000004", "admin"),
+            ("+919999000005", "admin"),
+            ("+919999000006", "admin"),
         ]
         for phone, role in roles:
             data = _login(phone, role)
