@@ -31,6 +31,7 @@ from app.models.models import (
     ConsumerProfile,
     EmailVerificationCode,
     OtpCode,
+    Patient,
     User,
     UserSession,
     WorkerProfile,
@@ -94,8 +95,20 @@ def _validate_password(password: str) -> None:
 async def _ensure_role_profile(db: AsyncSession, user: User) -> None:
     if user.role == UserRole.consumer:
         res = await db.execute(select(ConsumerProfile).where(ConsumerProfile.user_id == user.id))
-        if not res.scalar_one_or_none():
-            db.add(ConsumerProfile(user_id=user.id))
+        profile = res.scalar_one_or_none()
+        if not profile:
+            profile = ConsumerProfile(user_id=user.id)
+            db.add(profile)
+            await db.flush()
+            # Auto-create a "self" patient record so every consumer has at
+            # least one patient to book for immediately after signup.
+            db.add(
+                Patient(
+                    consumer_id=profile.id,
+                    full_name=user.full_name or "Self",
+                    relationship_to_consumer="self",
+                )
+            )
     elif user.role == UserRole.worker:
         res = await db.execute(select(WorkerProfile).where(WorkerProfile.user_id == user.id))
         if not res.scalar_one_or_none():
