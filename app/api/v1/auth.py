@@ -539,10 +539,10 @@ async def otp_verify(payload: OtpVerifyRequest, request: Request, db: AsyncSessi
     user_res = await db.execute(select(User).where(User.phone_e164 == phone))
     user = user_res.scalar_one_or_none()
 
-    if user and user.role == UserRole.worker:
+    if user and user.role != payload.role:
         raise HTTPException(
             status_code=409,
-            detail="This number is registered as a care professional. Use the nurse/caregiver login.",
+            detail=f"This number is registered as a {user.role.value}. Use the correct login for that role.",
         )
 
     if not user:
@@ -553,7 +553,7 @@ async def otp_verify(payload: OtpVerifyRequest, request: Request, db: AsyncSessi
         user = User(
             phone_e164=phone,
             full_name=(payload.full_name or "").strip() or None,
-            role=UserRole.consumer,
+            role=payload.role,
             status=UserStatus.active,
             email_verified_at=datetime.now(timezone.utc),
         )
