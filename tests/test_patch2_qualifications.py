@@ -31,7 +31,7 @@ WORKER2_PHONE = "+919999000007"
 # --------- helpers ---------
 def _login(phone: str, role: str) -> dict:
     r = requests.post(
-        f"{API}/auth/login",
+        f"{API}/auth/phone-login",
         json={"phone_e164": phone, "code": "123456", "role": role},
         timeout=15,
     )

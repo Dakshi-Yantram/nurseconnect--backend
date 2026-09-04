@@ -25,12 +25,12 @@ WORKER_PHONE = "+919999000002"
 
 # ---------- helpers ----------
 def _send_otp(phone, role):
-    httpx.post(f"{BASE}/auth/send-otp", json={"phone_e164": phone, "role": role}, timeout=15)
+    httpx.post(f"{BASE}/auth/otp/send", json={"phone_e164": phone, "role": role}, timeout=15)
 
 
 def _login(phone, role="consumer"):
     _send_otp(phone, role)
-    r = httpx.post(f"{BASE}/auth/verify-otp", json={
+    r = httpx.post(f"{BASE}/auth/otp/verify", json={
         "phone_e164": phone, "code": "123456", "role": role,
         "device_id": "phase6", "device_platform": "cli",
     }, timeout=15)
