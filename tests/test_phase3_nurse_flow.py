@@ -22,7 +22,16 @@ import requests
 
 from tests.conftest import API, _login, auth_headers
 
-PG_DSN = "host=127.0.0.1 port=5432 user=nurseconnect password=nurseconnect dbname=nurseconnect"
+# Direct-SQL DSN for status flips that have no API endpoint. Overridable via
+# the existing PG_TEST_DSN env var (already set by CI and used elsewhere in
+# this project's tooling) so a local Postgres on a non-default host port
+# (e.g. a Docker mapping like 55433->5432) works without touching this file
+# again; falls back to the exact value that matched the CI Postgres service
+# container when PG_TEST_DSN isn't set.
+PG_DSN = os.environ.get(
+    "PG_TEST_DSN",
+    "host=127.0.0.1 port=5432 user=nurseconnect password=nurseconnect dbname=nurseconnect",
+)
 
 
 def _sql(query: str, params: tuple = ()) -> None:
