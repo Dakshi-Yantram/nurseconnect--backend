@@ -113,6 +113,7 @@ async def _ensure_role_profile(db: AsyncSession, user: User) -> None:
         res = await db.execute(select(WorkerProfile).where(WorkerProfile.user_id == user.id))
         if not res.scalar_one_or_none():
             worker_kwargs = {}
+            dev_auto_approved = False
             # OTP_DEV_MODE gates local dev + CI/automated tests (see
             # app/core/rate_limit.py). The qualification gate added in
             # Patch 2 (app/services/qualification.py) requires
@@ -127,7 +128,31 @@ async def _ensure_role_profile(db: AsyncSession, user: User) -> None:
                     "onboarding_status": WorkerOnboardingStatus.approved,
                     "tier": WorkerTier.tier3,
                 }
-            db.add(WorkerProfile(user_id=user.id, **worker_kwargs))
+                # The qualification gate (app/services/qualification.py)
+                # also requires User.status == active — a worker stuck on
+                # UserStatus.onboarding is treated as WORKER_INACTIVE no
+                # matter how their WorkerProfile.onboarding_status reads.
+                # Dev-mode auto-approval above only ever touched
+                # WorkerProfile, so a worker created straight through
+                # phone-login (as every test worker is) never actually
+                # became eligible to accept bookings. Mirror the real
+                # approve_worker_profile flow here.
+                user.status = UserStatus.active
+                dev_auto_approved = True
+            worker_profile = WorkerProfile(user_id=user.id, **worker_kwargs)
+            db.add(worker_profile)
+            if dev_auto_approved:
+                # Mirror the other half of approve_worker_profile
+                # (app/services/worker_approval.py): setting
+                # onboarding_status/tier alone never populates
+                # WorkerServiceQualification rows for tier-only services,
+                # so a freshly dev-approved worker showed
+                # QUALIFICATION_STATUS_NOT_QUALIFIED instead of APPROVED
+                # for services they already qualify for by tier. Needs a
+                # flush first so worker_profile.id exists.
+                await db.flush()
+                from app.services.qualification import sync_tier_qualifications
+                await sync_tier_qualifications(db, worker_profile)
     await db.flush()
 
 
