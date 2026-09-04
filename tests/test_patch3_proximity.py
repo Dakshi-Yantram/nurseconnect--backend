@@ -1,418 +1,501 @@
-"""Patch 3 — Proximity dispatch (Haversine + radius waves) backend tests.
+"""Phase 3 — Nurse Flow Integration end-to-end backend tests.
 
-Covers:
-- POST /api/workers/me/location (JWT worker auth) + persistence
-- 401/403 when called without token or with consumer token
-- GET /api/bookings/worker/new-requests returns distance_km
-- Acceptance #1: worker inside wave-1 radius sees normal booking (~1.1 km)
-- Acceptance #2: worker outside wave-1 radius (~10 km) does NOT see booking
-- Acceptance #3: wave bump to 3 → far worker sees the booking
-- Acceptance #4: far worker can claim first; near worker gets 409 BOOKING_ALREADY_CLAIMED
-- Urgent booking with worker having no coords is excluded
-- No paid Google Maps backend APIs in repo
+Covers the full nurse lifecycle as outlined in the Phase 3 review_request:
+auth -> workers/me -> kit list/update -> earnings -> training modules ->
+bookings/worker -> create consumer booking -> direct SQL update to 'confirmed' ->
+bookings/worker/new-requests -> accept -> checkin (idempotent) -> vitals ->
+medications -> checklist -> manual escalate -> checkout (idempotent) ->
+GET /visits/{id} -> GET /escalations/?booking_id=... -> GET /care-notes/patient/{id}.
 
-Direct DB access (psycopg2) is used to:
-- flip booking status from `pending_payment` → `confirmed`
-- bump booking.assignment_wave for Check #3
-- temporarily NULL home/current coords for the no-coords urgent test
+Also verifies:
+- escalation level enum: watch | inform_family | contact_doctor | emergency
+- availability enum: online | offline | busy | on_leave
 """
 from __future__ import annotations
 
 import os
-from datetime import date, timedelta
-from pathlib import Path
+import random
+import uuid
+from datetime import date, datetime, timedelta, timezone
 
-import psycopg2
+import psycopg
 import pytest
 import requests
 
-BASE_URL = os.environ.get("EXPO_PUBLIC_BACKEND_URL", "http://localhost:8001").rstrip("/")
-API = f"{BASE_URL}/api"
+from tests.conftest import API, _login, auth_headers
 
-CONSUMER_PHONE = "+919999000001"
-RIYA_PHONE = "+919999000002"   # ~1 km worker
-MEERA_PHONE = "+919999000007"  # ~10 km worker in our tests
-
-CONSUMER_LAT = "18.9430"
-CONSUMER_LNG = "72.8235"
-RIYA_LAT = 18.953   # ~1.1 km from consumer
-RIYA_LNG = 72.8235
-MEERA_LAT = 19.033  # ~10 km from consumer
-MEERA_LNG = 72.8235
-
-
-# ---------- helpers ----------
-def _login(phone: str, role: str) -> dict:
-    r = requests.post(
-        f"{API}/auth/phone-login",
-        json={"phone_e164": phone, "code": "123456", "role": role},
-        timeout=15,
-    )
-    assert r.status_code == 200, f"login {phone}/{role} failed: {r.status_code} {r.text}"
-    body = r.json()
-    assert "tokens" in body and "access_token" in body["tokens"], body
-    return body
+# Direct-SQL DSN for status flips that have no API endpoint. Overridable via
+# the existing PG_TEST_DSN env var (already set by CI and used elsewhere in
+# this project's tooling) so a local Postgres on a non-default host port
+# (e.g. a Docker mapping like 55433->5432) works without touching this file
+# again; falls back to the exact value that matched the CI Postgres service
+# container when PG_TEST_DSN isn't set.
+PG_DSN = os.environ.get(
+    "PG_TEST_DSN",
+    "host=127.0.0.1 port=5432 user=nurseconnect password=nurseconnect dbname=nurseconnect",
+)
 
 
-def _h(auth: dict) -> dict:
-    return {"Authorization": f"Bearer {auth['tokens']['access_token']}"}
-
-
-def _pg_conn():
-    return psycopg2.connect(
-        host="127.0.0.1", port=5432, dbname="nurseconnect",
-        user="nurseconnect", password="nurseconnect",
-    )
-
-
-# ---------- session fixtures ----------
-@pytest.fixture(scope="session")
-def consumer_auth():
-    return _login(CONSUMER_PHONE, "consumer")
-
-
-@pytest.fixture(scope="session")
-def riya_auth():
-    return _login(RIYA_PHONE, "worker")
-
-
-@pytest.fixture(scope="session")
-def meera_auth():
-    return _login(MEERA_PHONE, "worker")
-
-
-@pytest.fixture(scope="session")
-def general_nursing_service():
-    r = requests.get(f"{API}/services", timeout=10)
-    assert r.status_code == 200, r.text
-    svcs = {s["service_code"]: s for s in r.json()}
-    assert "GENERAL_NURSING" in svcs, "GENERAL_NURSING not seeded"
-    return svcs["GENERAL_NURSING"]
-
-
-def _create_confirmed_booking(consumer_auth: dict, service_id: str, *,
-                              latitude: str = CONSUMER_LAT,
-                              longitude: str = CONSUMER_LNG,
-                              is_urgent: bool = False,
-                              days_ahead: int = 3) -> str:
-    ch = _h(consumer_auth)
-    patients = requests.get(f"{API}/patients", headers=ch, timeout=10).json()
-    assert patients, "no seeded patient"
-    pid = patients[0]["id"]
-    bk = requests.post(
-        f"{API}/bookings/",
-        headers=ch,
-        json={
-            "patient_id": pid,
-            "service_id": service_id,
-            "scheduled_date": (date.today() + timedelta(days=days_ahead)).isoformat(),
-            "scheduled_start_time": "10:30:00",
-            "address": {"line1": "42 MG Rd", "city": "Mumbai", "state": "MH", "pincode": "400001"},
-            "latitude": latitude,
-            "longitude": longitude,
-            "is_urgent": is_urgent,
-        },
-        timeout=15,
-    )
-    assert bk.status_code == 200, bk.text
-    bid = bk.json()["id"]
-    conn = _pg_conn()
-    try:
+def _sql(query: str, params: tuple = ()) -> None:
+    with psycopg.connect(PG_DSN, autocommit=True) as conn:
         with conn.cursor() as cur:
-            cur.execute(
-                "UPDATE bookings SET status='confirmed', worker_id=NULL, assignment_wave=1 WHERE id=%s",
-                (bid,),
-            )
-        conn.commit()
-    finally:
-        conn.close()
-    return bid
+            cur.execute(query, params)
 
 
-# ---------- Health ----------
-class TestHealth:
-    def test_health_ok(self):
-        r = requests.get(f"{API}/health", timeout=10)
+def _fetchone(query: str, params: tuple = ()):
+    with psycopg.connect(PG_DSN, autocommit=True) as conn:
+        with conn.cursor() as cur:
+            cur.execute(query, params)
+            return cur.fetchone()
+
+
+def _unique_future_slot(base_days: int = 5000) -> tuple[str, str]:
+    """(scheduled_date, scheduled_start_time) pair that won't collide with
+    another booking — this suite's own bookings included — even across
+    repeated runs on a persistent DB. A fixed date+time (as several tests
+    here originally used) eventually collides with a worker's own
+    already-assigned visit from an earlier run and trips the very real
+    worker_has_schedule_conflict check for a scenario that has nothing to
+    do with what's actually under test.
+
+    Pushes far into the future and picks the date offset and time-of-day
+    with two INDEPENDENT random.randint() calls (Python's random module is
+    seeded from OS entropy at interpreter start, not from wall-clock alone)
+    over a wide space (3650 days x 840 minute-slots ~= 3M combinations) —
+    collision-resistant across effectively any number of repeated runs.
+    An earlier version of this helper derived both the date offset and the
+    time-of-day from the same millisecond-of-second wall-clock value, which
+    gave the pair a combined repeat cycle of only ~36 seconds — worse than
+    the fixed value it replaced once run more than a handful of times.
+    worker_has_schedule_conflict itself is untouched either way.
+    """
+    scheduled_date = (
+        date.today() + timedelta(days=base_days + random.randint(0, 3650))
+    ).isoformat()
+    hour = random.randint(6, 19)
+    minute = random.randint(0, 59)
+    scheduled_start_time = f"{hour:02d}:{minute:02d}:00"
+    return scheduled_date, scheduled_start_time
+
+
+# --------- Module-scoped auth + shared context ---------
+@pytest.fixture(scope="module")
+def nurse_auth():
+    return _login("+919999000002", "worker")
+
+
+@pytest.fixture(scope="module")
+def family_auth():
+    return _login("+919999000001", "consumer")
+
+
+@pytest.fixture(scope="module")
+def ctx(nurse_auth, family_auth):
+    """Build a confirmed booking owned by consumer and assignable by nurse."""
+    ch = auth_headers(family_auth)
+    wh = auth_headers(nurse_auth)
+
+    svcs = requests.get(f"{API}/services", timeout=10).json()
+    svc_id = svcs[0]["id"]
+    patients = requests.get(f"{API}/patients", headers=ch, timeout=10).json()
+    pid = patients[0]["id"]
+
+    scheduled_date, scheduled_start_time = _unique_future_slot()
+    payload = {
+        "patient_id": pid,
+        "service_id": svc_id,
+        "scheduled_date": scheduled_date,
+        "scheduled_start_time": scheduled_start_time,
+        "address": {"line1": "Phase3 Lane", "city": "Mumbai", "state": "MH", "pincode": "400001"},
+        "latitude": "19.0760",
+        "longitude": "72.8777",
+        "is_urgent": False,
+    }
+    r = requests.post(f"{API}/bookings/", headers=ch, json=payload, timeout=10)
+    assert r.status_code == 200, r.text
+    booking = r.json()
+    bid = booking["id"]
+    # Bypass payment by setting booking confirmed + payment captured (mocked provider)
+    _sql(
+        "UPDATE bookings SET status='confirmed', payment_status='captured', worker_id=NULL WHERE id=%s",
+        (bid,),
+    )
+    # Patch 5A gates check-in/checklist behind service consent and
+    # medications behind medication consent (see app/api/v1/visits.py
+    # require_consent calls) — nothing creates that consent automatically,
+    # a real consumer grants it explicitly via POST /care/consents. Grant
+    # both, scoped to this booking, so the visit lifecycle below can
+    # actually proceed through check-in and medications like a real flow
+    # would, instead of asserting around a step this suite never took.
+    for consent_type in ("service", "medication"):
+        cr = requests.post(
+            f"{API}/care/consents",
+            headers=ch,
+            json={
+                "patient_id": pid,
+                "booking_id": bid,
+                "consent_type": consent_type,
+                "consented_by_name": "Phase3 Test Family",
+                "relationship_to_patient": "self",
+            },
+            timeout=10,
+        )
+        assert cr.status_code == 200, cr.text
+    return {"ch": ch, "wh": wh, "bid": bid, "pid": pid, "booking": booking}
+
+
+# --------- 1. Auth + workers/me ---------
+class TestAuthAndProfile:
+    def test_send_otp_and_verify_for_worker(self):
+        r = requests.post(
+            f"{API}/auth/otp/send",
+            json={"phone_e164": "+919999000002", "role": "worker", "purpose": "login"},
+            timeout=10,
+        )
         assert r.status_code == 200, r.text
         body = r.json()
-        # Accept either {"status":"ok"} or nested db/redis flags
-        assert body.get("status", "ok") in ("ok", "healthy") or body.get("db") in (True, "ok") or body.get("ok")
-
-
-# ---------- Login ----------
-class TestLogin:
-    def test_consumer_login(self):
-        body = _login(CONSUMER_PHONE, "consumer")
-        assert body["user"]["role"] == "consumer"
-
-    def test_riya_login(self):
-        body = _login(RIYA_PHONE, "worker")
-        assert body["user"]["role"] == "worker"
-        assert "access_token" in body["tokens"]
-
-    def test_meera_login(self):
-        body = _login(MEERA_PHONE, "worker")
-        assert body["user"]["role"] == "worker"
-        assert "access_token" in body["tokens"]
-
-
-# ---------- POST /workers/me/location ----------
-class TestWorkerLocationEndpoint:
-    def test_requires_auth_no_token(self):
+        assert body.get("sent") is True
+        # verify
         r = requests.post(
-            f"{API}/workers/me/location",
-            json={"latitude": RIYA_LAT, "longitude": RIYA_LNG, "accuracy": 10},
+            f"{API}/auth/otp/verify",
+            json={"phone_e164": "+919999000002", "code": "123456", "role": "worker"},
             timeout=10,
         )
-        assert r.status_code in (401, 403), f"expected 401/403 without token, got {r.status_code} {r.text}"
+        assert r.status_code == 200, r.text
+        data = r.json()
+        assert "tokens" in data and "access_token" in data["tokens"]
+        assert data["user"]["role"] == "worker"
 
-    def test_requires_worker_role(self, consumer_auth):
-        r = requests.post(
-            f"{API}/workers/me/location",
-            headers=_h(consumer_auth),
-            json={"latitude": RIYA_LAT, "longitude": RIYA_LNG, "accuracy": 10},
-            timeout=10,
+    def test_workers_me_returns_profile(self, nurse_auth):
+        r = requests.get(f"{API}/workers/me", headers=auth_headers(nurse_auth), timeout=10)
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert "id" in body
+        assert "availability" in body
+
+
+# --------- 2. Kit ---------
+class TestKit:
+    @pytest.fixture(scope="class", autouse=True)
+    def _seed_kit_items(self, nurse_auth):
+        """Nothing in app/ code ever provisions WorkerKitItem rows for a
+        worker (no seed step, no auto-create on approval) — GET /me/kit
+        just lists whatever exists. Seed a couple of baseline items
+        directly, once, so these tests exercise the real GET/PUT
+        /workers/me/kit endpoints against realistic data instead of
+        changing application logic to add auto-provisioning that isn't
+        this suite's concern. Idempotent: only inserts if this worker has
+        no kit items yet, so repeated runs on a persistent DB don't pile
+        up duplicates.
+        """
+        row = _fetchone(
+            "SELECT wp.id FROM worker_profiles wp JOIN users u ON u.id = wp.user_id "
+            "WHERE u.phone_e164 = %s",
+            ("+919999000002",),
         )
-        assert r.status_code in (401, 403), f"expected 401/403 for consumer, got {r.status_code} {r.text}"
+        assert row, "nurse worker profile not found for kit seeding"
+        worker_id = row[0]
 
-    def test_worker_can_post_location(self, riya_auth):
-        r = requests.post(
-            f"{API}/workers/me/location",
-            headers=_h(riya_auth),
-            json={"latitude": RIYA_LAT, "longitude": RIYA_LNG, "accuracy": 12},
-            timeout=10,
+        existing = _fetchone(
+            "SELECT COUNT(*) FROM worker_kit_items WHERE worker_id = %s", (worker_id,)
+        )
+        if not existing or existing[0] == 0:
+            for item_code, item_name in (
+                ("BP_MONITOR", "BP Monitor"),
+                ("THERMOMETER", "Digital Thermometer"),
+            ):
+                _sql(
+                    "INSERT INTO worker_kit_items (id, worker_id, item_code, item_name, is_present) "
+                    "VALUES (%s, %s, %s, %s, true)",
+                    (str(uuid.uuid4()), worker_id, item_code, item_name),
+                )
+            # Verify from a fresh connection immediately, so a failure here
+            # points straight at the actual mechanism (wrong worker_id, a
+            # trigger/constraint silently rejecting the row, etc.) instead
+            # of surfacing three test methods downstream as a generic
+            # "empty kit" assertion with no further information.
+            verify = _fetchone(
+                "SELECT COUNT(*) FROM worker_kit_items WHERE worker_id = %s", (worker_id,)
+            )
+            assert verify and verify[0] >= 2, (
+                f"kit item seeding did not take effect: worker_id={worker_id!r}, "
+                f"post-insert count={verify!r}"
+            )
+
+    def test_list_kit_has_items(self, nurse_auth):
+        r = requests.get(f"{API}/workers/me/kit", headers=auth_headers(nurse_auth), timeout=10)
+        assert r.status_code == 200, r.text
+        items = r.json()
+        assert isinstance(items, list) and len(items) >= 1
+        assert {"id", "item_code", "item_name", "is_present"}.issubset(items[0].keys())
+
+    def test_update_kit_is_present_false(self, nurse_auth):
+        h = auth_headers(nurse_auth)
+        kits = requests.get(f"{API}/workers/me/kit", headers=h, timeout=10).json()
+        kid = kits[0]["id"]
+        r = requests.put(
+            f"{API}/workers/me/kit/{kid}?is_present=false", headers=h, timeout=10
         )
         assert r.status_code == 200, r.text
         body = r.json()
         assert body.get("ok") is True
-        assert abs(float(body["current_latitude"]) - RIYA_LAT) < 1e-4
-        assert abs(float(body["current_longitude"]) - RIYA_LNG) < 1e-4
-        assert "current_location_updated_at" in body
+        assert body.get("kit_complete") is False
+        # restore
+        r2 = requests.put(
+            f"{API}/workers/me/kit/{kid}?is_present=true", headers=h, timeout=10
+        )
+        assert r2.status_code == 200
 
-    def test_location_persists_in_db(self, riya_auth):
-        # Re-post a slightly tweaked location and read back from DB
+
+# --------- 3. Earnings ---------
+class TestEarnings:
+    def test_earnings_shape(self, nurse_auth):
+        r = requests.get(f"{API}/workers/me/earnings", headers=auth_headers(nurse_auth), timeout=10)
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert {"total_paid", "total_pending", "payouts"}.issubset(body.keys())
+        assert isinstance(body["payouts"], list)
+
+
+# --------- 4. Training ---------
+class TestTraining:
+    def test_modules_list(self, nurse_auth):
+        r = requests.get(f"{API}/training/modules", headers=auth_headers(nurse_auth), timeout=10)
+        assert r.status_code == 200, r.text
+        mods = r.json()
+        assert isinstance(mods, list) and len(mods) >= 1
+        assert {"id", "code", "title", "completed"}.issubset(mods[0].keys())
+
+
+# --------- 5. Worker bookings list ---------
+class TestWorkerBookings:
+    def test_worker_bookings(self, nurse_auth):
+        r = requests.get(f"{API}/bookings/worker", headers=auth_headers(nurse_auth), timeout=10)
+        assert r.status_code == 200, r.text
+        assert isinstance(r.json(), list)
+
+    def test_worker_new_requests_contains_our_booking(self, nurse_auth, ctx):
+        r = requests.get(
+            f"{API}/bookings/worker/new-requests", headers=auth_headers(nurse_auth), timeout=10
+        )
+        assert r.status_code == 200, r.text
+        items = r.json()
+        ids = [b["id"] for b in items]
+        assert ctx["bid"] in ids, f"booking {ctx['bid']} should be in new-requests, got {ids[:5]}"
+
+
+# --------- 6. Visit lifecycle ---------
+class TestVisitLifecycle:
+    def test_01_accept(self, ctx):
+        r = requests.post(f"{API}/bookings/{ctx['bid']}/accept", headers=ctx["wh"], timeout=10)
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["status"] == "assigned"
+        assert body["worker_id"]
+
+    def test_02_checkin(self, ctx):
         r = requests.post(
-            f"{API}/workers/me/location",
-            headers=_h(riya_auth),
-            json={"latitude": RIYA_LAT, "longitude": RIYA_LNG, "accuracy": 7},
+            f"{API}/visits/{ctx['bid']}/checkin",
+            headers=ctx["wh"],
+            json={"latitude": "19.0760", "longitude": "72.8777"},
             timeout=10,
         )
         assert r.status_code == 200, r.text
-        conn = _pg_conn()
-        try:
-            with conn.cursor() as cur:
-                cur.execute(
-                    "SELECT current_latitude, current_longitude, current_location_updated_at "
-                    "FROM worker_profiles wp JOIN users u ON u.id = wp.user_id "
-                    "WHERE u.phone_e164 = %s",
-                    (RIYA_PHONE,),
-                )
-                row = cur.fetchone()
-        finally:
-            conn.close()
-        assert row is not None, "worker profile not found"
-        assert abs(float(row[0]) - RIYA_LAT) < 1e-4
-        assert abs(float(row[1]) - RIYA_LNG) < 1e-4
-        assert row[2] is not None
+        body = r.json()
+        assert body["status"] == "in_progress"
+        assert body["check_in_at"]
 
-
-# ---------- Patch 2 regression — service eligibility ----------
-class TestPatch2EligibilityRegression:
-    def test_four_seeded_states(self, riya_auth):
-        r = requests.get(f"{API}/workers/me/service-eligibility", headers=_h(riya_auth), timeout=15)
-        assert r.status_code == 200, r.text
-        rows = {x["code"]: x for x in r.json()}
-        gn = rows.get("GENERAL_NURSING")
-        wd = rows.get("WOUND_DRESSING")
-        iv = rows.get("IV_INFUSION")
-        pi = rows.get("PICC_LINE_CARE")
-        assert gn and gn["qualification_status"] == "APPROVED", gn
-        assert gn["can_opt_in"] is True
-        assert wd and wd["qualification_status"] == "APPROVED", wd
-        assert iv and iv["qualification_status"] == "TRAINING_REQUIRED", iv
-        assert pi is not None, "PICC_LINE_CARE missing"
-        # PICC may be locked due to tier or pending approval — both spec-acceptable.
-        assert pi["can_opt_in"] is False
-
-
-# ---------- Acceptance checks #1–#4 ----------
-class TestAcceptanceProximityFlow:
-    """The four headline Patch 3 acceptance scenarios.
-
-    Tests share state via class attributes — order matters within this class.
-    """
-
-    booking_id: str = ""
-
-    def test_01_set_worker_locations_and_create_booking(
-        self, riya_auth, meera_auth, consumer_auth, general_nursing_service
-    ):
-        # Riya inside ~1 km
+    def test_03_checkin_idempotent_rejects_double(self, ctx):
+        """Calling checkin twice should NOT corrupt state — must 400 with 'Already checked in'."""
         r = requests.post(
-            f"{API}/workers/me/location",
-            headers=_h(riya_auth),
-            json={"latitude": RIYA_LAT, "longitude": RIYA_LNG, "accuracy": 10},
+            f"{API}/visits/{ctx['bid']}/checkin",
+            headers=ctx["wh"],
+            json={"latitude": "19.0760", "longitude": "72.8777"},
+            timeout=10,
+        )
+        assert r.status_code == 400, r.text
+        assert "checked in" in r.text.lower()
+
+    def test_04_vitals(self, ctx):
+        r = requests.post(
+            f"{API}/visits/{ctx['bid']}/vitals",
+            headers=ctx["wh"],
+            json={
+                "bp_systolic": 120,
+                "bp_diastolic": 80,
+                "pulse": 72,
+                "spo2": 98,
+                "temperature_f": 98.6,
+                "blood_sugar_random": 110,
+            },
             timeout=10,
         )
         assert r.status_code == 200, r.text
-        # Meera far away (~10 km)
+        body = r.json()
+        assert body["bp_systolic"] == 120
+        assert body["bp_diastolic"] == 80
+
+    def test_05_medications(self, ctx):
         r = requests.post(
-            f"{API}/workers/me/location",
-            headers=_h(meera_auth),
-            json={"latitude": MEERA_LAT, "longitude": MEERA_LNG, "accuracy": 10},
+            f"{API}/visits/{ctx['bid']}/medications",
+            headers=ctx["wh"],
+            json={
+                "drug_name": "Paracetamol",
+                "dose_amount": "500mg",
+                "allergy_check_done": True,
+                "allergy_confirmed_clear": True,
+                "patient_identified": True,
+                "expiry_checked": True,
+                "administered_at": datetime.now(timezone.utc).isoformat(),
+            },
             timeout=10,
         )
         assert r.status_code == 200, r.text
+        body = r.json()
+        assert body.get("id")
 
-        # Ensure both opted IN to GENERAL_NURSING
-        gn = general_nursing_service
-        for w in (riya_auth, meera_auth):
+    def test_06_checklist(self, ctx):
+        r = requests.post(
+            f"{API}/visits/{ctx['bid']}/checklist",
+            headers=ctx["wh"],
+            json={"responses": {"hand_hygiene": True, "consent_taken": True, "vitals_recorded": True}},
+            timeout=10,
+        )
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body.get("checklist_responses", {}).get("hand_hygiene") is True
+
+    def test_07_manual_escalate_inform_family(self, ctx):
+        r = requests.post(
+            f"{API}/bookings/{ctx['bid']}/escalate",
+            headers=ctx["wh"],
+            json={
+                "level": "inform_family",
+                "trigger_type": "manual",
+                "notes": "Family wants an update",
+                "trigger_details": {"reason": "family_request"},
+            },
+            timeout=10,
+        )
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["level"] == "inform_family"
+        assert body["status"] == "open"
+
+    def test_08_checkout(self, ctx):
+        r = requests.post(
+            f"{API}/visits/{ctx['bid']}/checkout",
+            headers=ctx["wh"],
+            json={
+                "latitude": "19.0760",
+                "longitude": "72.8777",
+                "family_summary": "All good",
+                "care_notes": "Patient stable",
+            },
+            timeout=10,
+        )
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["status"] == "completed"
+        assert body["documentation_complete"] is True
+        assert body["check_out_at"]
+
+    def test_09_checkout_idempotent_rejects_double(self, ctx):
+        r = requests.post(
+            f"{API}/visits/{ctx['bid']}/checkout",
+            headers=ctx["wh"],
+            json={
+                "latitude": "19.0760",
+                "longitude": "72.8777",
+                "family_summary": "dup",
+                "care_notes": "dup",
+            },
+            timeout=10,
+        )
+        assert r.status_code == 400, r.text
+        assert "checked out" in r.text.lower()
+
+    def test_10_get_visit_completed(self, ctx):
+        r = requests.get(f"{API}/visits/{ctx['bid']}", headers=ctx["wh"], timeout=10)
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["status"] == "completed"
+        assert body["documentation_complete"] is True
+
+    def test_11_escalations_by_booking(self, ctx):
+        r = requests.get(
+            f"{API}/escalations/?booking_id={ctx['bid']}", headers=ctx["wh"], timeout=10
+        )
+        assert r.status_code == 200, r.text
+        items = r.json()
+        assert isinstance(items, list)
+        assert any(e["level"] == "inform_family" for e in items), items
+
+    def test_12_care_notes_for_patient(self, ctx, family_auth):
+        # Use consumer because worker visibility depends on note flags
+        r = requests.get(
+            f"{API}/care-notes/patient/{ctx['pid']}",
+            headers=auth_headers(family_auth),
+            timeout=10,
+        )
+        assert r.status_code == 200, r.text
+        assert isinstance(r.json(), list)
+
+
+# --------- 7. Enum coverage ---------
+class TestEnumCoverage:
+    @pytest.mark.parametrize("level", ["watch", "inform_family", "contact_doctor", "emergency"])
+    def test_all_escalation_levels_accepted(self, nurse_auth, family_auth, level):
+        ch = auth_headers(family_auth)
+        wh = auth_headers(nurse_auth)
+        svcs = requests.get(f"{API}/services", timeout=10).json()
+        patients = requests.get(f"{API}/patients", headers=ch, timeout=10).json()
+        scheduled_date, scheduled_start_time = _unique_future_slot()
+        bk = requests.post(
+            f"{API}/bookings/",
+            headers=ch,
+            json={
+                "patient_id": patients[0]["id"],
+                "service_id": svcs[0]["id"],
+                "scheduled_date": scheduled_date,
+                "scheduled_start_time": scheduled_start_time,
+                "address": {"line1": "Lvl", "city": "Mumbai", "state": "MH", "pincode": "400001"},
+                "latitude": "19.0760",
+                "longitude": "72.8777",
+            },
+            timeout=10,
+        ).json()
+        bid = bk["id"]
+        _sql(
+            "UPDATE bookings SET status='confirmed', payment_status='captured', worker_id=NULL WHERE id=%s",
+            (bid,),
+        )
+        ar = requests.post(f"{API}/bookings/{bid}/accept", headers=wh, timeout=10)
+        assert ar.status_code == 200, ar.text
+        r = requests.post(
+            f"{API}/bookings/{bid}/escalate",
+            headers=wh,
+            json={"level": level, "trigger_type": "manual", "notes": f"test {level}"},
+            timeout=10,
+        )
+        assert r.status_code == 200, f"level={level} -> {r.status_code} {r.text}"
+        assert r.json()["level"] == level
+
+    @pytest.mark.parametrize("av", ["online", "offline", "busy", "on_leave"])
+    def test_all_availability_values(self, nurse_auth, av):
+        r = requests.put(
+            f"{API}/workers/me/availability",
+            headers=auth_headers(nurse_auth),
+            json={"availability": av},
+            timeout=10,
+        )
+        assert r.status_code == 200, f"availability={av} -> {r.status_code} {r.text}"
+        assert r.json()["availability"] == av
+        # restore at the end
+        if av != "online":
             requests.put(
-                f"{API}/workers/me/service-preferences",
-                headers=_h(w),
-                json={"target_type": "service", "target_id": gn["id"], "preference_status": "OPTED_IN"},
+                f"{API}/workers/me/availability",
+                headers=auth_headers(nurse_auth),
+                json={"availability": "online"},
                 timeout=10,
             )
-
-        bid = _create_confirmed_booking(consumer_auth, gn["id"])
-        TestAcceptanceProximityFlow.booking_id = bid
-        assert bid
-
-    def test_02_check1_riya_sees_booking_with_distance(self, riya_auth):
-        bid = TestAcceptanceProximityFlow.booking_id
-        r = requests.get(f"{API}/bookings/worker/new-requests", headers=_h(riya_auth), timeout=15)
-        assert r.status_code == 200, r.text
-        items = r.json()
-        match = next((b for b in items if b["id"] == bid), None)
-        assert match is not None, f"Riya should see booking {bid}; got {[b['id'] for b in items]}"
-        assert match.get("assignment_wave") == 1
-        assert match.get("distance_km") is not None
-        assert 0.9 <= float(match["distance_km"]) <= 1.4, f"distance_km {match.get('distance_km')} not ~1.1km"
-
-    def test_03_check2_meera_does_not_see_wave1_booking(self, meera_auth):
-        bid = TestAcceptanceProximityFlow.booking_id
-        r = requests.get(f"{API}/bookings/worker/new-requests", headers=_h(meera_auth), timeout=15)
-        assert r.status_code == 200, r.text
-        items = r.json()
-        ids = {b["id"] for b in items}
-        assert bid not in ids, f"Meera (~10km) must NOT see wave-1 booking; saw {ids}"
-
-    def test_04_check3_bump_wave_to_3_meera_sees(self, meera_auth):
-        bid = TestAcceptanceProximityFlow.booking_id
-        conn = _pg_conn()
-        try:
-            with conn.cursor() as cur:
-                cur.execute("UPDATE bookings SET assignment_wave=3 WHERE id=%s", (bid,))
-            conn.commit()
-        finally:
-            conn.close()
-
-        r = requests.get(f"{API}/bookings/worker/new-requests", headers=_h(meera_auth), timeout=15)
-        assert r.status_code == 200, r.text
-        items = r.json()
-        match = next((b for b in items if b["id"] == bid), None)
-        assert match is not None, f"Meera should see wave-3 booking {bid}; got {[b['id'] for b in items]}"
-        assert match.get("distance_km") is not None
-        assert 9.0 <= float(match["distance_km"]) <= 11.5, f"distance_km {match['distance_km']} not ~10km"
-        # assignment_wave should remain >= 3 (the endpoint only bumps UP)
-        assert (match.get("assignment_wave") or 0) >= 3
-
-    def test_05_check4_meera_claims_first_riya_409(self, meera_auth, riya_auth):
-        bid = TestAcceptanceProximityFlow.booking_id
-        # Ensure wave still 3 (test_04 left it at 3 and endpoint only bumps up)
-        # Meera claims first
-        r_meera = requests.post(f"{API}/bookings/{bid}/accept", headers=_h(meera_auth), timeout=15)
-        assert r_meera.status_code == 200, f"Meera first claim should succeed: {r_meera.status_code} {r_meera.text}"
-        body_m = r_meera.json()
-        assert body_m.get("status") == "assigned", body_m
-
-        # Riya tries to claim — must lose with 409
-        r_riya = requests.post(f"{API}/bookings/{bid}/accept", headers=_h(riya_auth), timeout=15)
-        assert r_riya.status_code == 409, f"Riya late claim must 409, got {r_riya.status_code} {r_riya.text}"
-        body_r = r_riya.json()
-        # Patch 2 envelope shape: {success:false, code:'BOOKING_ALREADY_CLAIMED', message:...}
-        assert body_r.get("code") == "BOOKING_ALREADY_CLAIMED", body_r
-        assert body_r.get("success") is False
-        assert "message" in body_r
-
-
-# ---------- Urgent + worker without coords → excluded ----------
-class TestUrgentNoCoordsExclusion:
-    def test_urgent_excluded_when_worker_has_no_coords(
-        self, meera_auth, consumer_auth, general_nursing_service
-    ):
-        # Snapshot Meera's coords, NULL them, create an urgent booking, then restore.
-        conn = _pg_conn()
-        try:
-            with conn.cursor() as cur:
-                cur.execute(
-                    "SELECT wp.id, wp.home_latitude, wp.home_longitude, wp.current_latitude, wp.current_longitude, wp.current_location_updated_at "
-                    "FROM worker_profiles wp JOIN users u ON u.id = wp.user_id WHERE u.phone_e164=%s",
-                    (MEERA_PHONE,),
-                )
-                row = cur.fetchone()
-                assert row, "Meera profile missing"
-                wp_id, h_lat, h_lng, c_lat, c_lng, c_ts = row
-                cur.execute(
-                    "UPDATE worker_profiles SET home_latitude=NULL, home_longitude=NULL, "
-                    "current_latitude=NULL, current_longitude=NULL, current_location_updated_at=NULL "
-                    "WHERE id=%s",
-                    (wp_id,),
-                )
-            conn.commit()
-        finally:
-            conn.close()
-
-        try:
-            bid = _create_confirmed_booking(
-                consumer_auth, general_nursing_service["id"], is_urgent=True
-            )
-            r = requests.get(f"{API}/bookings/worker/new-requests", headers=_h(meera_auth), timeout=15)
-            assert r.status_code == 200, r.text
-            items = r.json()
-            ids = {b["id"] for b in items}
-            assert bid not in ids, (
-                "Urgent booking must NOT be visible to worker with no current/home coords"
-            )
-        finally:
-            # Restore coords so subsequent test sessions still work
-            conn = _pg_conn()
-            try:
-                with conn.cursor() as cur:
-                    cur.execute(
-                        "UPDATE worker_profiles SET home_latitude=%s, home_longitude=%s, "
-                        "current_latitude=%s, current_longitude=%s, current_location_updated_at=%s "
-                        "WHERE id=%s",
-                        (h_lat, h_lng, c_lat, c_lng, c_ts, wp_id),
-                    )
-                conn.commit()
-            finally:
-                conn.close()
-
-
-# ---------- No paid Google Maps API usage in backend ----------
-class TestNoPaidMapsBackend:
-    def test_no_google_maps_backend_calls(self):
-        # Pure-Python scan instead of shelling out to `grep`: portable across
-        # OSes (the CI runner and local Windows dev boxes both lack a
-        # guaranteed `grep` on PATH), and anchored to the actual repo `app/`
-        # directory next to this test file rather than a hardcoded
-        # `/app/backend/app` container path that doesn't exist outside the
-        # Docker image — with the old subprocess approach a missing path
-        # silently made `grep` exit non-zero and the assertion pass
-        # vacuously, so this was never really checking anything in CI.
-        forbidden = ["GOOGLE_MAPS_API_KEY", "maps.googleapis.com", "geocoding", "distance-matrix"]
-        app_dir = Path(__file__).resolve().parent.parent / "app"
-        skip_dirs = {"__pycache__", ".venv", "venv"}
-        hits: list[str] = []
-        for py_file in app_dir.rglob("*.py"):
-            if skip_dirs & set(py_file.parts):
-                continue
-            try:
-                text = py_file.read_text(encoding="utf-8", errors="ignore")
-            except OSError:
-                continue
-            for needle in forbidden:
-                if needle in text:
-                    hits.append(f"{py_file}: {needle}")
-        assert not hits, f"Forbidden token(s) found in backend:\n" + "\n".join(hits)

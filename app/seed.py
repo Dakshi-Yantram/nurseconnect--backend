@@ -22,6 +22,7 @@ from app.models.enums import (
     VisitFrequency,
     ChecklistPhase,
     QualificationGate,
+    ServiceRiskLevel,
 )
 from app.seed_question_bank import (
     GENERATED_ASSESSMENT_MODULES,
@@ -29,10 +30,10 @@ from app.seed_question_bank import (
     GENERATED_PACKAGE_REQUIREMENTS,
     GENERATED_TRAINING_MODULES,
 )
-from app.models.enums import WorkerOnboardingStatus
-from app.models.models import WorkerProfile
+from app.models.enums import WorkerOnboardingStatus, UserStatus, WorkerQualificationSource
+from app.models.models import WorkerProfile, User, WorkerServiceQualification
 from app.services.qualification import sync_tier_qualifications
-from sqlalchemy import select
+from sqlalchemy import select, delete
 
 
 SERVICES = [
@@ -154,6 +155,43 @@ SERVICES = [
         insurance_covered=False,
         icon="dumbbell",
     ),
+    dict(
+        service_code="IV_INFUSION",
+        name="IV Infusion",
+        description="Administration and monitoring of prescribed intravenous fluid/drug infusions.",
+        category=ServiceCategory.micro_visit,
+        min_tier=WorkerTier.tier2,
+        duration_minutes=45,
+        base_price=Decimal("699"),
+        commission_pct=Decimal("20"),
+        requires_prescription=True,
+        billing_trigger=BillingTrigger.on_completion,
+        insurance_covered=True,
+        icon="droplet",
+        # Patch 2 — service-level qualification gating: a nurse must have
+        # passed the IV_INFUSION_V1 training assessment before this service
+        # ever shows as opt-in-able.
+        required_training_module_codes=["IV_INFUSION_V1"],
+        risk_level=ServiceRiskLevel.MEDIUM,
+    ),
+    dict(
+        service_code="PICC_LINE_CARE",
+        name="PICC Line Care",
+        description="Peripherally inserted central catheter site care, dressing, and flush.",
+        category=ServiceCategory.micro_visit,
+        min_tier=WorkerTier.tier5,
+        duration_minutes=40,
+        base_price=Decimal("1199"),
+        commission_pct=Decimal("20"),
+        requires_prescription=True,
+        billing_trigger=BillingTrigger.on_completion,
+        insurance_covered=True,
+        icon="syringe",
+        # Highest-risk micro-visit service in the catalogue — restricted to
+        # our most senior tier, on top of whatever training/cert gates get
+        # added later.
+        risk_level=ServiceRiskLevel.CRITICAL,
+    ),
 ]
 
 PACKAGES = [
@@ -213,6 +251,30 @@ PACKAGES = [
         commission_pct=Decimal("20"),
         requires_prescription=True,
         insurance_covered=True,
+    ),
+    dict(
+        package_code="POST_OP_CARE_7D",
+        name="Post-Op Complex Care — 7 Day",
+        tagline="Admin-reviewed post-operative care for higher-complexity recoveries",
+        description="A 7-day daily-visit package for higher-complexity post-operative recovery "
+                     "that requires reviewer sign-off before a nurse can be dispatched.",
+        target_condition="Complex post-surgical recovery requiring admin-reviewed nurse assignment",
+        min_tier=WorkerTier.tier3,
+        gender_restriction=GenderRestriction.any,
+        visit_frequency=VisitFrequency.daily,
+        visits_per_cycle=7,
+        cycle_duration_days=7,
+        package_price=Decimal("10999"),
+        per_visit_price=Decimal("1571"),
+        subsidy_eligible=False,
+        commission_pct=Decimal("20"),
+        requires_prescription=True,
+        insurance_covered=True,
+        # Patch 2 — package-level qualification gating: unlike the tier-only
+        # packages above, this one requires an explicit admin-reviewed
+        # qualification grant (see POST /workers/me/service-qualification-
+        # requests) rather than being auto-approved off tier alone.
+        requires_admin_skill_approval=True,
     ),
     dict(
         package_code="MATERNITY_POSTNATAL_30D",
@@ -1686,6 +1748,36 @@ TRAINING_MODULES = [
             },
         ]
     },
+    {
+        # Patch 2 — gates the IV_INFUSION service (required_training_module_codes
+        # in SERVICES above). Passing this assessment is what flips a
+        # worker's WorkerServiceQualification for IV_INFUSION to APPROVED
+        # via evaluate_and_upsert_qualifications_for_module.
+        "code": "IV_INFUSION_V1",
+        "title": "IV Infusion Administration & Monitoring",
+        "description": "Safe setup, administration, and monitoring of prescribed intravenous infusions in the home setting.",
+        "category": "Clinical Skills",
+        "duration_minutes": 30,
+        "is_mandatory": False,
+        "pass_percent": 70,
+        "required_for_tiers": ["tier2", "tier3", "tier4", "tier5"],
+        "assessment": [
+            {
+                "id": "iv1", "difficulty": 2, "type": "single_select",
+                "question": "Before starting a prescribed IV infusion at a home visit, the nurse's FIRST priority is to:",
+                "options": ["Start the infusion at the fastest safe rate to save time", "Verify the prescription, patient identity, and check the IV site/line for patency and signs of infection", "Skip the site check if the line was placed by another nurse", "Administer the infusion without gloves to save supplies"],
+                "correct_index": 1,
+                "explanation": "The 'rights' of medication administration (right patient, right drug, right dose, right route, right time) plus a patency/infection check of the access site come before starting any prescribed infusion."
+            },
+            {
+                "id": "iv2", "difficulty": 2, "type": "single_select",
+                "question": "During an IV infusion, the patient develops sudden breathlessness, chills, and a rise in temperature. The nurse should:",
+                "options": ["Slow the infusion slightly and continue monitoring for another hour", "Stop the infusion immediately, keep the line open with saline, assess vitals, and escalate per protocol", "Disconnect the line completely and leave the site uncovered", "Reassure the patient — this is a normal reaction to all infusions"],
+                "correct_index": 1,
+                "explanation": "Sudden breathlessness, chills and fever during an infusion are signs of a possible transfusion/infusion reaction or infection — stop the infusion, keep venous access open with saline, assess vitals, and escalate to the clinical escalation protocol immediately."
+            },
+        ]
+    },
 ]
 
 
@@ -1934,6 +2026,82 @@ async def main():
         checklists_linked += await link_package_checklists(session)
 
         await session.commit()
+
+        # Cleanup: remove stale package-level WorkerServiceQualification rows
+        # left over from before sync_tier_qualifications was restricted to
+        # services only. That older tier-sync pass also iterated CarePackage
+        # rows and stamped qualification_source=TIER on whatever it
+        # auto-created for them (including admin-gated packages, wrongly
+        # pre-parking them at QUALIFIED_PENDING_APPROVAL instead of leaving
+        # them unrequested). It no longer runs against packages, but on a
+        # persistent DB those old rows are still sitting there, so an
+        # admin-gated package like POST_OP_CARE_7D wrongly resolves to
+        # ADMIN_APPROVAL_REQUIRED instead of QUALIFICATION_RECORD_MISSING.
+        # qualification_source=TIER is a safe, unambiguous signature for
+        # "created by that old bug": a genuinely worker-requested package
+        # qualification (POST /workers/me/service-qualification-requests)
+        # is always source=ADMIN_APPROVAL, never TIER — so this only ever
+        # removes rows the old bug created, never a real request. Scoped to
+        # admin-gated packages only (today: POST_OP_CARE_7D) — a stale TIER
+        # row on a NON-admin-gated package is harmless (the
+        # has_configured_requirements exception in is_worker_qualified_for_
+        # service already treats those as qualified regardless), so there's
+        # no reason to touch rows outside the one category the old bug
+        # actually got wrong.
+        print("\nCleaning up stale package qualification rows from the old tier-sync bug...")
+        admin_gated_pkg_ids = select(CarePackage.id).where(
+            CarePackage.requires_admin_skill_approval.is_(True)
+        )
+        try:
+            stale_del = await session.execute(
+                delete(WorkerServiceQualification)
+                .where(
+                    WorkerServiceQualification.package_id.in_(admin_gated_pkg_ids),
+                    WorkerServiceQualification.qualification_source == WorkerQualificationSource.TIER,
+                )
+                .execution_options(synchronize_session=False)
+            )
+            await session.commit()
+            print(f"  + removed {stale_del.rowcount} stale package qualification row(s)")
+        except Exception as e:
+            # Never let this one cleanup step take down the rest of the
+            # seed run (worker reactivation / qualification backfill below
+            # are independent and must still run even if this fails).
+            await session.rollback()
+            print(f"  ! stale qualification cleanup failed, skipping: {e}")
+
+        # Backfill: reactivate any worker whose User row is still stuck on
+        # UserStatus.onboarding despite WorkerProfile.onboarding_status
+        # already being approved. This happens for any worker created via
+        # the dev-mode phone-login shortcut (app/api/v1/auth.py
+        # _ensure_role_profile) *before* that path was fixed to also flip
+        # User.status — on a fresh/CI database there are no such rows, but
+        # on a persistent local/dev database a worker created under the
+        # old code stays permanently WORKER_INACTIVE (is_worker_qualified_
+        # for_service) even after the app code is fixed, because that fix
+        # only ever runs at first-time WorkerProfile creation, never on
+        # existing rows. Safe to re-run — it only ever moves onboarding ->
+        # active for a worker already marked approved.
+        print("\nReactivating approved workers stuck on User.status=onboarding...")
+        ures = await session.execute(
+            select(WorkerProfile).where(
+                WorkerProfile.onboarding_status == WorkerOnboardingStatus.approved
+            )
+        )
+        approved_worker_ids = [w.user_id for w in ures.scalars().all()]
+        reactivated = 0
+        if approved_worker_ids:
+            uwres = await session.execute(
+                select(User).where(
+                    User.id.in_(approved_worker_ids),
+                    User.status == UserStatus.onboarding,
+                )
+            )
+            for u in uwres.scalars().all():
+                u.status = UserStatus.active
+                reactivated += 1
+            await session.commit()
+        print(f"  + reactivated {reactivated} worker user(s)")
 
         # Backfill the tier -> qualification bridge for workers who were
         # already APPROVED before a service existed (e.g. a new service was

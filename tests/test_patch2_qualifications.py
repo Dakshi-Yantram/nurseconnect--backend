@@ -23,6 +23,19 @@ import requests
 BASE_URL = os.environ.get("EXPO_PUBLIC_BACKEND_URL", "http://localhost:8001").rstrip("/")
 API = f"{BASE_URL}/api"
 
+# Direct-SQL fixtures below (status flips that have no API endpoint) connect
+# straight to Postgres via psycopg2. Other test files in this suite (e.g.
+# test_phase3_nurse_flow.py) hardcode host=127.0.0.1 port=5432 on purpose to
+# match the CI Postgres service container. A local/dev Postgres — e.g. a
+# docker run with a different host port mapping — won't necessarily be on
+# 5432, so these are overridable via env vars while keeping the exact same
+# CI-matching defaults.
+PG_HOST = os.environ.get("PG_TEST_HOST", "127.0.0.1")
+PG_PORT = int(os.environ.get("PG_TEST_PORT", "5432"))
+PG_DBNAME = os.environ.get("PG_TEST_DBNAME", "nurseconnect")
+PG_USER = os.environ.get("PG_TEST_USER", "nurseconnect")
+PG_PASSWORD = os.environ.get("PG_TEST_PASSWORD", "nurseconnect")
+
 CONSUMER_PHONE = "+919999000001"
 WORKER1_PHONE = "+919999000002"
 WORKER2_PHONE = "+919999000007"
@@ -125,6 +138,33 @@ class TestServiceEligibility:
         assert picc["risk_level"] == "CRITICAL"
 
     def test_post_op_package_missing_qualification(self, worker1_auth):
+        # Test isolation: on a persistent DB shared across repeated runs,
+        # an earlier debugging session (a manual API call, an older buggy
+        # tier-sync pass, etc.) can leave a stale WorkerServiceQualification
+        # row for (worker1, POST_OP_CARE_7D) sitting in the DB — regardless
+        # of its source, ANY leftover row here makes this specific "never
+        # requested it" scenario untestable, since the eligibility endpoint
+        # then correctly reports whatever that stale row says instead of
+        # "no record". This test's whole point is the *absence* of a
+        # qualification record, so it must start from that state itself
+        # rather than assume the shared DB happens to already be clean.
+        import psycopg2 as _pg  # noqa: E402
+
+        conn = _pg.connect(host=PG_HOST, port=PG_PORT, dbname=PG_DBNAME, user=PG_USER, password=PG_PASSWORD)
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "DELETE FROM worker_service_qualifications wsq "
+                    "USING worker_profiles wp, users u, care_packages cp "
+                    "WHERE wsq.worker_id = wp.id AND wp.user_id = u.id "
+                    "AND u.phone_e164 = %s AND wsq.package_id = cp.id "
+                    "AND cp.package_code = %s",
+                    (WORKER1_PHONE, "POST_OP_CARE_7D"),
+                )
+            conn.commit()
+        finally:
+            conn.close()
+
         r = requests.get(f"{API}/workers/me/service-eligibility", headers=_h(worker1_auth), timeout=15)
         rows = r.json()
         po = next((x for x in rows if x["code"] == "POST_OP_CARE_7D"), None)
@@ -189,14 +229,28 @@ def _create_confirmed_booking(consumer_auth: dict, service_id: str, days_ahead: 
     patients = requests.get(f"{API}/patients", headers=ch, timeout=10).json()
     assert patients, "no seeded patient"
     pid = patients[0]["id"]
+    # Test isolation: on a persistent DB shared across repeated runs, a
+    # fixed "10:30:00" start time plus a small (1-9 day) offset eventually
+    # collides with a worker's already-assigned visit left over from an
+    # earlier run of this same suite, tripping worker_has_schedule_conflict
+    # for a booking that has nothing to do with the scenario actually under
+    # test. Push far into the future (well beyond any realistic accumulated
+    # test data) and derive the start time from the wall clock so distinct
+    # invocations — even repeated runs on the same calendar day — land on a
+    # start time that hasn't been used before.
+    _now_ms = int(time.time() * 1000)
+    _minute_of_day = _now_ms % 1440
+    _hour = 6 + (_minute_of_day % 14)  # keep inside a plausible 06:00-19:59 booking window
+    _minute = _minute_of_day % 60
+    scheduled_start_time = f"{_hour:02d}:{_minute:02d}:00"
     bk = requests.post(
         f"{API}/bookings/",
         headers=ch,
         json={
             "patient_id": pid,
             "service_id": service_id,
-            "scheduled_date": (date.today() + timedelta(days=days_ahead)).isoformat(),
-            "scheduled_start_time": "10:30:00",
+            "scheduled_date": (date.today() + timedelta(days=180 + days_ahead)).isoformat(),
+            "scheduled_start_time": scheduled_start_time,
             "address": {"line1": "42 MG Rd", "city": "Mumbai", "state": "MH", "pincode": "400001"},
             "latitude": "19.0760",
             "longitude": "72.8777",
@@ -209,7 +263,7 @@ def _create_confirmed_booking(consumer_auth: dict, service_id: str, days_ahead: 
     # Flip status to 'confirmed' directly via DB using sync psycopg2
     import psycopg2 as _pg  # noqa: E402
 
-    conn = _pg.connect(host="127.0.0.1", port=5432, dbname="nurseconnect", user="nurseconnect", password="nurseconnect")
+    conn = _pg.connect(host=PG_HOST, port=PG_PORT, dbname=PG_DBNAME, user=PG_USER, password=PG_PASSWORD)
     try:
         with conn.cursor() as cur:
             cur.execute("UPDATE bookings SET status='confirmed', worker_id=NULL WHERE id=%s", (bid,))
@@ -314,7 +368,7 @@ class TestNewRequestsAndAccept:
 
         # Verify only one VisitRecord
         import psycopg2 as _pg
-        conn = _pg.connect(host="127.0.0.1", port=5432, dbname="nurseconnect", user="nurseconnect", password="nurseconnect")
+        conn = _pg.connect(host=PG_HOST, port=PG_PORT, dbname=PG_DBNAME, user=PG_USER, password=PG_PASSWORD)
         try:
             with conn.cursor() as cur:
                 cur.execute("SELECT COUNT(*) FROM visit_records WHERE booking_id=%s", (bid,))

@@ -304,10 +304,18 @@ async def is_worker_qualified_for_service(
         if not practical_ok:
             return False, "PRACTICAL_SIGNOFF_REQUIRED"
 
-    # Admin approval requirement
+    # Admin approval requirement. Distinguish "nobody has even started the
+    # review" from "review is in progress": no qualification row at all
+    # means the worker never requested (or was never granted) this
+    # admin-gated target — surface that as QUALIFICATION_RECORD_MISSING so
+    # the UI can point them at the "request access" flow
+    # (POST /workers/me/service-qualification-requests) rather than
+    # implying a review is already underway.
     requires_admin = bool(getattr(service, "requires_admin_skill_approval", False))
     if requires_admin:
-        if not qual or not qual.admin_approved_at:
+        if not qual:
+            return False, "QUALIFICATION_RECORD_MISSING"
+        if not qual.admin_approved_at:
             return False, "ADMIN_APPROVAL_REQUIRED"
 
     # Qualification record must be APPROVED and not expired.
@@ -491,15 +499,22 @@ async def sync_tier_qualifications(
       status for the training/assessment bridge to manage; only touches the
       row here if it doesn't exist yet (so `can_opt_in` shows the right
       locked_reason instead of QUALIFICATION_RECORD_MISSING).
+
+    Services only — deliberately does NOT touch CarePackage rows. Packages
+    are a stricter, explicitly-reviewed grant: a worker must go through
+    POST /workers/me/service-qualification-requests (or an admin action)
+    before a WorkerServiceQualification row for a package exists at all, so
+    that admin-gated / no-configured-requirement packages correctly read as
+    QUALIFICATION_RECORD_MISSING until requested, instead of this tier
+    bridge silently pre-creating (and for admin-gated ones, silently
+    pending-approving) a row nobody asked for.
     """
     updated: list[WorkerServiceQualification] = []
 
     sres = await db.execute(select(ServiceCatalogue).where(ServiceCatalogue.is_active.is_(True)))
     services = list(sres.scalars().all())
-    pres = await db.execute(select(CarePackage).where(CarePackage.is_active.is_(True)))
-    packages = list(pres.scalars().all())
 
-    for target in services + packages:
+    for target in services:
         tier_ok = _tier_value(worker.tier) >= _tier_value(target.min_tier)
 
         training_codes = list(getattr(target, "required_training_module_codes", None) or [])
@@ -536,12 +551,20 @@ async def sync_tier_qualifications(
 
         if not tier_ok:
             qual.qualification_status = WorkerQualificationStatus.NOT_QUALIFIED
-        elif not (training_ok and cert_ok and assess_ok and practical_ok):
-            # Tier is fine but something else is still outstanding — leave
-            # status as-is (defaults to NOT_QUALIFIED for a brand new row) so
-            # the eligibility endpoint reports the *real* locked_reason
-            # (TRAINING_REQUIRED / CERTIFICATE_REQUIRED / ASSESSMENT_REQUIRED)
-            # rather than QUALIFICATION_RECORD_MISSING.
+        elif not training_ok:
+            # Tier is fine but training is the specific outstanding gate —
+            # WorkerQualificationStatus has a dedicated TRAINING_REQUIRED
+            # value for exactly this case, so the stored row (not just the
+            # live locked_reason computed in is_worker_qualified_for_service)
+            # reflects it.
+            qual.qualification_status = WorkerQualificationStatus.TRAINING_REQUIRED
+        elif not (cert_ok and assess_ok and practical_ok):
+            # Tier and training are fine but something else (certificate /
+            # assessment / practical sign-off) is still outstanding — no
+            # dedicated status value for those, so leave as NOT_QUALIFIED
+            # and let the eligibility endpoint's live locked_reason
+            # (CERTIFICATE_REQUIRED / ASSESSMENT_REQUIRED /
+            # PRACTICAL_SIGNOFF_REQUIRED) carry the specific reason.
             if qual.qualification_status is None:
                 qual.qualification_status = WorkerQualificationStatus.NOT_QUALIFIED
         elif requires_admin and not qual.admin_approved_at:
