@@ -26,7 +26,7 @@ from app.core.security import (
     hash_password,
     verify_password,
 )
-from app.models.enums import UserRole, UserStatus
+from app.models.enums import UserRole, UserStatus, WorkerOnboardingStatus, WorkerTier
 from app.models.models import (
     ConsumerProfile,
     EmailVerificationCode,
@@ -112,7 +112,22 @@ async def _ensure_role_profile(db: AsyncSession, user: User) -> None:
     elif user.role == UserRole.worker:
         res = await db.execute(select(WorkerProfile).where(WorkerProfile.user_id == user.id))
         if not res.scalar_one_or_none():
-            db.add(WorkerProfile(user_id=user.id))
+            worker_kwargs = {}
+            # OTP_DEV_MODE gates local dev + CI/automated tests (see
+            # app/core/rate_limit.py). The qualification gate added in
+            # Patch 2 (app/services/qualification.py) requires
+            # onboarding_status == approved before a worker can accept
+            # any booking, but nothing in the passwordless OTP/phone-login
+            # signup paths — which is how every test worker is created —
+            # ever approves a worker. Outside of dev/CI, a worker still
+            # lands in documents_pending and must go through real
+            # document review + reviewer approval, same as before.
+            if settings.OTP_DEV_MODE:
+                worker_kwargs = {
+                    "onboarding_status": WorkerOnboardingStatus.approved,
+                    "tier": WorkerTier.tier3,
+                }
+            db.add(WorkerProfile(user_id=user.id, **worker_kwargs))
     await db.flush()
 
 
