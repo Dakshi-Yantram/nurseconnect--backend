@@ -29,6 +29,9 @@ from app.seed_question_bank import (
     GENERATED_PACKAGE_REQUIREMENTS,
     GENERATED_TRAINING_MODULES,
 )
+from app.models.enums import WorkerOnboardingStatus
+from app.models.models import WorkerProfile
+from app.services.qualification import sync_tier_qualifications
 from sqlalchemy import select
 
 
@@ -124,6 +127,19 @@ SERVICES = [
         billing_trigger=BillingTrigger.on_checkin,
         insurance_covered=True,
         icon="home",
+    ),
+    dict(
+        service_code="GENERAL_NURSING",
+        name="General Nursing",
+        description="General nursing care visit — routine monitoring, hygiene support, and basic clinical care.",
+        category=ServiceCategory.micro_visit,
+        min_tier=WorkerTier.tier1,
+        duration_minutes=60,
+        base_price=Decimal("599"),
+        commission_pct=Decimal("20"),
+        billing_trigger=BillingTrigger.on_completion,
+        insurance_covered=True,
+        icon="stethoscope",
     ),
     dict(
         service_code="PHYSIO_HOME_VISIT",
@@ -1918,6 +1934,31 @@ async def main():
         checklists_linked += await link_package_checklists(session)
 
         await session.commit()
+
+        # Backfill the tier -> qualification bridge for workers who were
+        # already APPROVED before a service existed (e.g. a new service was
+        # just added above). Without this, an already-approved worker's
+        # eligibility for the new service stays NOT_QUALIFIED /
+        # QUALIFICATION_RECORD_MISSING until someone re-runs
+        # sync_tier_qualifications for them. Safe to re-run — it only
+        # unlocks what the worker's real tier/training/certificates already
+        # qualify them for. See backfill_worker_qualifications.py.
+        print("\nBackfilling tier qualifications for already-approved workers...")
+        wres = await session.execute(
+            select(WorkerProfile).where(
+                WorkerProfile.onboarding_status == WorkerOnboardingStatus.approved
+            )
+        )
+        approved_workers = wres.scalars().all()
+        qualifications_synced = 0
+        for worker in approved_workers:
+            updated = await sync_tier_qualifications(session, worker)
+            qualifications_synced += len(updated)
+        await session.commit()
+        print(
+            f"  + synced {qualifications_synced} qualification row(s) across "
+            f"{len(approved_workers)} approved worker(s)"
+        )
 
     print("\n" + "=" * 50)
     print(
