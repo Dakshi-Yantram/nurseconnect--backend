@@ -1,4 +1,4 @@
-"""Application configuration."""
+﻿"""Application configuration."""
 from functools import lru_cache
 from typing import List
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -65,6 +65,24 @@ class Settings(BaseSettings):
     RAZORPAY_WEBHOOK_SECRET: str = ""
 
     # ---------------------------------------------------------------------
+    # Company identity printed on every invoice and payout statement.
+    # Centralised here so the GSTIN/address exist in exactly one place and
+    # can differ per environment — no PDF template hardcodes any of them.
+    # See app/core/company.py.
+    # ---------------------------------------------------------------------
+    COMPANY_LEGAL_NAME: str = "YANTRAM MEDTECH PVT LTD"
+    COMPANY_ADDRESS_LINE: str = "HITEC City, Hyderabad, Telangana - 500081"
+    COMPANY_GSTIN: str = ""
+    COMPANY_STATE_NAME: str = "Telangana"
+    COMPANY_STATE_CODE: str = "36"
+    COMPANY_SUPPORT_EMAIL: str = "support@nurseconnect.app"
+
+    # Invoice / statement number prefixes. Numbers are allocated per financial
+    # year per series (see app/services/billing_service.py).
+    INVOICE_NUMBER_PREFIX: str = "YM-INV"
+    PAYOUT_STATEMENT_PREFIX: str = "YM-COMM"
+
+    # ---------------------------------------------------------------------
     # Worker payouts.
     #
     # When a visit is completed a payout is generated for the nurse:
@@ -97,6 +115,22 @@ class Settings(BaseSettings):
     # out-of-band bank transfer). When set, admin "process" attempts a real
     # RazorpayX transfer to the nurse's fund account.
     RAZORPAYX_ACCOUNT_NUMBER: str = ""
+    # RazorpayX API credentials. When blank, the payment-side RAZORPAY_KEY_*
+    # pair is reused — RazorpayX accepts the same key/secret when Payouts is
+    # enabled on the account, but a dedicated pair is preferred in production
+    # so a leaked checkout key can't move money out.
+    RAZORPAYX_KEY_ID: str = ""
+    RAZORPAYX_KEY_SECRET: str = ""
+    # IMPS / NEFT / RTGS / UPI / card. IMPS settles in seconds and is the
+    # sensible default for per-booking nurse payouts.
+    RAZORPAYX_PAYOUT_MODE: str = "IMPS"
+    # "payout" processes immediately; "payout_composite" lets Razorpay resolve
+    # the fund account from a VPA/bank detail payload.
+    RAZORPAYX_PAYOUT_PURPOSE: str = "payout"
+    # Webhook secret for payout.processed / payout.failed / payout.reversed.
+    # Distinct from the payments webhook secret above — Razorpay signs each
+    # webhook endpoint with its own secret.
+    RAZORPAYX_WEBHOOK_SECRET: str = ""
 
     # Cloudinary
     CLOUDINARY_CLOUD_NAME: str = ""

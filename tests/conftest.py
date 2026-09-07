@@ -18,7 +18,7 @@ ADMIN_CLINICAL_PHONE = "+919999000006"
 def _login(phone: str, role: str) -> dict:
     s = requests.Session()
     r = s.post(f"{API}/auth/otp/send", json={"phone_e164": phone, "role": role}, timeout=10)
-    assert r.status_code == 200, f"send-otp failed: {r.status_code} {r.text}"
+    assert r.status_code == 200, f"otp/send failed: {r.status_code} {r.text}"
     r = s.post(
         f"{API}/auth/otp/verify",
         json={
@@ -30,8 +30,9 @@ def _login(phone: str, role: str) -> dict:
         },
         timeout=10,
     )
-    assert r.status_code == 200, f"verify-otp failed: {r.status_code} {r.text}"
+    assert r.status_code == 200, f"otp/verify failed: {r.status_code} {r.text}"
     return r.json()
+
 
 @pytest.fixture(scope="session")
 def api():
@@ -48,33 +49,24 @@ def worker_auth():
     return _login(WORKER_PHONE, "worker")
 
 
-# NOTE: app/models/enums.py:UserRole only defines a single "admin" role —
-# there is no admin_ops/admin_super/admin_finance/admin_clinical value in
-# the enum (those names only appear in docstrings/comments as an aspirational
-# permission model that was never implemented). Sending role="admin_ops" etc.
-# to /auth/otp/send fails Pydantic validation with 422, which fails these
-# session-scoped fixtures at setup and makes every test that depends on them
-# error out. Until real admin sub-roles are added to the enum + RBAC layer,
-# all four fixtures log in as the single "admin" role, on distinct phone
-# numbers so each still gets an independent test user/token.
 @pytest.fixture(scope="session")
 def admin_ops_auth():
-    return _login(ADMIN_OPS_PHONE, "admin")
+    return _login(ADMIN_OPS_PHONE, "admin_ops")
 
 
 @pytest.fixture(scope="session")
 def admin_super_auth():
-    return _login(ADMIN_SUPER_PHONE, "admin")
+    return _login(ADMIN_SUPER_PHONE, "admin_super")
 
 
 @pytest.fixture(scope="session")
 def admin_finance_auth():
-    return _login(ADMIN_FINANCE_PHONE, "admin")
+    return _login(ADMIN_FINANCE_PHONE, "admin_finance")
 
 
 @pytest.fixture(scope="session")
 def admin_clinical_auth():
-    return _login(ADMIN_CLINICAL_PHONE, "admin")
+    return _login(ADMIN_CLINICAL_PHONE, "admin_clinical")
 
 
 def auth_headers(auth: dict) -> dict:
