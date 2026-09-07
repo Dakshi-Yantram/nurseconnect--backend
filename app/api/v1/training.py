@@ -77,6 +77,9 @@ class TrainingModuleDraft(BaseModel):
     assessment: Optional[List[Dict[str, Any]]] = None
     pass_percent: int = 70
     is_mandatory: bool = False
+    # Provider Type system — which WorkerType values this module is even
+    # shown to. None/empty = visible to every provider type.
+    allowed_provider_types: Optional[List[str]] = None
 
 
 class TrainingModuleUpdate(BaseModel):
@@ -90,6 +93,7 @@ class TrainingModuleUpdate(BaseModel):
     assessment: Optional[List[Dict[str, Any]]] = None
     pass_percent: Optional[int] = None
     is_mandatory: Optional[bool] = None
+    allowed_provider_types: Optional[List[str]] = None
 
 
 class AssessmentDraft(BaseModel):
@@ -99,6 +103,7 @@ class AssessmentDraft(BaseModel):
     pass_score: int = 70
     questions: List[Dict[str, Any]]
     linked_training_module_code: Optional[str] = None
+    allowed_provider_types: Optional[List[str]] = None
 
 
 class AssessmentUpdate(BaseModel):
@@ -107,6 +112,7 @@ class AssessmentUpdate(BaseModel):
     pass_score: Optional[int] = None
     questions: Optional[List[Dict[str, Any]]] = None
     linked_training_module_code: Optional[str] = None
+    allowed_provider_types: Optional[List[str]] = None
 
 
 class ReviewBody(BaseModel):
@@ -238,6 +244,7 @@ def _serialize_module(m: TrainingModule, *, include_admin_fields: bool = False, 
         "version": m.version,
         "status": m.status.value if m.status else None,
         "required_for_tiers": m.required_for_tiers or [],
+        "allowed_provider_types": m.allowed_provider_types or [],
     }
     if include_full_assessment:
         out["assessment"] = m.assessment or []
@@ -288,6 +295,7 @@ def _serialize_assessment(a: AssessmentModule, *, include_admin_fields: bool = F
         "time_limit_minutes": a.time_limit_minutes,
         "max_attempts": a.max_attempts,
         "cooldown_hours": a.cooldown_hours,
+        "allowed_provider_types": a.allowed_provider_types or [],
     }
     if include_admin_fields:
         out.update({
@@ -316,7 +324,10 @@ async def list_modules(
     profile: WorkerProfile = Depends(get_worker_profile),
     db: AsyncSession = Depends(get_db),
 ):
-    """Worker view — only published modules."""
+    """Worker view — only published modules, filtered to the ones relevant
+    to this worker's Provider Type. A module with no allowed_provider_types
+    set (None/empty) is visible to every provider type — same unrestricted-
+    by-default semantics as ServiceCatalogue/CarePackage."""
     res = await db.execute(
         select(TrainingModule).where(
             TrainingModule.is_active.is_(True),
@@ -324,6 +335,12 @@ async def list_modules(
         )
     )
     modules = res.scalars().all()
+    worker_type = getattr(profile, "worker_type", None)
+    worker_type_value = worker_type.value if worker_type else None
+    modules = [
+        m for m in modules
+        if not m.allowed_provider_types or worker_type_value in m.allowed_provider_types
+    ]
     cres = await db.execute(select(TrainingCompletion).where(TrainingCompletion.worker_id == profile.id))
     comps = {c.module_id: c for c in cres.scalars().all()}
     out = []
@@ -382,6 +399,39 @@ async def get_module(module_id: UUID, db: AsyncSession = Depends(get_db), _=Depe
     }
 
 
+def _grade_module_answer(q: Dict[str, Any], answer: Any) -> bool:
+    """Type-aware grading for a single module-quiz question.
+
+    Mirrors `_score_attempt`'s per-type rules, but works on a single
+    (question, answer) pair so it can be reused by both the legacy flat
+    and adaptive id-keyed submit formats below.
+    """
+    qtype = q.get("type", "single_select")
+    if qtype == "multi_select":
+        if not isinstance(answer, list):
+            return False
+        try:
+            given = {int(x) for x in answer}
+        except (TypeError, ValueError):
+            return False
+        return given == set(int(x) for x in (q.get("correct_indices") or []))
+    if qtype == "boolean":
+        if isinstance(answer, bool):
+            return answer == bool(q.get("correct_bool"))
+        # frontend may send the option index (0=True, 1=False) instead of a bool
+        if isinstance(answer, int):
+            correct_idx = 0 if q.get("correct_bool") else 1
+            return answer == correct_idx
+        return False
+    if qtype == "text":
+        return isinstance(answer, str) and bool(answer.strip())
+    # single_select (default)
+    try:
+        return int(answer) == int(q.get("correct_index", -1))
+    except (TypeError, ValueError):
+        return False
+
+
 @router.post("/modules/{module_id}/assessment/submit")
 async def submit_module_assessment(
     module_id: UUID,
@@ -393,6 +443,11 @@ async def submit_module_assessment(
     - Legacy flat list: [0, 2, 1, ...]  (answer index per question by position)
     - Adaptive list:    [{"id": "ic1", "answer": 2}, ...]  (per-question id + answer)
     Adaptive format scores based on answered questions only.
+
+    Grading is type-aware (single_select / multi_select / boolean / text) via
+    `_grade_module_answer` — previously this only ever compared against
+    `correct_index`, so multi_select and boolean questions were impossible to
+    pass regardless of the answer given.
     """
     res = await db.execute(
         select(TrainingModule).where(
@@ -411,12 +466,12 @@ async def submit_module_assessment(
         qmap = {q.get("id", str(i)): q for i, q in enumerate(m.assessment)}
         for item in answers:
             q = qmap.get(item.get("id"))
-            if q and item.get("answer") == q.get("correct_index"):
+            if q and _grade_module_answer(q, item.get("answer")):
                 correct += 1
         score = int((correct / len(answers)) * 100) if answers else 0
     else:
         for idx, q in enumerate(m.assessment):
-            if idx < len(answers) and answers[idx] == q.get("correct_index"):
+            if idx < len(answers) and _grade_module_answer(q, answers[idx]):
                 correct += 1
         score = int((correct / len(m.assessment)) * 100) if m.assessment else 0
     passed = score >= m.pass_percent
@@ -463,6 +518,14 @@ async def list_published_assessments(
         )
     )
     items = res.scalars().all()
+    # Filter to this worker's Provider Type — same unrestricted-by-default
+    # semantics as training modules (see list_modules above).
+    worker_type = getattr(profile, "worker_type", None)
+    worker_type_value = worker_type.value if worker_type else None
+    items = [
+        a for a in items
+        if not a.allowed_provider_types or worker_type_value in a.allowed_provider_types
+    ]
     # Latest attempts per assessment_id
     ares = await db.execute(
         select(WorkerAssessmentAttempt).where(
@@ -928,6 +991,7 @@ async def create_module_draft(
         assessment=payload.assessment,
         pass_percent=payload.pass_percent,
         is_mandatory=payload.is_mandatory,
+        allowed_provider_types=payload.allowed_provider_types,
         is_active=True,
         version=1,
         status=ContentStatus.draft,
@@ -1019,20 +1083,20 @@ async def approve_module(
     current: CurrentUser = Depends(require_reviewer),
     db: AsyncSession = Depends(get_db),
 ):
-    """Approving a module publishes it immediately — approved content
-    reaches nurses automatically, no separate publish step needed."""
+    """Approves a module for publishing. This does NOT publish it — a
+    separate call to /{id}/publish is required to make it live for
+    nurses. Keeping approve and publish as distinct steps lets a reviewer
+    sign off on content ahead of a scheduled release."""
     res = await db.execute(select(TrainingModule).where(TrainingModule.id == id))
     m = res.scalar_one_or_none()
     if not m:
         raise HTTPException(status_code=404, detail="Module not found")
     if m.status != ContentStatus.under_review:
         raise HTTPException(status_code=409, detail=f"Cannot approve module in status {m.status.value}")
-    m.status = ContentStatus.published
+    m.status = ContentStatus.approved
     m.reviewed_by = current.id
     m.reviewed_at = _now()
     m.review_notes = body.notes
-    m.published_at = _now()
-    m.published_version = m.version
     await db.commit()
     return _serialize_module(m, include_admin_fields=True, include_full_assessment=True)
 
@@ -1099,6 +1163,7 @@ async def create_assessment_draft(
         pass_score=payload.pass_score,
         questions=payload.questions,
         linked_training_module_code=payload.linked_training_module_code,
+        allowed_provider_types=payload.allowed_provider_types,
         version=1,
         status=ContentStatus.draft,
         created_by=current.id,
@@ -1243,20 +1308,19 @@ async def approve_assessment(
     current: CurrentUser = Depends(require_reviewer),
     db: AsyncSession = Depends(get_db),
 ):
-    """Approving an assessment publishes it immediately — same
-    auto-publish-on-approve behavior as training modules."""
+    """Approves an assessment for publishing. This does NOT publish it —
+    a separate call to /{id}/publish is required to make it live for
+    nurses, mirroring the training-module lifecycle."""
     res = await db.execute(select(AssessmentModule).where(AssessmentModule.id == id))
     a = res.scalar_one_or_none()
     if not a:
         raise HTTPException(status_code=404, detail="Assessment not found")
     if a.status != ContentStatus.under_review:
         raise HTTPException(status_code=409, detail=f"Cannot approve assessment in status {a.status.value}")
-    a.status = ContentStatus.published
+    a.status = ContentStatus.approved
     a.reviewed_by = current.id
     a.reviewed_at = _now()
     a.review_notes = body.notes
-    a.published_at = _now()
-    a.published_version = a.version
     await db.commit()
     return _serialize_assessment(a, include_admin_fields=True, include_correct=True)
 

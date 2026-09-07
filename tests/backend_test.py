@@ -44,10 +44,10 @@ class TestHealth:
 class TestAuth:
     def test_send_otp_consumer(self):
         r = requests.post(
-            f"{API}/auth/send-otp",
-            json={"phone_e164": "+919999000001", "role": "consumer"},
-            timeout=10,
-        )
+        f"{API}/auth/otp/send",   # ✅ correct
+        json={"phone_e164": "+919999000001", "role": "consumer"},
+        timeout=10,
+    )
         assert r.status_code == 200, r.text
         body = r.json()
         assert body.get("dev_otp") == "123456"
@@ -58,10 +58,10 @@ class TestAuth:
         roles = [
             ("+919999000001", "consumer"),
             ("+919999000002", "worker"),
-            ("+919999000003", "admin_ops"),
-            ("+919999000004", "admin_super"),
-            ("+919999000005", "admin_finance"),
-            ("+919999000006", "admin_clinical"),
+            ("+919999000003", "admin"),
+            ("+919999000004", "admin"),
+            ("+919999000005", "admin"),
+            ("+919999000006", "admin"),
         ]
         for phone, role in roles:
             data = _login(phone, role)

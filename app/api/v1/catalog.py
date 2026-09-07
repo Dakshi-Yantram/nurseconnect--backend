@@ -69,7 +69,21 @@ async def _care_packages_out(
     out: List[CarePackageOut] = []
     for p in packages:
         included_ids = _package_included_ids(p)
-        data = CarePackageOut.model_validate(p).model_dump()
+        # BUGFIX: this used to call CarePackageOut.model_validate(p) FIRST and
+        # only overwrite `included_service_ids` afterwards. But `model_validate`
+        # reads the raw ORM column straight off `p` — CarePackage.included_service_ids
+        # is nullable and is None for any package that only sets a
+        # primary_service_id (i.e. almost every package), while the schema
+        # field is a plain `List[UUID]`. Pydantic rejects None for a list
+        # field outright (ValidationError: "Input should be a valid list"),
+        # so ONE such package crashed the entire /care-packages list with a
+        # 500 for every consumer — this is what showed up in the app as
+        # "Couldn't load this / Request failed" on the booking screen.
+        # Fix: build the dict from the ORM columns ourselves and set
+        # `included_service_ids` to the already-normalised list *before*
+        # constructing CarePackageOut, instead of validating the raw
+        # (possibly-None) column first.
+        data = {column.name: getattr(p, column.name) for column in CarePackage.__table__.columns}
         data["included_service_ids"] = included_ids
         data["services"] = [
             PackageServiceSummary(id=s.id, service_code=s.service_code, name=s.name)
@@ -86,10 +100,12 @@ async def list_care_packages(
     active_only: bool = True,
     db: AsyncSession = Depends(get_db),
 ):
-    conds = []
+    # Deleted packages never appear in any list — admin's active_only=false
+    # is only meant to surface disabled-but-not-deleted packages.
+    conds = [CarePackage.is_deleted.is_(False)]
     if active_only:
         conds.append(CarePackage.is_active.is_(True))
-    res = await db.execute(select(CarePackage).where(and_(*conds)) if conds else select(CarePackage))
+    res = await db.execute(select(CarePackage).where(and_(*conds)))
     items = res.scalars().all()
     if city:
         items = [p for p in items if not p.available_cities or city in p.available_cities]

@@ -4,3 +4,15 @@ __pycache__/
 .venv/
 venv/
 *.db
+
+# Elastic Beanstalk Files
+.elasticbeanstalk/*
+!.elasticbeanstalk/*.cfg.yml
+!.elasticbeanstalk/*.global.yml
+* 2.py
+* 2.txt
+* 2.json
+* 2.yml
+* 2.md
+* 2
+*.local-bak
