@@ -263,6 +263,10 @@ class WorkerProfile(Base):
     bank_account_number: Mapped[Optional[str]] = mapped_column(String(50))
     bank_ifsc: Mapped[Optional[str]] = mapped_column(String(20))
     razorpay_fund_account_id: Mapped[Optional[str]] = mapped_column(String(100))
+    # RazorpayX requires a contact before a fund account can hang off it.
+    # Cached alongside the fund account id so onboarding to RazorpayX happens
+    # once per nurse rather than on every payout.
+    razorpay_contact_id: Mapped[Optional[str]] = mapped_column(String(100))
     kit_complete: Mapped[bool] = mapped_column(Boolean, default=False)
     background_check_status: Mapped[str] = mapped_column(String(50), default="pending")
     onboarding_submitted_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
@@ -868,6 +872,76 @@ class Invoice(Base):
     pdf_url: Mapped[Optional[str]] = mapped_column(Text)
     generated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now, server_default=func.now())
 
+    # ── GST breakdown (customer-facing) ──────────────────────────────────
+    # Split out of the single tax_amount above because a GST invoice must
+    # state CGST and SGST separately, and must distinguish the exempt portion
+    # from the taxable one. One invoice routinely carries both: an exempt
+    # paramedical nursing line beside an 18% consumables line.
+    taxable_value: Mapped[Decimal] = mapped_column(Numeric(10, 2), default=0, server_default="0")
+    exempt_value: Mapped[Decimal] = mapped_column(Numeric(10, 2), default=0, server_default="0")
+    cgst_amount: Mapped[Decimal] = mapped_column(Numeric(10, 2), default=0, server_default="0")
+    sgst_amount: Mapped[Decimal] = mapped_column(Numeric(10, 2), default=0, server_default="0")
+    place_of_supply: Mapped[Optional[str]] = mapped_column(String(100))
+
+    # Frozen snapshot of the full pricing calculation (see
+    # pricing_engine.to_storable). Holds BOTH the customer view and the
+    # internal 80/20 split, so admin can reconstruct exactly how a historical
+    # invoice was computed even after the rate card changes. Never serialised
+    # to a consumer endpoint — see app/api/v1/payments.py.
+    pricing_snapshot: Mapped[Optional[dict]] = mapped_column(JSONB)
+    pdf_generated_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+
+
+class PricingComponent(Base):
+    """One row of the modular charges table.
+
+    This is the "change it in one place" rate card: a booking's price is the
+    sum of its components, and editing a component's amount/GST/commission
+    moves the customer price, the nurse's take-home and the tax together,
+    because everything downstream reads through app/services/pricing_engine.
+
+    Rows attach to a service OR a package. When an offering has no rows at
+    all, pricing falls back to the legacy single-line behaviour driven by
+    ServiceCatalogue.base_price, so existing catalogue entries keep working
+    untouched until someone configures a card for them.
+    """
+
+    __tablename__ = "pricing_components"
+    id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), primary_key=True, default=_uuid)
+    service_id: Mapped[Optional[UUID]] = mapped_column(PG_UUID(as_uuid=True), ForeignKey("service_catalogue.id", ondelete="CASCADE"), index=True)
+    package_id: Mapped[Optional[UUID]] = mapped_column(PG_UUID(as_uuid=True), ForeignKey("care_packages.id", ondelete="CASCADE"), index=True)
+
+    component_code: Mapped[str] = mapped_column(String(50), nullable=False)
+    label: Mapped[str] = mapped_column(String(255), nullable=False)
+    sac_code: Mapped[Optional[str]] = mapped_column(String(20))
+
+    #: The modular input amount — the one number an admin edits.
+    input_amount: Mapped[Decimal] = mapped_column(Numeric(10, 2), nullable=False)
+    #: "customer_rate" (input is the customer price) or "earning_rate"
+    #: (input is the nurse's net take-home, grossed up for commission).
+    basis: Mapped[str] = mapped_column(String(20), default="customer_rate", server_default="customer_rate")
+    #: Only for basis="customer_rate": is input_amount already GST-inclusive?
+    gst_inclusive: Mapped[bool] = mapped_column(Boolean, default=True, server_default="true")
+    #: 0 for exempt healthcare, 18 for taxable. Per-line, never global —
+    #: applying 18% everywhere is exactly the bug this column prevents.
+    gst_rate_pct: Mapped[Decimal] = mapped_column(Numeric(5, 2), default=0, server_default="0")
+    exemption_note: Mapped[Optional[str]] = mapped_column(Text)
+    #: "worker" (nurse earns the 80%) or "platform" (kits, protection fees —
+    #: platform keeps all of it and the nurse earns nothing from the line).
+    earns_to: Mapped[str] = mapped_column(String(20), default="worker", server_default="worker")
+    #: NULL -> settings.PLATFORM_COMMISSION_PCT (20).
+    commission_pct: Mapped[Optional[Decimal]] = mapped_column(Numeric(5, 2))
+
+    display_order: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True, server_default="true", index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now, server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now, onupdate=_now, server_default=func.now())
+
+    __table_args__ = (
+        Index("ix_pricing_components_service_active", "service_id", "is_active"),
+        Index("ix_pricing_components_package_active", "package_id", "is_active"),
+    )
+
 
 # ============================================================================
 # In-app calling (Dyte) + best-effort background call push
@@ -1269,6 +1343,76 @@ class WorkerPayout(Base):
     next_retry_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
     ledger_entry_id: Mapped[Optional[UUID]] = mapped_column(PG_UUID(as_uuid=True), ForeignKey("financial_ledger.id"))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now, server_default=func.now())
+
+    # ── Release + Razorpay confirmation ─────────────────────────────────
+    # `status` tracks OUR state machine; these track what Razorpay actually
+    # told us. The two are deliberately separate: status only becomes `paid`
+    # when razorpay_payout_status is a terminal success ("processed"), so a
+    # payout can never read as successful on the strength of a request we
+    # merely sent.
+    razorpay_payout_status: Mapped[Optional[str]] = mapped_column(String(30))
+    #: Bank reference (UTR) — printed on the nurse's payout statement.
+    razorpay_utr: Mapped[Optional[str]] = mapped_column(String(64))
+    razorpay_fund_account_id: Mapped[Optional[str]] = mapped_column(String(64))
+    #: Last raw status payload from Razorpay, for support/reconciliation.
+    razorpay_last_response: Mapped[Optional[dict]] = mapped_column(JSONB)
+
+    #: Sent to Razorpay as X-Payout-Idempotency. Generated once and reused on
+    #: every retry of THIS payout, so a network timeout followed by a retry
+    #: returns the original payout instead of transferring a second time.
+    idempotency_key: Mapped[Optional[str]] = mapped_column(String(64), unique=True)
+    #: Set when the booking completes and the payout becomes releasable —
+    #: this is what puts it in the admin "Ready for Release" queue.
+    ready_for_release_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    released_by: Mapped[Optional[UUID]] = mapped_column(PG_UUID(as_uuid=True), ForeignKey("users.id"))
+    #: When an admin pressed Release Payment (request sent), as distinct from
+    #: paid_at (when Razorpay confirmed the money actually moved).
+    released_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    last_status_checked_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+
+    __table_args__ = (
+        # Hard guarantee against double-paying a booking. The service layer
+        # also guards this, but a unique index is the only thing that holds
+        # under two admins clicking Release at the same instant on two
+        # different workers.
+        UniqueConstraint("booking_id", name="uq_worker_payouts_booking"),
+        Index("ix_worker_payouts_ready", "ready_for_release_at", "status"),
+    )
+
+
+class PayoutStatement(Base):
+    """The nurse-facing 'Payout Advice & Tax Invoice'.
+
+    Kept as its own table rather than reusing `invoices` because that table is
+    uniquely keyed on booking_id and holds the *customer's* tax invoice. A
+    booking legitimately produces two documents — the patient receipt and the
+    partner payout advice — with different recipients, different numbering
+    series and different statutory meaning.
+    """
+
+    __tablename__ = "payout_statements"
+    id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), primary_key=True, default=_uuid)
+    payout_id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), ForeignKey("worker_payouts.id", ondelete="CASCADE"), unique=True, index=True)
+    booking_id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), ForeignKey("bookings.id", ondelete="CASCADE"), index=True)
+    worker_id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), ForeignKey("worker_profiles.id"), index=True)
+
+    statement_number: Mapped[str] = mapped_column(String(40), unique=True, index=True)
+    #: Nurse's gross earned service value (the exempt healthcare line).
+    gross_earned: Mapped[Decimal] = mapped_column(Numeric(10, 2), nullable=False)
+    #: Platform technology fee billed B2B to the partner, ex-GST.
+    platform_fee: Mapped[Decimal] = mapped_column(Numeric(10, 2), default=0, server_default="0")
+    platform_fee_gst: Mapped[Decimal] = mapped_column(Numeric(10, 2), default=0, server_default="0")
+    #: gross_earned - platform_fee - platform_fee_gst
+    net_take_home: Mapped[Decimal] = mapped_column(Numeric(10, 2), nullable=False)
+    #: Statutory recoveries below the take-home line (e-stamp advance, TDS).
+    total_deductions: Mapped[Decimal] = mapped_column(Numeric(10, 2), default=0, server_default="0")
+    #: What actually hits the bank account.
+    final_disbursal: Mapped[Decimal] = mapped_column(Numeric(10, 2), nullable=False)
+
+    line_items: Mapped[list] = mapped_column(JSONB, nullable=False)
+    pdf_url: Mapped[Optional[str]] = mapped_column(Text)
+    pdf_generated_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    generated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now, server_default=func.now())
 
 
 class Dispute(Base):

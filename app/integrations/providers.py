@@ -69,12 +69,193 @@ class RazorpayClient:
         expected = hmac.new(self.webhook_secret.encode(), body, hashlib.sha256).hexdigest()
         return hmac.compare_digest(expected, signature)
 
-    async def initiate_payout(self, fund_account_id: str, amount_paise: int, reference: str, notes: Optional[Dict] = None) -> Dict[str, Any]:
+    # -----------------------------------------------------------------
+    # RazorpayX Payouts
+    #
+    # Payouts are a different product from Checkout above: a different API
+    # host (api.razorpay.com/v1/payouts), a source account number rather than
+    # an order, and its own webhook secret. The razorpay python SDK does not
+    # wrap payouts, so these call the REST API directly over httpx.
+    #
+    # Terminal states are `processed` (money moved), `reversed`, `cancelled`
+    # and `failed`. `queued`/`pending`/`processing` are NOT terminal — the
+    # caller must keep the payout un-paid until a webhook or a status poll
+    # returns `processed`.
+    # -----------------------------------------------------------------
+    PAYOUT_API = "https://api.razorpay.com/v1"
+
+    TERMINAL_SUCCESS = {"processed"}
+    TERMINAL_FAILURE = {"failed", "cancelled", "reversed", "rejected"}
+
+    @property
+    def payouts_enabled(self) -> bool:
+        """True when a real RazorpayX transfer can actually be attempted."""
+        return bool(
+            not self.mock
+            and settings.RAZORPAYX_ACCOUNT_NUMBER
+            and (settings.RAZORPAYX_KEY_ID or self.key_id)
+            and (settings.RAZORPAYX_KEY_SECRET or self.key_secret)
+        )
+
+    def _payout_auth(self) -> tuple[str, str]:
+        return (
+            settings.RAZORPAYX_KEY_ID or self.key_id,
+            settings.RAZORPAYX_KEY_SECRET or self.key_secret,
+        )
+
+    def verify_payout_webhook_signature(self, body: bytes, signature: str) -> bool:
+        """Payout webhooks are signed with their own secret, not the payments
+        one. Falls back to the payments secret only if the payout-specific
+        secret is unset, so an existing single-secret setup keeps working."""
+        if self.mock:
+            return True
+        secret = settings.RAZORPAYX_WEBHOOK_SECRET or self.webhook_secret
+        if not secret:
+            return False
+        expected = hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
+        return hmac.compare_digest(expected, signature or "")
+
+    async def create_fund_account(
+        self,
+        *,
+        contact_name: str,
+        contact_id: Optional[str],
+        account_number: str,
+        ifsc: str,
+        contact_reference: str,
+        contact_phone: Optional[str] = None,
+        contact_email: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Ensure a RazorpayX contact + bank fund account exists for a nurse.
+
+        Returns {"contact_id": ..., "fund_account_id": ...}. RazorpayX will
+        not pay to a raw account number — money can only be sent to a
+        fund_account_id, so this must run once per nurse before the first
+        transfer. The ids are cached on WorkerProfile by the caller.
+        """
+        if self.mock:
+            return {
+                "contact_id": contact_id or f"cont_mock_{uuid.uuid4().hex[:12]}",
+                "fund_account_id": f"fa_mock_{uuid.uuid4().hex[:12]}",
+            }
+
+        import httpx
+
+        auth = self._payout_auth()
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            if not contact_id:
+                payload: Dict[str, Any] = {
+                    "name": contact_name,
+                    "type": "employee",
+                    "reference_id": contact_reference,
+                }
+                if contact_phone:
+                    payload["contact"] = contact_phone
+                if contact_email:
+                    payload["email"] = contact_email
+                r = await client.post(f"{self.PAYOUT_API}/contacts", json=payload, auth=auth)
+                if r.status_code >= 400:
+                    raise ExternalProviderError(f"RazorpayX contact creation failed: {r.text}")
+                contact_id = r.json()["id"]
+
+            r = await client.post(
+                f"{self.PAYOUT_API}/fund_accounts",
+                json={
+                    "contact_id": contact_id,
+                    "account_type": "bank_account",
+                    "bank_account": {
+                        "name": contact_name,
+                        "ifsc": ifsc,
+                        "account_number": account_number,
+                    },
+                },
+                auth=auth,
+            )
+            if r.status_code >= 400:
+                raise ExternalProviderError(f"RazorpayX fund account creation failed: {r.text}")
+            return {"contact_id": contact_id, "fund_account_id": r.json()["id"]}
+
+    async def initiate_payout(
+        self,
+        fund_account_id: str,
+        amount_paise: int,
+        reference: str,
+        notes: Optional[Dict] = None,
+        idempotency_key: Optional[str] = None,
+        mode: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Create a RazorpayX payout.
+
+        `idempotency_key` is sent as X-Payout-Idempotency. Razorpay returns
+        the ORIGINAL payout for a repeated key instead of creating a second
+        one, which is what makes a retry after a network timeout safe: the
+        caller cannot accidentally pay a nurse twice for one booking.
+
+        The returned `status` is passed through untouched — it is frequently
+        `queued` or `processing`, and the caller must not read that as paid.
+        """
         if self.mock:
             payout_id = f"pout_mock_{uuid.uuid4().hex[:14]}"
-            return {"id": payout_id, "status": "processed", "amount": amount_paise, "reference_id": reference}
-        # Real impl would use razorpay.Client(...).payout.create(...)
-        raise NotImplementedError("Configure real Razorpay credentials")
+            return {
+                "id": payout_id,
+                "entity": "payout",
+                "status": "processed",
+                "amount": amount_paise,
+                "reference_id": reference,
+                "utr": f"MOCKUTR{uuid.uuid4().hex[:12].upper()}",
+                "fund_account_id": fund_account_id,
+            }
+
+        if not settings.RAZORPAYX_ACCOUNT_NUMBER:
+            raise ExternalProviderError(
+                "RAZORPAYX_ACCOUNT_NUMBER is not configured — cannot initiate a payout."
+            )
+
+        import httpx
+
+        headers = {"Content-Type": "application/json"}
+        if idempotency_key:
+            headers["X-Payout-Idempotency"] = idempotency_key
+
+        body = {
+            "account_number": settings.RAZORPAYX_ACCOUNT_NUMBER,
+            "fund_account_id": fund_account_id,
+            "amount": amount_paise,
+            "currency": "INR",
+            "mode": mode or settings.RAZORPAYX_PAYOUT_MODE,
+            "purpose": settings.RAZORPAYX_PAYOUT_PURPOSE,
+            "queue_if_low_balance": True,
+            "reference_id": reference,
+            "narration": (notes or {}).get("narration", "NurseConnect payout"),
+            "notes": {k: str(v) for k, v in (notes or {}).items()},
+        }
+
+        async with httpx.AsyncClient(timeout=40.0) as client:
+            r = await client.post(
+                f"{self.PAYOUT_API}/payouts",
+                json=body,
+                headers=headers,
+                auth=self._payout_auth(),
+            )
+        if r.status_code >= 400:
+            raise ExternalProviderError(f"RazorpayX payout failed [{r.status_code}]: {r.text}")
+        return r.json()
+
+    async def fetch_payout(self, payout_id: str) -> Dict[str, Any]:
+        """Poll a payout's current state — used to resolve `queued`/`processing`
+        payouts and to reconcile when a webhook was missed."""
+        if self.mock:
+            return {"id": payout_id, "status": "processed",
+                    "utr": f"MOCKUTR{payout_id[-10:].upper()}"}
+
+        import httpx
+
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            r = await client.get(f"{self.PAYOUT_API}/payouts/{payout_id}",
+                                 auth=self._payout_auth())
+        if r.status_code >= 400:
+            raise ExternalProviderError(f"RazorpayX payout fetch failed: {r.text}")
+        return r.json()
 
     async def create_refund(self, payment_id: str, amount_paise: int) -> Dict[str, Any]:
         if self.mock:

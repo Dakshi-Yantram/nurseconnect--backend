@@ -1,4 +1,5 @@
 """Admin endpoints (catalog mgmt, worker approval, ledger, dashboards)."""
+import logging
 import re
 from typing import List, Optional
 from uuid import UUID
@@ -15,6 +16,8 @@ from app.core.database import get_db
 from app.core.deps import CurrentUser, get_current_user, is_admin, require_admin, require_operations, require_reviewer, require_roles
 from app.core.security import hash_password
 from app.services.common_services import audit
+
+logger = logging.getLogger(__name__)
 from app.models.enums import (
     BookingStatus,
     ComplaintStatus,
@@ -57,6 +60,7 @@ from app.models.models import (
     Escalation,
     FinancialLedger,
     InsuranceCoverageAssessment,
+    Invoice,
     MedicationAdministration,
     Message,
     NurseReviewTicket,
@@ -2070,7 +2074,7 @@ async def approve_worker_payout(
 ):
     """Step 1 of 2: admin approves a payout. Money still hasn't moved — this
     just unlocks /process for this payout. Nurse gets 80% (platform's cut
-    of 20% via commission, see payout_service._commission_pct) only after
+    of 20% via the centralised pricing engine) only after
     both approve and process have happened."""
     res = await db.execute(select(WorkerPayout).where(WorkerPayout.id == payout_id))
     payout = res.scalar_one_or_none()
@@ -2135,6 +2139,240 @@ async def process_worker_payout(
         await db.rollback()
         raise HTTPException(status_code=409, detail=result["error"])
     await audit(db, current.id, current.role.value, "payout.process", "worker_payout", payout.id, result)
+    await db.commit()
+    return result
+
+
+@router.get("/worker-payouts/ready-for-release")
+async def list_payouts_ready_for_release(
+    current: CurrentUser = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """The Ready for Release queue.
+
+    A payout appears here once its booking is complete (ready_for_release_at
+    set at payout creation) and it has not yet been paid. Failed and
+    in-flight payouts stay in the list so an admin can retry or reconcile
+    them rather than losing sight of them.
+    """
+    rows = (
+        await db.execute(
+            select(WorkerPayout)
+            .where(
+                WorkerPayout.ready_for_release_at.isnot(None),
+                WorkerPayout.status.in_(
+                    [
+                        WorkerPayoutStatus.pending,
+                        WorkerPayoutStatus.processing,
+                        WorkerPayoutStatus.failed,
+                    ]
+                ),
+            )
+            .order_by(WorkerPayout.ready_for_release_at.desc())
+        )
+    ).scalars().all()
+
+    worker_ids = {p.worker_id for p in rows}
+    booking_ids = {p.booking_id for p in rows}
+
+    names: dict = {}
+    if worker_ids:
+        wres = await db.execute(
+            select(WorkerProfile, User)
+            .join(User, User.id == WorkerProfile.user_id)
+            .where(WorkerProfile.id.in_(worker_ids))
+        )
+        for wp, u in wres.all():
+            names[wp.id] = {
+                "name": u.full_name or u.email,
+                "has_bank": bool(wp.bank_account_number and wp.bank_ifsc),
+            }
+
+    refs: dict = {}
+    if booking_ids:
+        bres = await db.execute(
+            select(Booking.id, Booking.booking_ref, Booking.total_amount).where(
+                Booking.id.in_(booking_ids)
+            )
+        )
+        for bid, ref, total in bres.all():
+            refs[bid] = {"booking_ref": ref, "customer_amount": float(total)}
+
+    return [
+        {
+            "payout_id": str(p.id),
+            "booking_id": str(p.booking_id),
+            "booking_ref": refs.get(p.booking_id, {}).get("booking_ref"),
+            "worker_id": str(p.worker_id),
+            "worker_name": names.get(p.worker_id, {}).get("name"),
+            "worker_has_bank": names.get(p.worker_id, {}).get("has_bank", False),
+            "customer_amount": refs.get(p.booking_id, {}).get("customer_amount"),
+            "nurse_payout_amount": float(p.net_amount),
+            "gross_amount": float(p.gross_amount),
+            "status": p.status.value,
+            "approval_status": p.approval_status.value,
+            # The button is only actionable once the payout is approved and
+            # not already settled.
+            "releasable": (
+                p.approval_status == PayoutApprovalStatus.approved
+                and p.status in (WorkerPayoutStatus.pending, WorkerPayoutStatus.failed)
+            ),
+            "razorpay_payout_id": p.razorpay_payout_id,
+            "razorpay_status": p.razorpay_payout_status,
+            "utr": p.razorpay_utr,
+            "attempt_count": p.attempt_count or 0,
+            "max_attempts": p.max_attempts or 3,
+            "failure_reason": p.failure_reason,
+            "ready_for_release_at": (
+                p.ready_for_release_at.isoformat() if p.ready_for_release_at else None
+            ),
+            "released_at": p.released_at.isoformat() if p.released_at else None,
+            "paid_at": p.paid_at.isoformat() if p.paid_at else None,
+        }
+        for p in rows
+    ]
+
+
+@router.get("/worker-payouts/{payout_id}/breakdown")
+async def worker_payout_breakdown(
+    payout_id: UUID,
+    current: CurrentUser = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """The complete calculation behind one payout — admin eyes only.
+
+    Shows the customer amount, the nurse amount, the platform fee, GST on
+    each, every deduction and the final payout, all straight from the
+    centralised pricing engine so it cannot disagree with the invoice or the
+    amount actually sent to Razorpay.
+    """
+    res = await db.execute(select(WorkerPayout).where(WorkerPayout.id == payout_id))
+    payout = res.scalar_one_or_none()
+    if not payout:
+        raise HTTPException(status_code=404, detail="Payout not found")
+
+    bres = await db.execute(select(Booking).where(Booking.id == payout.booking_id))
+    booking = bres.scalar_one_or_none()
+
+    from app.services.payout_service import build_payout_breakdown
+    from app.services.pricing_engine import admin_view
+
+    breakdown = await build_payout_breakdown(db, payout)
+    calculation = admin_view(breakdown) if breakdown is not None else None
+
+    ires = await db.execute(select(Invoice).where(Invoice.booking_id == payout.booking_id))
+    invoice = ires.scalar_one_or_none()
+
+    return {
+        "payout_id": str(payout.id),
+        "booking_id": str(payout.booking_id),
+        "booking_ref": booking.booking_ref if booking else None,
+        "customer_amount": float(booking.total_amount) if booking else None,
+        "invoice_number": invoice.invoice_number if invoice else None,
+        "invoice_pdf_url": invoice.pdf_url if invoice else None,
+        # Full 80/20 + GST calculation.
+        "calculation": calculation,
+        # The stored figures — what will actually be transferred.
+        "stored": {
+            "gross_amount": float(payout.gross_amount),
+            "tds_deducted": float(payout.tds_deducted or 0),
+            "net_amount": float(payout.net_amount),
+        },
+        "status": payout.status.value,
+        "approval_status": payout.approval_status.value,
+        "razorpay_payout_id": payout.razorpay_payout_id,
+        "razorpay_status": payout.razorpay_payout_status,
+        "utr": payout.razorpay_utr,
+        "attempt_count": payout.attempt_count or 0,
+        "max_attempts": payout.max_attempts or 3,
+        "failure_reason": payout.failure_reason,
+        "released_at": payout.released_at.isoformat() if payout.released_at else None,
+        "paid_at": payout.paid_at.isoformat() if payout.paid_at else None,
+    }
+
+
+@router.post("/worker-payouts/{payout_id}/release")
+async def release_worker_payout(
+    payout_id: UUID,
+    current: CurrentUser = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """The Release Payment button.
+
+    Sends the calculated net amount to the nurse through RazorpayX, then
+    generates her payout statement. Safe to click twice: an already-paid
+    payout returns its existing result, and an in-flight one is polled rather
+    than re-sent.
+
+    The response is committed even on failure — an attempt that failed is a
+    fact worth keeping, and rolling it back would lose the attempt counter
+    and the failure reason the admin needs in order to decide what to do.
+    """
+    res = await db.execute(
+        select(WorkerPayout).where(WorkerPayout.id == payout_id).with_for_update()
+    )
+    payout = res.scalar_one_or_none()
+    if not payout:
+        raise HTTPException(status_code=404, detail="Payout not found")
+
+    from app.services.payout_service import release_payout
+
+    result = await release_payout(db, payout, released_by=current.id)
+
+    await audit(
+        db,
+        current.id,
+        current.role.value,
+        "payout.release",
+        "worker_payout",
+        payout.id,
+        {k: v for k, v in result.items() if k != "note"},
+    )
+    await db.commit()
+
+    # Statement generation happens after the money decision is committed, so
+    # a PDF problem can never undo a completed transfer.
+    try:
+        from app.services.billing_service import (
+            generate_payout_statement,
+            notify_payout_released,
+        )
+
+        statement = await generate_payout_statement(db, payout)
+        await db.commit()
+        await notify_payout_released(db, payout, statement)
+        await db.commit()
+        if statement is not None:
+            result["statement_number"] = statement.statement_number
+            result["statement_pdf_url"] = statement.pdf_url
+    except Exception:  # noqa: BLE001
+        await db.rollback()
+        logger.exception("payout statement generation failed for %s", payout.id)
+
+    if result.get("error") and not result.get("retryable"):
+        raise HTTPException(status_code=409, detail=result)
+    return result
+
+
+@router.post("/worker-payouts/{payout_id}/sync-status")
+async def sync_worker_payout_status(
+    payout_id: UUID,
+    current: CurrentUser = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Re-check an in-flight payout against Razorpay.
+
+    The safety net for a webhook that never arrived — without it a payout
+    left in `processing` would never resolve.
+    """
+    res = await db.execute(select(WorkerPayout).where(WorkerPayout.id == payout_id))
+    payout = res.scalar_one_or_none()
+    if not payout:
+        raise HTTPException(status_code=404, detail="Payout not found")
+
+    from app.services.payout_service import sync_payout_status
+
+    result = await sync_payout_status(db, payout)
     await db.commit()
     return result
 
