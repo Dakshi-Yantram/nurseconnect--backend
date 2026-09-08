@@ -308,21 +308,6 @@ async def verify_visit_start_otp(
     if not booking:
         raise HTTPException(status_code=404, detail="Booking not found or not assigned to you")
 
-    # Enforce the fatigue/safety-check gate: the nurse must have marked
-    # themselves En Route (which requires passing the reaction-time /
-    # fitness check in POST /workers/me/alertness-checks) before they're
-    # allowed to start the visit via OTP. Without this, a nurse could skip
-    # "En Route" entirely and jump straight to check-in, bypassing the
-    # mandatory pre-visit safety check.
-    if booking.status != BookingStatus.worker_en_route:
-        raise HTTPException(
-            status_code=409,
-            detail={
-                "code": "EN_ROUTE_REQUIRED",
-                "message": "Please mark yourself En Route (and complete the safety check) before starting the visit.",
-            },
-        )
-
     # ── Brute-force guard ───────────────────────────────────────────────────
     attempts_raw = await redis_client.get(_attempts_key(booking_id))
     attempts = int(attempts_raw) if attempts_raw else 0
