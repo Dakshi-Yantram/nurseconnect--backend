@@ -96,6 +96,12 @@ async def get_my_contracts(
     stage1 = await _get_stage(db, worker.id, 1)
     stage2 = await _get_stage(db, worker.id, 2)
 
+    # Legacy rows created before this column existed can be NULL in the DB
+    # even though the ORM default is 0 (that default only applies to new
+    # inserts made through SQLAlchemy) — guard so a NULL here can't turn a
+    # routine GET into a 500 (`None >= 1` raises TypeError).
+    completed_visits_count = worker.completed_visits_count or 0
+
     full_name = current.user.full_name or ""
     stage1_text = contract_templates.render_stage1(full_name=full_name, worker_type=worker.worker_type)
 
@@ -110,7 +116,7 @@ async def get_my_contracts(
     ]
 
     # Stage 2 unlocks only after the worker's first completed booking.
-    stage2_unlocked = worker.completed_visits_count >= 1
+    stage2_unlocked = completed_visits_count >= 1
     stage2_status = stage2.status if stage2 else ("pending" if stage2_unlocked else "not_applicable")
     stage2_text = None
     if stage2:
@@ -244,7 +250,7 @@ async def accept_stage2(
     current: CurrentUser = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    if worker.completed_visits_count < 1:
+    if (worker.completed_visits_count or 0) < 1:
         raise HTTPException(status_code=403, detail="Stage 2 unlocks only after your first completed booking.")
 
     existing = await _get_stage(db, worker.id, 2)
@@ -364,7 +370,7 @@ async def admin_list_agreements(
         stage1 = stage_map.get(1)
         stage2 = stage_map.get(2)
         stage2_status = (
-            stage2.status if stage2 else ("pending" if worker.completed_visits_count >= 1 else "not_applicable")
+            stage2.status if stage2 else ("pending" if (worker.completed_visits_count or 0) >= 1 else "not_applicable")
         )
         agreement_for_fee = stage2
         out.append(
@@ -378,7 +384,7 @@ async def admin_list_agreements(
                 stage2_status=stage2_status,
                 stage1_accepted_at=stage1.accepted_at if stage1 else None,
                 stage2_accepted_at=stage2.accepted_at if stage2 else None,
-                completed_visits_count=worker.completed_visits_count,
+                completed_visits_count=worker.completed_visits_count or 0,
                 onboarding_fee_collected=float(agreement_for_fee.onboarding_fee_collected) if agreement_for_fee else 0.0,
                 onboarding_fee_target=float(settings.ONBOARDING_ENABLEMENT_FEE),
             )
@@ -406,7 +412,7 @@ async def admin_get_worker_agreements(
             unlocked=False,
         )
     ]
-    stage2_unlocked = worker.completed_visits_count >= 1
+    stage2_unlocked = (worker.completed_visits_count or 0) >= 1
     out.append(
         ContractPreviewOut(
             stage=2,
