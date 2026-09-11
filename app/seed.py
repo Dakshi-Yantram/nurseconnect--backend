@@ -1976,7 +1976,21 @@ async def seed_faqs(session) -> int:
 async def _run_pending_column_migrations():
     """Small, safe, idempotent ALTER TABLE fixes that must run before the app
     serves traffic. Each statement uses IF NOT EXISTS / WHERE-guarded UPDATE,
-    so re-running on every startup is harmless."""
+    so re-running on every startup is harmless.
+
+    NOTE: this is the *only* place additive schema changes get applied
+    automatically on deploy — the one-off add_*_schema.py scripts at the repo
+    root are NOT run automatically by anything (Procfile/eb-engine just start
+    the web process). Historically that meant a schema change could ship in
+    the code, the standalone script would only get run manually/by hand, and
+    if that manual step was skipped the corresponding table/column would
+    simply not exist in production even though the ORM models and API code
+    assumed it did — 500s on every request that touched it, with no
+    application-level fix required, just the missing DDL. To close that gap
+    for good, every add_*_schema.py migration's statements are folded into
+    this function (each one still IF NOT EXISTS / additive, matching the
+    ORM models in app/models/models.py exactly) so a normal deploy is always
+    enough — no manual SSH + script step required ever again."""
     from sqlalchemy import text
 
     async with engine.begin() as conn:
@@ -1988,6 +2002,188 @@ async def _run_pending_column_migrations():
             "WHERE dispatch_started_at IS NULL AND status NOT IN ('draft', 'pending_payment')"
         ))
     print("Column migrations: bookings.dispatch_started_at ensured")
+
+    # ---- from add_contracts_schema.py ----------------------------------
+    async with engine.begin() as conn:
+        await conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS worker_agreements (
+                id UUID PRIMARY KEY,
+                worker_id UUID NOT NULL REFERENCES worker_profiles(id) ON DELETE CASCADE,
+                stage INTEGER NOT NULL,
+                status VARCHAR(30) NOT NULL DEFAULT 'pending',
+                provider_type_snapshot VARCHAR(50) NOT NULL,
+                rendered_text TEXT NOT NULL,
+                template_version VARCHAR(20) NOT NULL DEFAULT 'v1',
+                accepted_at TIMESTAMPTZ,
+                otp_verified BOOLEAN NOT NULL DEFAULT false,
+                ip_address VARCHAR(64),
+                esign_provider VARCHAR(50),
+                esign_reference_id VARCHAR(255),
+                esign_document_url TEXT,
+                onboarding_fee_deducted BOOLEAN NOT NULL DEFAULT false,
+                voided_at TIMESTAMPTZ,
+                void_reason TEXT,
+                created_at TIMESTAMPTZ DEFAULT now()
+            )
+        """))
+        await conn.execute(text(
+            "CREATE INDEX IF NOT EXISTS ix_worker_agreements_worker_stage ON worker_agreements(worker_id, stage)"
+        ))
+        await conn.execute(text(
+            "ALTER TABLE worker_documents ADD COLUMN IF NOT EXISTS ocr_extracted_name VARCHAR(255)"
+        ))
+        await conn.execute(text(
+            "ALTER TABLE worker_documents ADD COLUMN IF NOT EXISTS ocr_extracted_registration_no VARCHAR(100)"
+        ))
+        await conn.execute(text(
+            "ALTER TABLE worker_documents ADD COLUMN IF NOT EXISTS ocr_confidence NUMERIC(4,3)"
+        ))
+        await conn.execute(text(
+            "ALTER TABLE worker_documents ADD COLUMN IF NOT EXISTS ocr_raw_text TEXT"
+        ))
+    print("Column migrations: worker_agreements + worker_documents OCR columns ensured")
+
+    # ---- from add_availability_slots_and_alertness_schema.py ----------
+    async with engine.begin() as conn:
+        await conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS worker_availability_slots (
+                id UUID PRIMARY KEY,
+                worker_id UUID NOT NULL REFERENCES worker_profiles(id) ON DELETE CASCADE,
+                day_of_week SMALLINT NOT NULL,
+                start_time TIME NOT NULL,
+                end_time TIME NOT NULL,
+                is_active BOOLEAN NOT NULL DEFAULT true,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+            )
+        """))
+        await conn.execute(text(
+            "CREATE INDEX IF NOT EXISTS ix_worker_availability_slots_worker_day "
+            "ON worker_availability_slots (worker_id, day_of_week)"
+        ))
+        await conn.execute(text("""
+            DO $$ BEGIN
+                ALTER TABLE worker_availability_slots
+                ADD CONSTRAINT ck_availability_slot_day_of_week
+                CHECK (day_of_week BETWEEN 0 AND 6);
+            EXCEPTION
+                WHEN duplicate_object THEN NULL;
+            END $$;
+        """))
+        await conn.execute(text("""
+            DO $$ BEGIN
+                ALTER TABLE worker_availability_slots
+                ADD CONSTRAINT ck_availability_slot_end_after_start
+                CHECK (end_time > start_time);
+            EXCEPTION
+                WHEN duplicate_object THEN NULL;
+            END $$;
+        """))
+        await conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS worker_alertness_checks (
+                id UUID PRIMARY KEY,
+                worker_id UUID NOT NULL REFERENCES worker_profiles(id) ON DELETE CASCADE,
+                booking_id UUID NULL REFERENCES bookings(id) ON DELETE SET NULL,
+                round_reaction_times_ms INTEGER[],
+                average_reaction_time_ms INTEGER,
+                missed_taps INTEGER NOT NULL DEFAULT 0,
+                passed BOOLEAN NOT NULL,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+            )
+        """))
+        await conn.execute(text(
+            "CREATE INDEX IF NOT EXISTS ix_worker_alertness_checks_worker_created "
+            "ON worker_alertness_checks (worker_id, created_at)"
+        ))
+    print("Column migrations: worker_availability_slots + worker_alertness_checks ensured")
+
+    # ---- from add_eprescription_and_payout_approval_schema.py ---------
+    async with engine.begin() as conn:
+        await conn.execute(text("""
+            DO $$ BEGIN
+                CREATE TYPE tele_consultation_stage AS ENUM
+                    ('waiting', 'diet_review', 'patient_assessment', 'prescription', 'completed');
+            EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+        """))
+        await conn.execute(text("""
+            DO $$ BEGIN
+                CREATE TYPE payout_approval_status AS ENUM
+                    ('pending_approval', 'approved', 'rejected');
+            EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+        """))
+        await conn.execute(text("""
+            ALTER TABLE worker_profiles
+            ADD COLUMN IF NOT EXISTS signature_url TEXT NULL,
+            ADD COLUMN IF NOT EXISTS signature_public_id TEXT NULL,
+            ADD COLUMN IF NOT EXISTS signature_uploaded_at TIMESTAMPTZ NULL
+        """))
+        await conn.execute(text("""
+            ALTER TABLE prescriptions
+            ADD COLUMN IF NOT EXISTS is_doctor_generated BOOLEAN NOT NULL DEFAULT false,
+            ADD COLUMN IF NOT EXISTS issued_by_worker_id UUID NULL REFERENCES worker_profiles(id),
+            ADD COLUMN IF NOT EXISTS diet_notes TEXT NULL,
+            ADD COLUMN IF NOT EXISTS patient_issues TEXT NULL,
+            ADD COLUMN IF NOT EXISTS signature_url TEXT NULL,
+            ADD COLUMN IF NOT EXISTS pdf_url TEXT NULL,
+            ADD COLUMN IF NOT EXISTS pdf_public_id TEXT NULL,
+            ADD COLUMN IF NOT EXISTS verification_hash VARCHAR(64) NULL,
+            ADD COLUMN IF NOT EXISTS qr_code_url TEXT NULL
+        """))
+        await conn.execute(text(
+            "CREATE INDEX IF NOT EXISTS ix_prescriptions_is_doctor_generated ON prescriptions (is_doctor_generated)"
+        ))
+        await conn.execute(text(
+            "CREATE INDEX IF NOT EXISTS ix_prescriptions_verification_hash ON prescriptions (verification_hash)"
+        ))
+        await conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS tele_consultations (
+                id UUID PRIMARY KEY,
+                booking_id UUID NOT NULL UNIQUE REFERENCES bookings(id) ON DELETE CASCADE,
+                doctor_worker_id UUID NOT NULL REFERENCES worker_profiles(id),
+                patient_id UUID NOT NULL REFERENCES patients(id),
+                stage tele_consultation_stage NOT NULL DEFAULT 'waiting',
+                diet_notes TEXT NULL,
+                patient_issues TEXT NULL,
+                patient_all_okay BOOLEAN NULL,
+                prescription_id UUID NULL REFERENCES prescriptions(id),
+                started_at TIMESTAMPTZ NULL,
+                diet_reviewed_at TIMESTAMPTZ NULL,
+                patient_assessed_at TIMESTAMPTZ NULL,
+                completed_at TIMESTAMPTZ NULL,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+            )
+        """))
+        await conn.execute(text(
+            "CREATE INDEX IF NOT EXISTS ix_tele_consultations_doctor_stage ON tele_consultations (doctor_worker_id, stage)"
+        ))
+        await conn.execute(text(
+            "CREATE INDEX IF NOT EXISTS ix_tele_consultations_stage ON tele_consultations (stage)"
+        ))
+        await conn.execute(text("""
+            ALTER TABLE worker_payouts
+            ADD COLUMN IF NOT EXISTS approval_status payout_approval_status NOT NULL DEFAULT 'pending_approval',
+            ADD COLUMN IF NOT EXISTS approved_by UUID NULL REFERENCES users(id),
+            ADD COLUMN IF NOT EXISTS approved_at TIMESTAMPTZ NULL,
+            ADD COLUMN IF NOT EXISTS approval_rejection_reason TEXT NULL
+        """))
+        await conn.execute(text(
+            "CREATE INDEX IF NOT EXISTS ix_worker_payouts_approval_status ON worker_payouts (approval_status)"
+        ))
+        await conn.execute(text("""
+            UPDATE worker_payouts
+            SET approval_status = 'approved', approved_at = COALESCE(paid_at, now())
+            WHERE status = 'paid' AND approval_status = 'pending_approval'
+        """))
+        await conn.execute(text(
+            "ALTER TABLE worker_agreements ADD COLUMN IF NOT EXISTS onboarding_fee_collected NUMERIC(6,2) NOT NULL DEFAULT 0"
+        ))
+        await conn.execute(text("""
+            UPDATE worker_agreements
+            SET onboarding_fee_collected = 200.00
+            WHERE onboarding_fee_deducted = true AND onboarding_fee_collected = 0
+        """))
+    print("Column migrations: tele_consultations, payout approval gate, e-prescription columns ensured")
 
 
 async def main():
