@@ -92,8 +92,16 @@ async def notify_parties(
     template_code: str,
     title: str,
     body: str,
+    channels: Optional[List[NotificationChannel]] = None,
 ) -> None:
-    """Resolve abstract parties (worker | family | ops | doctor | emergency_desk) to users."""
+    """Resolve abstract parties (worker | family | ops | doctor | emergency_desk) to users.
+
+    ``channels`` defaults to send_notification's own default (in_app + push)
+    when not given, so existing call sites are unaffected. Pass an explicit
+    list (e.g. ``[NotificationChannel.whatsapp]``) to fan a specific event
+    out over a specific channel, such as the post-visit WhatsApp feedback
+    request, without changing every other notification of that party.
+    """
     from app.models.models import Booking, ConsumerProfile, WorkerProfile
     from app.models.enums import UserRole
 
@@ -123,7 +131,45 @@ async def notify_parties(
             recipient_ids.append(u.id)
 
     for rid in set(recipient_ids):
-        await send_notification(db, rid, template_code, title, body, context)
+        await send_notification(db, rid, template_code, title, body, context, channels=channels)
+
+
+async def notify_admins(
+    db: AsyncSession,
+    template_code: str,
+    title: str,
+    body: str,
+    context: Optional[Dict[str, Any]] = None,
+) -> List[UUID]:
+    """Push an in-app/push notification to every admin account and return
+    their user ids (so the caller can also fan the same event out over the
+    live /ws/user WebSocket for near-instant delivery, e.g. SOS alerts)."""
+    from app.models.enums import UserRole
+
+    ares = await db.execute(select(User).where(User.role == UserRole.admin))
+    admin_ids = [u.id for u in ares.scalars().all()]
+    for aid in admin_ids:
+        await send_notification(db, aid, template_code, title, body, context or {})
+    return admin_ids
+
+
+async def notify_admins(
+    db: AsyncSession,
+    template_code: str,
+    title: str,
+    body: str,
+    context: Optional[Dict[str, Any]] = None,
+) -> List[UUID]:
+    """Push an in-app/push notification to every admin account and return
+    their user ids (so the caller can also fan the same event out over the
+    live /ws/user WebSocket for near-instant delivery, e.g. SOS alerts)."""
+    from app.models.enums import UserRole
+
+    ares = await db.execute(select(User).where(User.role == UserRole.admin))
+    admin_ids = [u.id for u in ares.scalars().all()]
+    for aid in admin_ids:
+        await send_notification(db, aid, template_code, title, body, context or {})
+    return admin_ids
 
 
 # ============================================================================

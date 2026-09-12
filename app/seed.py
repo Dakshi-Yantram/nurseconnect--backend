@@ -5,10 +5,14 @@ Seeds are idempotent: re-running never creates duplicates.
 """
 import asyncio
 import sys
+import uuid
 from decimal import Decimal
 
 from app.core.database import AsyncSessionLocal, engine, Base
-from app.models.models import ServiceCatalogue, CarePackage, TrainingModule, AssessmentModule, Faq
+from app.models.models import (
+    ServiceCatalogue, CarePackage, TrainingModule, AssessmentModule, Faq,
+    ChecklistTemplate,
+)
 from app.models.enums import (
     ServiceCategory,
     WorkerTier,
@@ -16,8 +20,20 @@ from app.models.enums import (
     ContentStatus,
     GenderRestriction,
     VisitFrequency,
+    ChecklistPhase,
+    QualificationGate,
+    ServiceRiskLevel,
 )
-from sqlalchemy import select
+from app.seed_question_bank import (
+    GENERATED_ASSESSMENT_MODULES,
+    GENERATED_COMPETENCIES_BY_ID,
+    GENERATED_PACKAGE_REQUIREMENTS,
+    GENERATED_TRAINING_MODULES,
+)
+from app.models.enums import WorkerOnboardingStatus, UserStatus, WorkerQualificationSource
+from app.models.models import WorkerProfile, User, WorkerServiceQualification
+from app.services.qualification import sync_tier_qualifications
+from sqlalchemy import select, delete
 
 
 SERVICES = [
@@ -114,6 +130,19 @@ SERVICES = [
         icon="home",
     ),
     dict(
+        service_code="GENERAL_NURSING",
+        name="General Nursing",
+        description="General nursing care visit — routine monitoring, hygiene support, and basic clinical care.",
+        category=ServiceCategory.micro_visit,
+        min_tier=WorkerTier.tier1,
+        duration_minutes=60,
+        base_price=Decimal("599"),
+        commission_pct=Decimal("20"),
+        billing_trigger=BillingTrigger.on_completion,
+        insurance_covered=True,
+        icon="stethoscope",
+    ),
+    dict(
         service_code="PHYSIO_HOME_VISIT",
         name="Home Physiotherapy Visit",
         description="In-home physiotherapy session for mobility and rehabilitation.",
@@ -125,6 +154,43 @@ SERVICES = [
         billing_trigger=BillingTrigger.on_completion,
         insurance_covered=False,
         icon="dumbbell",
+    ),
+    dict(
+        service_code="IV_INFUSION",
+        name="IV Infusion",
+        description="Administration and monitoring of prescribed intravenous fluid/drug infusions.",
+        category=ServiceCategory.micro_visit,
+        min_tier=WorkerTier.tier2,
+        duration_minutes=45,
+        base_price=Decimal("699"),
+        commission_pct=Decimal("20"),
+        requires_prescription=True,
+        billing_trigger=BillingTrigger.on_completion,
+        insurance_covered=True,
+        icon="droplet",
+        # Patch 2 — service-level qualification gating: a nurse must have
+        # passed the IV_INFUSION_V1 training assessment before this service
+        # ever shows as opt-in-able.
+        required_training_module_codes=["IV_INFUSION_V1"],
+        risk_level=ServiceRiskLevel.MEDIUM,
+    ),
+    dict(
+        service_code="PICC_LINE_CARE",
+        name="PICC Line Care",
+        description="Peripherally inserted central catheter site care, dressing, and flush.",
+        category=ServiceCategory.micro_visit,
+        min_tier=WorkerTier.tier5,
+        duration_minutes=40,
+        base_price=Decimal("1199"),
+        commission_pct=Decimal("20"),
+        requires_prescription=True,
+        billing_trigger=BillingTrigger.on_completion,
+        insurance_covered=True,
+        icon="syringe",
+        # Highest-risk micro-visit service in the catalogue — restricted to
+        # our most senior tier, on top of whatever training/cert gates get
+        # added later.
+        risk_level=ServiceRiskLevel.CRITICAL,
     ),
 ]
 
@@ -185,6 +251,30 @@ PACKAGES = [
         commission_pct=Decimal("20"),
         requires_prescription=True,
         insurance_covered=True,
+    ),
+    dict(
+        package_code="POST_OP_CARE_7D",
+        name="Post-Op Complex Care — 7 Day",
+        tagline="Admin-reviewed post-operative care for higher-complexity recoveries",
+        description="A 7-day daily-visit package for higher-complexity post-operative recovery "
+                     "that requires reviewer sign-off before a nurse can be dispatched.",
+        target_condition="Complex post-surgical recovery requiring admin-reviewed nurse assignment",
+        min_tier=WorkerTier.tier3,
+        gender_restriction=GenderRestriction.any,
+        visit_frequency=VisitFrequency.daily,
+        visits_per_cycle=7,
+        cycle_duration_days=7,
+        package_price=Decimal("10999"),
+        per_visit_price=Decimal("1571"),
+        subsidy_eligible=False,
+        commission_pct=Decimal("20"),
+        requires_prescription=True,
+        insurance_covered=True,
+        # Patch 2 — package-level qualification gating: unlike the tier-only
+        # packages above, this one requires an explicit admin-reviewed
+        # qualification grant (see POST /workers/me/service-qualification-
+        # requests) rather than being auto-approved off tier alone.
+        requires_admin_skill_approval=True,
     ),
     dict(
         package_code="MATERNITY_POSTNATAL_30D",
@@ -269,6 +359,207 @@ async def link_package_services(session) -> int:
     return linked
 
 
+# ---------------------------------------------------------------------------
+# In-visit questionnaires (ChecklistTemplate) — previously missing entirely,
+# which left the nurse's in-visit questionnaire screen blank for every
+# service/package. Seeded here + linked onto the matching ServiceCatalogue
+# rows via link_service_checklists() below, which (unlike seed_services)
+# updates already-existing rows so this works on a DB that was seeded
+# before this fix shipped.
+# ---------------------------------------------------------------------------
+CHECKLIST_TEMPLATES = [
+    dict(
+        code="CHK-WOUND-DRESSING-V1",
+        name="Wound Dressing — Visit Questionnaire",
+        service_codes=["WOUND_DRESSING"],
+        # Post-op recovery visits also involve wound checks, so reuse this
+        # checklist for that package until/unless a dedicated post-op
+        # checklist is created.
+        package_codes=["POST_OP_7D"],
+        phase=ChecklistPhase.during_visit,
+        questions=[
+            {
+                "id": "wound_photo_captured",
+                "type": "photo",
+                "text": "Photo of the wound before dressing",
+                "required": True,
+                "phase": "during_visit",
+            },
+            {
+                "id": "wound_condition",
+                "type": "single_select",
+                "text": "Current wound condition",
+                "options": ["Healing well", "No change", "Signs of infection", "Worsening"],
+                "required": True,
+                "phase": "during_visit",
+            },
+            {
+                "id": "pain_level",
+                "type": "number",
+                "text": "Patient-reported pain level (0–10)",
+                "required": True,
+                "phase": "during_visit",
+            },
+            {
+                "id": "dressing_type_used",
+                "type": "text",
+                "text": "Dressing material used",
+                "required": True,
+                "phase": "during_visit",
+            },
+            {
+                "id": "signs_of_infection_notes",
+                "type": "textarea",
+                "text": "Notes on any signs of infection (redness, discharge, odour, swelling)",
+                "required": False,
+                "phase": "during_visit",
+            },
+            {
+                "id": "photo_after_dressing",
+                "type": "photo",
+                "text": "Photo of the wound after fresh dressing applied",
+                "required": True,
+                "phase": "post_visit",
+            },
+            {
+                "id": "patient_consent",
+                "type": "consent_confirmation",
+                "text": "Patient/family consented to the procedure and photos",
+                "required": True,
+                "phase": "pre_visit",
+            },
+        ],
+    ),
+    dict(
+        code="CHK-VITALS-CHECK-V1",
+        name="Vitals Monitoring — Visit Questionnaire",
+        service_codes=["VITALS_CHECK"],
+        phase=ChecklistPhase.during_visit,
+        questions=[
+            {
+                "id": "vitals_reading",
+                "type": "vitals_entry",
+                "text": "Record vitals (BP, pulse, SpO2, temperature, blood sugar)",
+                "required": True,
+                "phase": "during_visit",
+            },
+            {
+                "id": "vitals_notes",
+                "type": "textarea",
+                "text": "Any observations to flag for the care team",
+                "required": False,
+                "phase": "during_visit",
+            },
+            {
+                "id": "patient_consent",
+                "type": "consent_confirmation",
+                "text": "Patient/family consented to the check",
+                "required": True,
+                "phase": "pre_visit",
+            },
+        ],
+    ),
+]
+
+
+async def seed_checklist_templates(session) -> int:
+    """Seed CHECKLIST_TEMPLATES into ChecklistTemplate — idempotent (matches
+    on `code`). This was previously called from main() but never defined,
+    which would raise NameError the moment FAQ seeding stopped failing first.
+    Only inserts new templates; it does NOT touch service/package links —
+    that's link_service_checklists() / link_package_checklists() below.
+    """
+    created = 0
+    for data in CHECKLIST_TEMPLATES:
+        exists = await session.execute(
+            select(ChecklistTemplate).where(ChecklistTemplate.code == data["code"])
+        )
+        if exists.scalar_one_or_none():
+            print(f"  · checklist template {data['code']} already exists, skipping")
+            continue
+        session.add(ChecklistTemplate(
+            code=data["code"],
+            name=data["name"],
+            phase=data["phase"],
+            questions=data["questions"],
+            is_active=True,
+        ))
+        created += 1
+        print(f"  + created checklist template {data['code']}")
+    return created
+
+
+async def link_service_checklists(session) -> int:
+    """Point ServiceCatalogue.checklist_template_id at the matching template.
+
+    Unlike seed_services(), this DOES touch already-existing service rows —
+    that's the whole point, since production already has WOUND_DRESSING /
+    VITALS_CHECK seeded from before this fix existed. Never overwrites a
+    checklist_template_id an admin already set some other way.
+    """
+    linked = 0
+    for data in CHECKLIST_TEMPLATES:
+        tres = await session.execute(
+            select(ChecklistTemplate).where(ChecklistTemplate.code == data["code"])
+        )
+        template = tres.scalar_one_or_none()
+        if not template:
+            continue
+        for service_code in data["service_codes"]:
+            sres = await session.execute(
+                select(ServiceCatalogue).where(ServiceCatalogue.service_code == service_code)
+            )
+            service = sres.scalar_one_or_none()
+            if not service:
+                print(f"  ! service {service_code} not found — cannot link checklist {data['code']}")
+                continue
+            if service.checklist_template_id:
+                print(f"  · service {service_code} already has a checklist template linked, skipping")
+                continue
+            service.checklist_template_id = template.id
+            linked += 1
+            print(f"  + linked service {service_code} -> checklist {data['code']}")
+    return linked
+
+
+async def link_package_checklists(session) -> int:
+    """Point CarePackage.checklist_template_id at the matching template.
+
+    Mirrors link_service_checklists() but for care packages. Packages route
+    through their own checklist_template_id independently of any service
+    they're built on top of (see resolve_workflow_for_booking), so a
+    package's questionnaire has to be linked here explicitly — it is NOT
+    inherited from its primary_service automatically. Never overwrites a
+    checklist_template_id an admin already set some other way.
+    """
+    linked = 0
+    for data in CHECKLIST_TEMPLATES:
+        package_codes = data.get("package_codes") or []
+        if not package_codes:
+            continue
+        tres = await session.execute(
+            select(ChecklistTemplate).where(ChecklistTemplate.code == data["code"])
+        )
+        template = tres.scalar_one_or_none()
+        if not template:
+            continue
+        for package_code in package_codes:
+            pres = await session.execute(
+                select(CarePackage).where(CarePackage.package_code == package_code)
+            )
+            package = pres.scalar_one_or_none()
+            if not package:
+                print(f"  ! package {package_code} not found — cannot link checklist {data['code']}")
+                continue
+            if package.checklist_template_id:
+                print(f"  · package {package_code} already has a checklist template linked, skipping")
+                continue
+            package.checklist_template_id = template.id
+            linked += 1
+            print(f"  + linked package {package_code} -> checklist {data['code']}")
+    return linked
+
+
 async def seed_services(session) -> int:
     created = 0
     for data in SERVICES:
@@ -297,6 +588,701 @@ async def seed_packages(session) -> int:
         created += 1
         print(f"  + created package {data['package_code']}")
     return created
+
+
+def _enum_value(enum_cls, value, default):
+    try:
+        return enum_cls(value)
+    except ValueError:
+        return default
+
+
+# ---------------------------------------------------------------------------
+# Customer-facing copy + pricing for the workbook-generated packages.
+#
+# GENERATED_PACKAGE_REQUIREMENTS (seed_question_bank.py) was produced straight
+# from the nurse-qualification workbook: every package's tagline/description
+# came out as "Care package seeded from the NurseConnect workbook.
+# Eligibility: Pass Test A + Test B2 (IV)." and package_price/per_visit_price
+# were left at "0". That's internal gating language, not something a customer
+# booking care should ever see — and a free care package isn't real. This
+# table overrides just the customer-facing fields (tagline, description,
+# price) per package_code; everything else — the training/assessment/
+# competency requirements used to gate which nurses can claim it — is left
+# alone and still comes from the generated data below.
+# ---------------------------------------------------------------------------
+WORKBOOK_PACKAGE_CUSTOMER_COPY: dict[str, dict] = {
+    # -- Tier 1: single-visit injections, IV access & infusions -------------
+    "PKG-A1-01": dict(
+        tagline="A quick check of vitals and general condition",
+        description="A single visit to check blood pressure, pulse, temperature, oxygen "
+                     "levels and blood sugar, with a summary of what was found.",
+        # Deliberately priced at Rs.1 (not the usual Rs.299) - kept as a low-cost
+        # test/entry package so payments can be exercised end-to-end cheaply.
+        package_price="1",
+        per_visit_price="1",
+        whats_included=[
+            "Blood pressure check",
+            "Pulse check",
+            "Temperature check",
+            "Respiration check",
+            "SpO₂ check",
+            "Brief symptom and medication review",
+            "Written visit note",
+        ],
+        service_details_text=
+        "One home nursing visit. The nurse carries the required basic monitoring equipment."
+    ),
+    "PKG-A1-02": dict(
+        tagline="One prescribed injection, given at home",
+        description="A nurse visits to administer a single prescribed intramuscular or "
+                     "subcutaneous injection safely at home.",
+        per_visit_price="299",
+        whats_included=[
+            "Administration of one prescribed IM or subcutaneous injection",
+            "Basic observation during the procedure",
+        ],
+        service_details_text=
+        "One prescribed injection per visit.",
+        important_information=
+        "The prescribed medicine is provided by the customer. A syringe and needle can be "
+        "supplied separately if required."
+    ),
+    "PKG-A1-03": dict(
+        tagline="Insulin administration for diabetes management",
+        description="A nurse administers your prescribed insulin dose and can check blood "
+                     "sugar in the same visit if needed.",
+        per_visit_price="329",
+        whats_included=[
+            "Administration of the prescribed insulin dose",
+            "Review of the latest glucose reading",
+        ],
+        service_details_text=
+        "Suitable for daily or recurring insulin administration.",
+        important_information=
+        "The prescribed insulin is provided by the customer. An insulin syringe can be supplied "
+        "separately if required."
+    ),
+    "PKG-A1-04": dict(
+        tagline="Two prescribed injections in a single visit",
+        description="For when you have two separate injections prescribed at the same time — "
+                     "both are administered safely in one visit.",
+        per_visit_price="449",
+        whats_included=[
+            "Administration of two prescribed IM or subcutaneous injections",
+            "Basic observation during the procedure",
+        ],
+        service_details_text=
+        "Two prescribed injections during one visit.",
+        important_information=
+        "The prescribed medicines are provided by the customer. Syringes can be supplied "
+        "separately if required."
+    ),
+    "PKG-A1-05": dict(
+        tagline="Fertility treatment hormonal injections",
+        description="A nurse trained in fertility-treatment protocols administers your "
+                     "prescribed hormonal injection at home, on your treatment schedule.",
+        per_visit_price="499",
+        whats_included=[
+            "Administration of the prescribed subcutaneous hormonal injection",
+            "Careful handling according to the prescribed schedule",
+        ],
+        service_details_text=
+        "One prescribed fertility or IVF hormonal injection per visit.",
+        important_information=
+        "The prescribed medicine is provided by the customer. A syringe can be supplied "
+        "separately if required."
+    ),
+    "PKG-A1-06": dict(
+        tagline="IV antibiotic administration at home",
+        description="A nurse administers a prescribed antibiotic through an existing IV line "
+                     "and monitors you for the duration of the infusion.",
+        per_visit_price="599",
+        whats_included=[
+            "Administration of the prescribed antibiotic through IV access",
+            "Monitoring during the visit",
+        ],
+        service_details_text=
+        "The service can use an existing IV cannula or a freshly placed cannula.",
+        important_information=
+        "If a new cannula is required, the applicable cannula and dressing charge is added "
+        "separately."
+    ),
+    "PKG-A1-07": dict(
+        tagline="IV cannula placed or removed by a trained nurse",
+        description="Sterile insertion of an IV cannula (for future medication or fluids) or "
+                     "safe removal of an existing one, done at home.",
+        per_visit_price="449",
+        whats_included=[
+            "Peripheral IV cannula insertion or removal",
+            "Basic procedure support",
+        ],
+        service_details_text=
+        "The procedure is performed by a cannulation-approved nurse.",
+        important_information=
+        "Cannula and fixing-dressing charges apply separately when supplied by NurseConnect."
+    ),
+    "PKG-A1-08": dict(
+        tagline="A short IV infusion, up to one hour",
+        description="Prescribed IV fluids or medication administered and monitored at home for "
+                     "infusions lasting up to an hour.",
+        per_visit_price="599",
+        whats_included=[
+            "Administration of the prescribed IV fluid or medicine",
+            "Baseline vital checks",
+            "Post-infusion vital checks",
+            "Nursing monitoring during the infusion",
+        ],
+        service_details_text=
+        "Infusion duration of up to 60 minutes.",
+        important_information=
+        "The prescribed medicine is not included. An IV infusion or drip set can be supplied "
+        "separately."
+    ),
+    "PKG-A1-09": dict(
+        tagline="A longer IV infusion, 1 to 3 hours",
+        description="Prescribed IV fluids or medication administered and monitored at home, "
+                     "with the nurse staying for the full 1–3 hour infusion.",
+        per_visit_price="999",
+        whats_included=[
+            "Administration of the prescribed infusion",
+            "Nursing presence throughout the prescribed infusion period",
+        ],
+        service_details_text=
+        "Infusion duration of up to three hours.",
+        important_information=
+        "Prescribed medicine is not included. An infusion or drip set can be supplied separately."
+    ),
+    "PKG-A1-10": dict(
+        tagline="An extended IV infusion, 3 to 6 hours",
+        description="For longer prescribed infusions — the nurse stays for the full 3–6 hours, "
+                     "monitoring your vitals and the infusion site throughout.",
+        per_visit_price="1699",
+        whats_included=[
+            "Administration of the prescribed IV infusion",
+            "Extended nurse presence throughout the prescribed infusion period",
+        ],
+        service_details_text=
+        "Infusion duration of three to six hours.",
+        important_information=
+        "Prescribed medicine is not included. An infusion or drip set can be supplied separately."
+    ),
+    "PKG-A1-11": dict(
+        tagline="Nebuliser therapy for breathing relief",
+        description="A nurse sets up and supervises a prescribed nebuliser session to help "
+                     "with breathing difficulty, wheezing or congestion.",
+        per_visit_price="349",
+        whats_included=[
+            "Nebuliser setup assistance",
+            "Administration of prescribed nebulisation",
+            "Vital checks before and after where appropriate",
+        ],
+        service_details_text=
+        "One nebulisation assistance visit.",
+        important_information=
+        "Prescribed medicine is not included. A disposable nebuliser mask or kit can be supplied "
+        "separately."
+    ),
+    "PKG-A1-12": dict(
+        tagline="Enema administration by a trained nurse",
+        description="A prescribed enema is administered safely and hygienically at home.",
+        per_visit_price="399",
+        whats_included=[
+            "Administration of the prescribed enema",
+            "Privacy and appropriate infection-control precautions",
+        ],
+        service_details_text=
+        "One home procedure visit.",
+        important_information=
+        "The enema kit can be supplied separately if required."
+    ),
+    # -- Tier 2: wound, catheter, tube & stoma care --------------------------
+    "PKG-A2-01": dict(
+        tagline="Routine wound cleaning and dressing",
+        description="Sterile cleaning and re-dressing of a straightforward wound, with the "
+                     "nurse checking for signs of infection or delayed healing.",
+        per_visit_price="449",
+        whats_included=[
+            "Wound cleaning",
+            "Dressing of the wound",
+            "Basic wound observation",
+        ],
+        service_details_text=
+        "One home nursing visit.",
+        important_information=
+        "For larger, infected or multiple wounds, use the applicable complex wound dressing "
+        "service."
+    ),
+    "PKG-A2-02": dict(
+        tagline="Suture or staple removal once healing is complete",
+        description="A nurse removes stitches or staples once your surgeon has confirmed the "
+                     "wound is ready, checking the site is healing well.",
+        per_visit_price="499",
+        whats_included=[
+            "Removal of prescribed sutures or staples",
+            "Basic post-procedure guidance",
+        ],
+        service_details_text=
+        "One home visit.",
+        important_information=
+        "Removal must be supported by appropriate medical instructions and timing."
+    ),
+    "PKG-A2-03": dict(
+        tagline="Dressing changes for a post-surgical wound",
+        description="Sterile dressing changes for a wound from a recent surgery, with close "
+                     "monitoring for infection during the healing period.",
+        per_visit_price="599",
+        whats_included=[
+            "Surgical incision assessment",
+            "Wound dressing",
+            "Basic red-flag observation",
+            "Documentation for the family",
+        ],
+        service_details_text=
+        "One home nursing visit.",
+        important_information=
+        "The surgical dressing kit is charged separately when supplied by NurseConnect."
+    ),
+    "PKG-A2-04": dict(
+        tagline="Dressing for a complex or large wound",
+        description="For wounds needing more involved care — larger dressings, wound "
+                     "irrigation or packing — done by a nurse trained in complex wound "
+                     "management.",
+        per_visit_price="799",
+        whats_included=[
+            "Assessment of the wound details",
+            "Appropriate dressing support",
+            "Documentation of relevant findings",
+        ],
+        service_details_text=
+        "One home nursing visit.",
+        important_information=
+        "Final service price depends on the wound complexity. Extended dressing materials are "
+        "charged separately based on wound size and requirements."
+    ),
+    "PKG-A2-05": dict(
+        tagline="Bed-sore (pressure ulcer) dressing and care",
+        description="Assessment and dressing of a pressure ulcer, along with guidance on "
+                     "positioning and skin care to prevent it from worsening.",
+        per_visit_price="699",
+        whats_included=[
+            "Pressure-ulcer dressing",
+            "Positioning guidance",
+            "Wound documentation",
+        ],
+        service_details_text=
+        "One home nursing visit.",
+        important_information=
+        "Final pricing depends on wound grade, size and number of wounds. Extended dressing "
+        "materials are charged separately where applicable."
+    ),
+    "PKG-A2-06": dict(
+        tagline="Routine urinary catheter care and hygiene",
+        description="Cleaning, hygiene checks and monitoring for an existing urinary catheter "
+                     "to prevent infection and keep it functioning properly.",
+        per_visit_price="499",
+        whats_included=[
+            "Catheter hygiene care",
+            "Urine-bag check",
+            "Urine-output review",
+            "Caregiver education",
+        ],
+        service_details_text=
+        "One home nursing visit.",
+        important_information=
+        "Catheter replacement is not included."
+    ),
+    "PKG-A2-07": dict(
+        tagline="Safe removal of a urinary catheter",
+        description="A trained nurse removes an existing urinary catheter once it's no longer "
+                     "needed, and checks you're passing urine normally afterward.",
+        per_visit_price="449",
+        whats_included=[
+            "Prescribed urinary catheter removal",
+            "Basic after-care guidance",
+        ],
+        service_details_text=
+        "One home nursing visit.",
+        important_information=
+        "The procedure must be supported by appropriate medical instruction."
+    ),
+    "PKG-A2-08": dict(
+        tagline="Sterile catheter insertion or replacement",
+        description="Insertion of a new urinary catheter, or replacement of an existing one, "
+                     "using sterile technique by a nurse trained in catheterisation.",
+        per_visit_price="799",
+        whats_included=[
+            "Urinary catheter insertion or replacement",
+            "Basic procedure support",
+        ],
+        service_details_text=
+        "One home visit by an approved nurse.",
+        important_information=
+        "A Foley catheter can be supplied separately if required."
+    ),
+    "PKG-A2-09": dict(
+        tagline="Routine care for an existing feeding (Ryles/NG) tube",
+        description="Checking placement, cleaning, and feed/medication support for an existing "
+                     "nasogastric feeding tube.",
+        per_visit_price="549",
+        whats_included=[
+            "Feeding assistance",
+            "Tube-site check",
+            "Tube-care education for the family",
+        ],
+        service_details_text=
+        "One home nursing visit.",
+        important_information=
+        "Tube replacement is not included."
+    ),
+    "PKG-A2-10": dict(
+        tagline="Feeding (Ryles/NG) tube insertion or replacement",
+        description="Insertion of a new nasogastric feeding tube, or replacement of an "
+                     "existing one, with placement confirmed before use.",
+        per_visit_price="899",
+        whats_included=[
+            "NG tube insertion or replacement",
+            "Basic procedure support",
+        ],
+        service_details_text=
+        "One home visit by a specifically trained and assessed nurse.",
+        important_information=
+        "An NG tube can be supplied separately if required."
+    ),
+    "PKG-A2-11": dict(
+        tagline="Stoma care and bag change",
+        description="Cleaning around the stoma site, bag change, and skin-integrity checks for "
+                     "an ostomy, done by a nurse trained in stoma care.",
+        per_visit_price="649",
+        whats_included=[
+            "Stoma observation",
+            "Pouch change",
+            "Family education",
+        ],
+        service_details_text=
+        "One home nursing visit.",
+        important_information=
+        "A stoma bag can be supplied separately if required."
+    ),
+    # -- Tier 3: post-discharge, recovery & specialised support -------------
+    "PKG-A3-01": dict(
+        tagline="One-time setup visit when you first come home",
+        description="A nurse reviews your discharge summary, sets up any equipment or "
+                     "medication schedule you need, and briefs your family on what to watch "
+                     "for in the first few days home.",
+        per_visit_price="999",
+        whats_included=[
+            "Review of discharge instructions",
+            "Medicine review",
+            "Baseline vital checks",
+            "Mobility and fall-risk check",
+            "Home-care plan for the family",
+        ],
+        service_details_text=
+        "One post-discharge nursing visit."
+    ),
+    "PKG-A3-02": dict(
+        tagline="A nursing visit focused on post-surgery recovery",
+        description="Vitals checks, wound review and general recovery monitoring by a nurse "
+                     "experienced in post-operative care.",
+        per_visit_price="1099",
+        whats_included=[
+            "Vital checks",
+            "Wound observation",
+            "Medication-adherence check",
+            "Recovery review",
+        ],
+        service_details_text=
+        "One home nursing visit.",
+        important_information=
+        "Dressing or injection services can be added where applicable."
+    ),
+    "PKG-A3-03": dict(
+        tagline="Close monitoring through the critical first 72 hours home",
+        description="Frequent vitals and symptom checks during the highest-risk window right "
+                     "after discharge, with clear escalation to a doctor if anything looks off.",
+        per_visit_price="1499",
+        whats_included=[
+            "3 nurse visits",
+            "Vital monitoring",
+            "Wound review",
+            "Medicine support",
+            "Mobility review",
+            "Red-flag documentation",
+        ],
+        service_details_text=
+        "One nursing visit each day for three days."
+    ),
+    "PKG-A3-04": dict(
+        tagline="Seven days of daily recovery visits",
+        description="A nurse visits daily for a week to monitor recovery, manage wound care or "
+                     "medication, and flag any complications early.",
+        package_price="8499",
+        per_visit_price="1214",
+        whats_included=[
+            "7 scheduled nursing visits",
+            "Close recovery monitoring",
+            "Vital and general condition review",
+        ],
+        service_details_text=
+        "One scheduled nursing visit per day for seven days."
+    ),
+    "PKG-A3-05": dict(
+        tagline="Enhanced recovery support with a wider care team",
+        description="A more comprehensive recovery visit that can pull in physiotherapy or "
+                     "dietary guidance alongside standard nursing care, coordinated for you.",
+        per_visit_price="1899",
+        whats_included=[
+            "Hospital-to-home assessment",
+            "5 nursing visits",
+            "2 physiotherapy sessions",
+            "Family home-care plan",
+        ],
+        service_details_text=
+        "Designed as a coordinated post-hospital recovery package."
+    ),
+    "PKG-A3-06": dict(
+        tagline="Home nursing support during cancer treatment",
+        description="Support around chemotherapy or radiation cycles — symptom monitoring, "
+                     "medication support and general comfort care from a nurse trained in "
+                     "oncology home care.",
+        per_visit_price="1699",
+        whats_included=[
+            "Vital checks",
+            "Hydration and intake review",
+            "Symptom documentation",
+            "Escalation guidance",
+        ],
+        service_details_text=
+        "One home nursing visit alongside ongoing oncology care."
+    ),
+    "PKG-A3-07": dict(
+        tagline="Home support for stroke recovery",
+        description="Assessment and hands-on support for a stroke patient at home, covering "
+                     "mobility, swallowing precautions and rehabilitation exercises alongside "
+                     "standard nursing checks.",
+        per_visit_price="1599",
+        whats_included=[
+            "Nursing assessment",
+            "Mobility assessment",
+            "Caregiver-needs review",
+            "Transfer-needs review",
+            "Rehabilitation-needs identification",
+        ],
+        service_details_text=
+        "One assessment visit."
+    ),
+    # -- Tier 3/4: nursing shifts ---------------------------------------------
+    "PKG-A4-01": dict(
+        tagline="4 hours of dedicated nursing care at home",
+        description="A qualified nurse stays with the patient for a 4-hour shift, handling "
+                     "medication, monitoring and hands-on care as needed.",
+        per_visit_price="899",
+        whats_included=[
+            "Prescribed medicine support",
+            "Vital monitoring",
+            "Positioning",
+            "Feeding support",
+            "Permitted nursing procedures",
+        ],
+        service_details_text=
+        "4-hour nursing shift."
+    ),
+    "PKG-A4-02": dict(
+        tagline="8 hours of dedicated nursing care at home",
+        description="A qualified nurse stays with the patient for a full 8-hour shift, "
+                     "handling medication, monitoring and hands-on care as needed.",
+        per_visit_price="1599",
+        whats_included=[
+            "Continuous nursing support during the booked shift",
+            "Assistance with applicable prescribed care and monitoring",
+        ],
+        service_details_text=
+        "8 continuous hours."
+    ),
+    "PKG-A4-03": dict(
+        tagline="12-hour daytime nursing shift",
+        description="Continuous daytime nursing coverage — vitals, medication, mobility "
+                     "support and monitoring across a 12-hour shift.",
+        per_visit_price="2199",
+        whats_included=[
+            "Continuous skilled nursing during the shift",
+            "Applicable prescribed care and monitoring",
+        ],
+        service_details_text=
+        "12-hour daytime shift."
+    ),
+    "PKG-A4-04": dict(
+        tagline="12-hour overnight nursing shift",
+        description="Continuous overnight nursing coverage, so the patient and family can rest "
+                     "while a qualified nurse handles monitoring and care.",
+        per_visit_price="2399",
+        whats_included=[
+            "Continuous overnight nursing support",
+            "Applicable prescribed care and monitoring",
+        ],
+        service_details_text=
+        "12-hour night shift.",
+        important_information=
+        "The listed price includes the night premium."
+    ),
+    "PKG-A4-05": dict(
+        tagline="Round-the-clock nursing coverage",
+        description="Continuous 24-hour nursing coverage for patients who need care and "
+                     "monitoring at all times, day and night.",
+        per_visit_price="4299",
+        whats_included=[
+            "One 12-hour day nursing shift",
+            "One 12-hour night nursing shift",
+            "Continuous coverage across the day and night",
+        ],
+        important_information=
+        "This is provided as two separate 12-hour nurses, not one nurse working continuously for "
+        "24 hours."
+    ),
+    "PKG-A4-06": dict(
+        tagline="A 12-hour nursing shift, every day for a week",
+        description="Seven consecutive days of 12-hour nursing shifts for sustained recovery "
+                     "or high-need care, billed as one weekly plan.",
+        package_price="13999",
+        per_visit_price="2000",
+        whats_included=[
+            "7 pre-booked 12-hour day shifts",
+            "Scheduled nursing coverage throughout the week",
+        ],
+        service_details_text=
+        "Seven 12-hour daytime nursing shifts."
+    ),
+    "PKG-A4-07": dict(
+        tagline="A 12-hour nursing shift, every day for a month",
+        description="Thirty consecutive days of 12-hour nursing shifts — our most comprehensive "
+                     "long-term home nursing plan, billed as one monthly package.",
+        package_price="54999",
+        per_visit_price="1833",
+        whats_included=[
+            "Scheduled 12-hour nursing coverage",
+            "Replacement support for continuity of care",
+        ],
+        service_details_text=
+        "Monthly nursing plan."
+    ),
+    "PKG-A4-08": dict(
+        tagline="High-dependency / ICU step-down nursing at home",
+        description="Critical-care-trained nursing for patients stepping down from ICU — close "
+                     "monitoring of vitals and equipment, with rapid escalation to a doctor if "
+                     "needed.",
+        per_visit_price="3999",
+        whats_included=[
+            "Specialised nursing support",
+            "Closer patient monitoring",
+            "Support for applicable high-dependency care needs",
+        ],
+        service_details_text=
+        "12-hour nursing shift.",
+        important_information=
+        "This service is intended for tracheostomy, oxygen support, frequent monitoring or "
+        "medically dependent patients. The source specifies that this package should launch only "
+        "once appropriate clinical escalation systems are ready."
+    ),
+}
+
+
+async def seed_workbook_package_requirements(session) -> int:
+    """Upsert care packages from the workbook's grouped package mapping.
+
+    The source sheet has many rows per package because it maps each package to
+    many questions and competencies. Keeping that shape in application code is
+    hard to read, so seed_question_bank.py groups each package into one record
+    with required module codes, assessment codes, question IDs, and competency
+    IDs.
+
+    Customer-facing copy and pricing come from WORKBOOK_PACKAGE_CUSTOMER_COPY
+    above rather than the raw generated data — see the comment on that table
+    for why.
+    """
+    changed = 0
+    for data in GENERATED_PACKAGE_REQUIREMENTS:
+        res = await session.execute(
+            select(CarePackage).where(CarePackage.package_code == data["package_code"])
+        )
+        package = res.scalar_one_or_none()
+        customer_copy = WORKBOOK_PACKAGE_CUSTOMER_COPY.get(data["package_code"], {})
+        _visits_per_cycle = data.get("visits_per_cycle") or 1
+        _per_visit_price = Decimal(str(
+            customer_copy.get("per_visit_price", data.get("per_visit_price")) or "0"
+        ))
+        _explicit_package_price = customer_copy.get("package_price", data.get("package_price"))
+        # Most workbook-generated packages only ever specified a per-visit price;
+        # package_price was left at "0" (see WORKBOOK_PACKAGE_CUSTOMER_COPY note
+        # above). A package literally priced at ₹0 isn't real, so when no explicit
+        # package_price was set, derive it from per_visit_price * visits_per_cycle
+        # instead of silently showing ₹0 to customers.
+        _package_price = (
+            Decimal(str(_explicit_package_price))
+            if _explicit_package_price not in (None, "", "0", 0)
+            else _per_visit_price * _visits_per_cycle
+        )
+        payload = {
+            "name": data["name"],
+            "tagline": customer_copy.get("tagline", data.get("tagline")),
+            "description": customer_copy.get("description", data.get("description")),
+            "whats_included": customer_copy.get("whats_included"),
+            "service_details_text": customer_copy.get("service_details_text"),
+            "important_information": customer_copy.get("important_information"),
+            "target_condition": data.get("target_condition"),
+            "min_tier": _enum_value(WorkerTier, data.get("min_tier"), WorkerTier.tier2),
+            "gender_restriction": GenderRestriction.any,
+            "visit_frequency": _enum_value(
+                VisitFrequency,
+                data.get("visit_frequency"),
+                VisitFrequency.as_needed,
+            ),
+            "visits_per_cycle": _visits_per_cycle,
+            "cycle_duration_days": data.get("cycle_duration_days") or 1,
+            "package_price": _package_price,
+            "per_visit_price": _per_visit_price,
+            "subsidy_eligible": bool(data.get("subsidy_eligible")),
+            "commission_pct": Decimal(str(data.get("commission_pct") or "20")),
+            "requires_prescription": bool(data.get("requires_prescription")),
+            "insurance_covered": bool(data.get("insurance_covered", True)),
+            "gate": _enum_value(
+                QualificationGate,
+                data.get("gate"),
+                QualificationGate.theory_verified,
+            ),
+            "required_training_module_codes": data.get("required_training_module_codes") or [],
+            "required_assessment_codes": data.get("required_assessment_codes") or [],
+            # Store workbook competency IDs as specialty tags for reporting/search
+            # without making them a hard qualification blocker.
+            "required_specialty_tags": data.get("workbook_competency_ids") or [],
+            "practical_checklist_items": [
+                competency["description"]
+                for competency_id in data.get("workbook_competency_ids", [])
+                if (
+                    (competency := GENERATED_COMPETENCIES_BY_ID.get(competency_id))
+                    and competency.get("practical_assessment") == "Mandatory"
+                    and competency.get("description")
+                )
+            ][:20],
+            "is_active": True,
+        }
+        if package is None:
+            session.add(CarePackage(package_code=data["package_code"], **payload))
+            changed += 1
+            print(f"  + created workbook package {data['package_code']}")
+            continue
+
+        updated = False
+        for key, value in payload.items():
+            if getattr(package, key) != value:
+                setattr(package, key, value)
+                updated = True
+        if updated:
+            changed += 1
+            print(f"  + updated workbook package {data['package_code']}")
+        else:
+            print(f"  · workbook package {data['package_code']} already up to date")
+    return changed
 
 
 # ---------------------------------------------------------------------------
@@ -762,13 +1748,44 @@ TRAINING_MODULES = [
             },
         ]
     },
+    {
+        # Patch 2 — gates the IV_INFUSION service (required_training_module_codes
+        # in SERVICES above). Passing this assessment is what flips a
+        # worker's WorkerServiceQualification for IV_INFUSION to APPROVED
+        # via evaluate_and_upsert_qualifications_for_module.
+        "code": "IV_INFUSION_V1",
+        "title": "IV Infusion Administration & Monitoring",
+        "description": "Safe setup, administration, and monitoring of prescribed intravenous infusions in the home setting.",
+        "category": "Clinical Skills",
+        "duration_minutes": 30,
+        "is_mandatory": False,
+        "pass_percent": 70,
+        "required_for_tiers": ["tier2", "tier3", "tier4", "tier5"],
+        "assessment": [
+            {
+                "id": "iv1", "difficulty": 2, "type": "single_select",
+                "question": "Before starting a prescribed IV infusion at a home visit, the nurse's FIRST priority is to:",
+                "options": ["Start the infusion at the fastest safe rate to save time", "Verify the prescription, patient identity, and check the IV site/line for patency and signs of infection", "Skip the site check if the line was placed by another nurse", "Administer the infusion without gloves to save supplies"],
+                "correct_index": 1,
+                "explanation": "The 'rights' of medication administration (right patient, right drug, right dose, right route, right time) plus a patency/infection check of the access site come before starting any prescribed infusion."
+            },
+            {
+                "id": "iv2", "difficulty": 2, "type": "single_select",
+                "question": "During an IV infusion, the patient develops sudden breathlessness, chills, and a rise in temperature. The nurse should:",
+                "options": ["Slow the infusion slightly and continue monitoring for another hour", "Stop the infusion immediately, keep the line open with saline, assess vitals, and escalate per protocol", "Disconnect the line completely and leave the site uncovered", "Reassure the patient — this is a normal reaction to all infusions"],
+                "correct_index": 1,
+                "explanation": "Sudden breathlessness, chills and fever during an infusion are signs of a possible transfusion/infusion reaction or infection — stop the infusion, keep venous access open with saline, assess vitals, and escalate to the clinical escalation protocol immediately."
+            },
+        ]
+    },
 ]
 
 
 async def seed_training_modules(session) -> int:
     """Seed training modules with MCQ questions — idempotent."""
     created = 0
-    for data in TRAINING_MODULES:
+    for source in [*TRAINING_MODULES, *GENERATED_TRAINING_MODULES]:
+        data = dict(source)
         exists = await session.execute(
             select(TrainingModule).where(TrainingModule.code == data["code"])
         )
@@ -790,51 +1807,424 @@ async def seed_training_modules(session) -> int:
     return created
 
 
+async def seed_assessment_modules(session) -> int:
+    """Seed workbook assessment modules grouped from Questionnaire to Package."""
+    created = 0
+    for source in GENERATED_ASSESSMENT_MODULES:
+        data = dict(source)
+        exists = await session.execute(
+            select(AssessmentModule).where(AssessmentModule.code == data["code"])
+        )
+        if exists.scalar_one_or_none():
+            print(f"  · assessment module {data['code']} already exists, skipping")
+            continue
+        session.add(AssessmentModule(
+            code=data["code"],
+            title=data["title"],
+            description=data.get("description"),
+            pass_score=data.get("pass_score", 80),
+            questions=data.get("questions") or [],
+            linked_training_module_code=data.get("linked_training_module_code"),
+            questions_per_attempt=data.get("questions_per_attempt"),
+            status=ContentStatus.published,
+            is_active=True,
+            version=1,
+            published_version=1,
+        ))
+        created += 1
+        print(f"  + created assessment module {data['code']}")
+    return created
+
+
 FAQS = [
-    dict(audience="consumer", category="Bookings", question="How do I book a nurse?",
-         answer="Go to Bookings → New Booking and fill in the details.", display_order=1),
-    dict(audience="consumer", category="Bookings", question="Can I cancel a booking?",
-         answer="Yes, you can cancel up to 2 hours before the scheduled time.", display_order=2),
-    dict(audience="consumer", category="Patients", question="How do I add a patient?",
-         answer="Go to Patients → Add Patient and fill in the form.", display_order=3),
-    dict(audience="consumer", category="Trust & Safety", question="How are nurses verified?",
-         answer="All nurses are background-checked and licensed before onboarding.", display_order=4),
-    dict(audience="consumer", category="Bookings", question="How do I contact my nurse?",
-         answer="Open your booking and use the in-app message button to reach your nurse once they've accepted the visit.", display_order=5),
-    dict(audience="consumer", category="Billing", question="What payment methods are accepted?",
-         answer="Cards, UPI, and net banking via Razorpay. Payment is collected after you confirm a booking.", display_order=6),
-    dict(audience="worker", category="Assignments", question="How do I claim a booking?",
-         answer="Open Assignments and tap Claim on any open booking. The first nurse to claim wins it — claims are first-come, first-served.", display_order=1),
-    dict(audience="worker", category="Training", question="Why can't I claim higher-tier bookings?",
-         answer="Higher-tier and specialised bookings require passing the relevant training assessment first. Check Training & Certifications for what's required.", display_order=2),
-    dict(audience="worker", category="Payments", question="When do I get paid?",
-         answer="Payouts are processed in batches after a visit is marked complete. Check Earnings for your payout history and status.", display_order=3),
-    dict(audience="worker", category="Account", question="How do I go online/offline?",
-         answer="Use the availability toggle on your home screen. You must be an approved nurse/caregiver to go online.", display_order=4),
-    dict(audience="all", category="Account", question="How do I reset my password?",
-         answer="Use 'Forgot password' on the login screen — you'll get a reset code by email.", display_order=1),
+    dict(
+        audience="consumer", category="Bookings", question="How do I book a nurse?",
+        answer=(
+            "Go to Bookings → New Booking, pick a care package and the patient it's for, then "
+            "choose a date, time, and address. Once you confirm and pay, we start matching you "
+            "with a verified nurse nearby."
+        ),
+        display_order=1,
+    ),
+    dict(
+        audience="consumer", category="Bookings", question="Can I cancel a booking?",
+        answer=(
+            "Yes — open the booking from your Visits tab and tap Cancel booking. Cancelling 6+ "
+            "hours before the visit gets a full refund; closer to the visit time a partial fee "
+            "may apply, and it's shown to you before you confirm."
+        ),
+        display_order=2,
+    ),
+    dict(
+        audience="consumer", category="Patients", question="How do I add a patient?",
+        answer=(
+            "Go to Profile → Patients → Add patient and fill in their name, age, and any "
+            "relevant medical notes. You can add more than one patient and pick who you're "
+            "booking for each time."
+        ),
+        display_order=3,
+    ),
+    dict(
+        audience="consumer", category="Trust & Safety", question="How are nurses verified?",
+        answer=(
+            "Every nurse passes identity, background, and document checks before taking any "
+            "booking, and is tiered by skill level — so specialised care only goes to someone "
+            "trained for it."
+        ),
+        display_order=4,
+    ),
+    dict(
+        audience="consumer", category="Bookings", question="How do I contact my nurse?",
+        answer=(
+            "Once a nurse accepts your visit, open the booking from Visits — chat and call "
+            "buttons appear there. Calls go through the app, so your personal number stays "
+            "private."
+        ),
+        display_order=5,
+    ),
+    dict(
+        audience="consumer", category="Billing", question="What payment methods are accepted?",
+        answer=(
+            "UPI, debit/credit cards, net banking, and popular wallets, all processed securely "
+            "via Razorpay. Receipts for every payment are under Profile → Payments."
+        ),
+        display_order=6,
+    ),
+    dict(
+        audience="consumer", category="Billing", question="What if I'm not happy with a visit?",
+        answer=(
+            "Rate the visit from your Visits tab once it's complete, or raise a request from "
+            "Help & support any time. Our team reviews it and can arrange a repeat visit or "
+            "refund."
+        ),
+        display_order=7,
+    ),
+    dict(
+        audience="worker", category="Assignments", question="How do I claim a booking?",
+        answer=(
+            "Open Assignments and tap Claim on any open booking matching your tier and "
+            "location. Claims are first-come, first-served, so turn on notifications to catch "
+            "new ones quickly."
+        ),
+        display_order=1,
+    ),
+    dict(
+        audience="worker", category="Training", question="Why can't I claim higher-tier bookings?",
+        answer=(
+            "Specialised bookings like wound care or post-op shifts need the matching training "
+            "module and assessment done first. Check Training & Certifications on your profile "
+            "to see what's next."
+        ),
+        display_order=2,
+    ),
+    dict(
+        audience="worker", category="Payments", question="When do I get paid?",
+        answer=(
+            "Payouts process after each visit is marked complete and reviewed, usually settling "
+            "within a few business days. Go to Earnings for a running total and payout status."
+        ),
+        display_order=3,
+    ),
+    dict(
+        audience="worker", category="Account", question="How do I go online/offline?",
+        answer=(
+            "Use the availability toggle on your home screen. It unlocks once your account is "
+            "fully approved — identity, documents, and any required training verified."
+        ),
+        display_order=4,
+    ),
+    dict(
+        audience="all", category="Account", question="How do I reset my password?",
+        answer=(
+            "Tap 'Forgot password?' on the sign-in screen and enter your email for a reset "
+            "code. If you sign in with a mobile OTP instead, you won't need a password at all."
+        ),
+        display_order=1,
+    ),
 ]
 
 
 async def seed_faqs(session) -> int:
-    """Seed default help-center FAQs — idempotent (matches on question text)."""
+    """Seed default help-center FAQs — idempotent. Matches on question +
+    audience + is_active=True, so an old inactive duplicate row from before
+    this fix never causes 'Multiple rows were found' and never blocks a
+    fresh active row from being (re)created.
+    """
     created = 0
+
     for data in FAQS:
         exists = await session.execute(
-            select(Faq).where(Faq.question == data["question"], Faq.audience == data["audience"])
+            select(Faq).where(
+                Faq.question == data["question"],
+                Faq.audience == data["audience"],
+                Faq.is_active.is_(True),
+            )
         )
+
         if exists.scalar_one_or_none():
             continue
+
         session.add(Faq(**data, is_active=True))
         created += 1
+
     if created:
         print(f"  + created {created} FAQ entries")
+
     return created
+
+
+async def _run_pending_column_migrations():
+    """Small, safe, idempotent ALTER TABLE fixes that must run before the app
+    serves traffic. Each statement uses IF NOT EXISTS / WHERE-guarded UPDATE,
+    so re-running on every startup is harmless.
+
+    NOTE: this is the *only* place additive schema changes get applied
+    automatically on deploy — the one-off add_*_schema.py scripts at the repo
+    root are NOT run automatically by anything (Procfile/eb-engine just start
+    the web process). Historically that meant a schema change could ship in
+    the code, the standalone script would only get run manually/by hand, and
+    if that manual step was skipped the corresponding table/column would
+    simply not exist in production even though the ORM models and API code
+    assumed it did — 500s on every request that touched it, with no
+    application-level fix required, just the missing DDL. To close that gap
+    for good, every add_*_schema.py migration's statements are folded into
+    this function (each one still IF NOT EXISTS / additive, matching the
+    ORM models in app/models/models.py exactly) so a normal deploy is always
+    enough — no manual SSH + script step required ever again."""
+    from sqlalchemy import text
+
+    async with engine.begin() as conn:
+        await conn.execute(text(
+            "ALTER TABLE bookings ADD COLUMN IF NOT EXISTS dispatch_started_at TIMESTAMPTZ NULL"
+        ))
+        await conn.execute(text(
+            "UPDATE bookings SET dispatch_started_at = created_at "
+            "WHERE dispatch_started_at IS NULL AND status NOT IN ('draft', 'pending_payment')"
+        ))
+    print("Column migrations: bookings.dispatch_started_at ensured")
+
+    # ---- from add_contracts_schema.py ----------------------------------
+    async with engine.begin() as conn:
+        await conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS worker_agreements (
+                id UUID PRIMARY KEY,
+                worker_id UUID NOT NULL REFERENCES worker_profiles(id) ON DELETE CASCADE,
+                stage INTEGER NOT NULL,
+                status VARCHAR(30) NOT NULL DEFAULT 'pending',
+                provider_type_snapshot VARCHAR(50) NOT NULL,
+                rendered_text TEXT NOT NULL,
+                template_version VARCHAR(20) NOT NULL DEFAULT 'v1',
+                accepted_at TIMESTAMPTZ,
+                otp_verified BOOLEAN NOT NULL DEFAULT false,
+                ip_address VARCHAR(64),
+                esign_provider VARCHAR(50),
+                esign_reference_id VARCHAR(255),
+                esign_document_url TEXT,
+                onboarding_fee_deducted BOOLEAN NOT NULL DEFAULT false,
+                voided_at TIMESTAMPTZ,
+                void_reason TEXT,
+                created_at TIMESTAMPTZ DEFAULT now()
+            )
+        """))
+        await conn.execute(text(
+            "CREATE INDEX IF NOT EXISTS ix_worker_agreements_worker_stage ON worker_agreements(worker_id, stage)"
+        ))
+        await conn.execute(text(
+            "ALTER TABLE worker_documents ADD COLUMN IF NOT EXISTS ocr_extracted_name VARCHAR(255)"
+        ))
+        await conn.execute(text(
+            "ALTER TABLE worker_documents ADD COLUMN IF NOT EXISTS ocr_extracted_registration_no VARCHAR(100)"
+        ))
+        await conn.execute(text(
+            "ALTER TABLE worker_documents ADD COLUMN IF NOT EXISTS ocr_confidence NUMERIC(4,3)"
+        ))
+        await conn.execute(text(
+            "ALTER TABLE worker_documents ADD COLUMN IF NOT EXISTS ocr_raw_text TEXT"
+        ))
+    print("Column migrations: worker_agreements + worker_documents OCR columns ensured")
+
+    # ---- from add_digio_esign_schema.py ---------------------------------
+    async with engine.begin() as conn:
+        await conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS worker_esign_sessions (
+                id UUID PRIMARY KEY,
+                worker_id UUID NOT NULL REFERENCES worker_profiles(id) ON DELETE CASCADE,
+                stage INTEGER NOT NULL DEFAULT 2,
+                provider VARCHAR(50) NOT NULL DEFAULT 'digio',
+                status VARCHAR(20) NOT NULL DEFAULT 'created',
+                digio_document_id VARCHAR(255),
+                sign_url TEXT,
+                rendered_text TEXT NOT NULL,
+                template_version VARCHAR(20) NOT NULL,
+                last_provider_payload JSONB,
+                failure_reason TEXT,
+                signed_at TIMESTAMPTZ,
+                expires_at TIMESTAMPTZ,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+            )
+        """))
+        await conn.execute(text(
+            "CREATE INDEX IF NOT EXISTS ix_worker_esign_sessions_worker_stage ON worker_esign_sessions(worker_id, stage)"
+        ))
+        await conn.execute(text(
+            "CREATE INDEX IF NOT EXISTS ix_worker_esign_sessions_digio_document_id ON worker_esign_sessions(digio_document_id)"
+        ))
+        await conn.execute(text(
+            "CREATE INDEX IF NOT EXISTS ix_worker_esign_sessions_status ON worker_esign_sessions(status)"
+        ))
+    print("Table migrations: worker_esign_sessions ensured")
+
+    # ---- from add_availability_slots_and_alertness_schema.py ----------
+    async with engine.begin() as conn:
+        await conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS worker_availability_slots (
+                id UUID PRIMARY KEY,
+                worker_id UUID NOT NULL REFERENCES worker_profiles(id) ON DELETE CASCADE,
+                day_of_week SMALLINT NOT NULL,
+                start_time TIME NOT NULL,
+                end_time TIME NOT NULL,
+                is_active BOOLEAN NOT NULL DEFAULT true,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+            )
+        """))
+        await conn.execute(text(
+            "CREATE INDEX IF NOT EXISTS ix_worker_availability_slots_worker_day "
+            "ON worker_availability_slots (worker_id, day_of_week)"
+        ))
+        await conn.execute(text("""
+            DO $$ BEGIN
+                ALTER TABLE worker_availability_slots
+                ADD CONSTRAINT ck_availability_slot_day_of_week
+                CHECK (day_of_week BETWEEN 0 AND 6);
+            EXCEPTION
+                WHEN duplicate_object THEN NULL;
+            END $$;
+        """))
+        await conn.execute(text("""
+            DO $$ BEGIN
+                ALTER TABLE worker_availability_slots
+                ADD CONSTRAINT ck_availability_slot_end_after_start
+                CHECK (end_time > start_time);
+            EXCEPTION
+                WHEN duplicate_object THEN NULL;
+            END $$;
+        """))
+        await conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS worker_alertness_checks (
+                id UUID PRIMARY KEY,
+                worker_id UUID NOT NULL REFERENCES worker_profiles(id) ON DELETE CASCADE,
+                booking_id UUID NULL REFERENCES bookings(id) ON DELETE SET NULL,
+                round_reaction_times_ms INTEGER[],
+                average_reaction_time_ms INTEGER,
+                missed_taps INTEGER NOT NULL DEFAULT 0,
+                passed BOOLEAN NOT NULL,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+            )
+        """))
+        await conn.execute(text(
+            "CREATE INDEX IF NOT EXISTS ix_worker_alertness_checks_worker_created "
+            "ON worker_alertness_checks (worker_id, created_at)"
+        ))
+    print("Column migrations: worker_availability_slots + worker_alertness_checks ensured")
+
+    # ---- from add_eprescription_and_payout_approval_schema.py ---------
+    async with engine.begin() as conn:
+        await conn.execute(text("""
+            DO $$ BEGIN
+                CREATE TYPE tele_consultation_stage AS ENUM
+                    ('waiting', 'diet_review', 'patient_assessment', 'prescription', 'completed');
+            EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+        """))
+        await conn.execute(text("""
+            DO $$ BEGIN
+                CREATE TYPE payout_approval_status AS ENUM
+                    ('pending_approval', 'approved', 'rejected');
+            EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+        """))
+        await conn.execute(text("""
+            ALTER TABLE worker_profiles
+            ADD COLUMN IF NOT EXISTS signature_url TEXT NULL,
+            ADD COLUMN IF NOT EXISTS signature_public_id TEXT NULL,
+            ADD COLUMN IF NOT EXISTS signature_uploaded_at TIMESTAMPTZ NULL
+        """))
+        await conn.execute(text("""
+            ALTER TABLE prescriptions
+            ADD COLUMN IF NOT EXISTS is_doctor_generated BOOLEAN NOT NULL DEFAULT false,
+            ADD COLUMN IF NOT EXISTS issued_by_worker_id UUID NULL REFERENCES worker_profiles(id),
+            ADD COLUMN IF NOT EXISTS diet_notes TEXT NULL,
+            ADD COLUMN IF NOT EXISTS patient_issues TEXT NULL,
+            ADD COLUMN IF NOT EXISTS signature_url TEXT NULL,
+            ADD COLUMN IF NOT EXISTS pdf_url TEXT NULL,
+            ADD COLUMN IF NOT EXISTS pdf_public_id TEXT NULL,
+            ADD COLUMN IF NOT EXISTS verification_hash VARCHAR(64) NULL,
+            ADD COLUMN IF NOT EXISTS qr_code_url TEXT NULL
+        """))
+        await conn.execute(text(
+            "CREATE INDEX IF NOT EXISTS ix_prescriptions_is_doctor_generated ON prescriptions (is_doctor_generated)"
+        ))
+        await conn.execute(text(
+            "CREATE INDEX IF NOT EXISTS ix_prescriptions_verification_hash ON prescriptions (verification_hash)"
+        ))
+        await conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS tele_consultations (
+                id UUID PRIMARY KEY,
+                booking_id UUID NOT NULL UNIQUE REFERENCES bookings(id) ON DELETE CASCADE,
+                doctor_worker_id UUID NOT NULL REFERENCES worker_profiles(id),
+                patient_id UUID NOT NULL REFERENCES patients(id),
+                stage tele_consultation_stage NOT NULL DEFAULT 'waiting',
+                diet_notes TEXT NULL,
+                patient_issues TEXT NULL,
+                patient_all_okay BOOLEAN NULL,
+                prescription_id UUID NULL REFERENCES prescriptions(id),
+                started_at TIMESTAMPTZ NULL,
+                diet_reviewed_at TIMESTAMPTZ NULL,
+                patient_assessed_at TIMESTAMPTZ NULL,
+                completed_at TIMESTAMPTZ NULL,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+            )
+        """))
+        await conn.execute(text(
+            "CREATE INDEX IF NOT EXISTS ix_tele_consultations_doctor_stage ON tele_consultations (doctor_worker_id, stage)"
+        ))
+        await conn.execute(text(
+            "CREATE INDEX IF NOT EXISTS ix_tele_consultations_stage ON tele_consultations (stage)"
+        ))
+        await conn.execute(text("""
+            ALTER TABLE worker_payouts
+            ADD COLUMN IF NOT EXISTS approval_status payout_approval_status NOT NULL DEFAULT 'pending_approval',
+            ADD COLUMN IF NOT EXISTS approved_by UUID NULL REFERENCES users(id),
+            ADD COLUMN IF NOT EXISTS approved_at TIMESTAMPTZ NULL,
+            ADD COLUMN IF NOT EXISTS approval_rejection_reason TEXT NULL
+        """))
+        await conn.execute(text(
+            "CREATE INDEX IF NOT EXISTS ix_worker_payouts_approval_status ON worker_payouts (approval_status)"
+        ))
+        await conn.execute(text("""
+            UPDATE worker_payouts
+            SET approval_status = 'approved', approved_at = COALESCE(paid_at, now())
+            WHERE status = 'paid' AND approval_status = 'pending_approval'
+        """))
+        await conn.execute(text(
+            "ALTER TABLE worker_agreements ADD COLUMN IF NOT EXISTS onboarding_fee_collected NUMERIC(6,2) NOT NULL DEFAULT 0"
+        ))
+        await conn.execute(text("""
+            UPDATE worker_agreements
+            SET onboarding_fee_collected = 200.00
+            WHERE onboarding_fee_deducted = true AND onboarding_fee_collected = 0
+        """))
+    print("Column migrations: tele_consultations, payout approval gate, e-prescription columns ensured")
 
 
 async def main():
     print("NurseConnect seed runner")
     print("=" * 50)
+
+    print("\nRunning pending column migrations...")
+    await _run_pending_column_migrations()
+
     async with AsyncSessionLocal() as session:
         print("\nSeeding services...")
         services_created = await seed_services(session)
@@ -845,14 +2235,140 @@ async def main():
         print("\nSeeding training modules...")
         training_created = await seed_training_modules(session)
 
+        print("\nSeeding workbook assessment modules...")
+        assessments_created = await seed_assessment_modules(session)
+
+        print("\nUpserting workbook care-package eligibility mapping...")
+        workbook_packages_changed = await seed_workbook_package_requirements(session)
+
         print("\nSeeding FAQs...")
         faqs_created = await seed_faqs(session)
 
+        print("\nSeeding in-visit questionnaires (checklist templates)...")
+        checklists_created = await seed_checklist_templates(session)
+
+        print("\nLinking checklist templates onto services...")
+        checklists_linked = await link_service_checklists(session)
+
+        print("\nLinking checklist templates onto care packages...")
+        checklists_linked += await link_package_checklists(session)
+
         await session.commit()
 
+        # Cleanup: remove stale package-level WorkerServiceQualification rows
+        # left over from before sync_tier_qualifications was restricted to
+        # services only. That older tier-sync pass also iterated CarePackage
+        # rows and stamped qualification_source=TIER on whatever it
+        # auto-created for them (including admin-gated packages, wrongly
+        # pre-parking them at QUALIFIED_PENDING_APPROVAL instead of leaving
+        # them unrequested). It no longer runs against packages, but on a
+        # persistent DB those old rows are still sitting there, so an
+        # admin-gated package like POST_OP_CARE_7D wrongly resolves to
+        # ADMIN_APPROVAL_REQUIRED instead of QUALIFICATION_RECORD_MISSING.
+        # qualification_source=TIER is a safe, unambiguous signature for
+        # "created by that old bug": a genuinely worker-requested package
+        # qualification (POST /workers/me/service-qualification-requests)
+        # is always source=ADMIN_APPROVAL, never TIER — so this only ever
+        # removes rows the old bug created, never a real request. Scoped to
+        # admin-gated packages only (today: POST_OP_CARE_7D) — a stale TIER
+        # row on a NON-admin-gated package is harmless (the
+        # has_configured_requirements exception in is_worker_qualified_for_
+        # service already treats those as qualified regardless), so there's
+        # no reason to touch rows outside the one category the old bug
+        # actually got wrong.
+        print("\nCleaning up stale package qualification rows from the old tier-sync bug...")
+        admin_gated_pkg_ids = select(CarePackage.id).where(
+            CarePackage.requires_admin_skill_approval.is_(True)
+        )
+        try:
+            stale_del = await session.execute(
+                delete(WorkerServiceQualification)
+                .where(
+                    WorkerServiceQualification.package_id.in_(admin_gated_pkg_ids),
+                    WorkerServiceQualification.qualification_source == WorkerQualificationSource.TIER,
+                )
+                .execution_options(synchronize_session=False)
+            )
+            await session.commit()
+            print(f"  + removed {stale_del.rowcount} stale package qualification row(s)")
+        except Exception as e:
+            # Never let this one cleanup step take down the rest of the
+            # seed run (worker reactivation / qualification backfill below
+            # are independent and must still run even if this fails).
+            await session.rollback()
+            print(f"  ! stale qualification cleanup failed, skipping: {e}")
+
+        # Backfill: reactivate any worker whose User row is still stuck on
+        # UserStatus.onboarding despite WorkerProfile.onboarding_status
+        # already being approved. This happens for any worker created via
+        # the dev-mode phone-login shortcut (app/api/v1/auth.py
+        # _ensure_role_profile) *before* that path was fixed to also flip
+        # User.status — on a fresh/CI database there are no such rows, but
+        # on a persistent local/dev database a worker created under the
+        # old code stays permanently WORKER_INACTIVE (is_worker_qualified_
+        # for_service) even after the app code is fixed, because that fix
+        # only ever runs at first-time WorkerProfile creation, never on
+        # existing rows. Safe to re-run — it only ever moves onboarding ->
+        # active for a worker already marked approved.
+        print("\nReactivating approved workers stuck on User.status=onboarding...")
+        ures = await session.execute(
+            select(WorkerProfile).where(
+                WorkerProfile.onboarding_status == WorkerOnboardingStatus.approved
+            )
+        )
+        approved_worker_ids = [w.user_id for w in ures.scalars().all()]
+        reactivated = 0
+        if approved_worker_ids:
+            uwres = await session.execute(
+                select(User).where(
+                    User.id.in_(approved_worker_ids),
+                    User.status == UserStatus.onboarding,
+                )
+            )
+            for u in uwres.scalars().all():
+                u.status = UserStatus.active
+                reactivated += 1
+            await session.commit()
+        print(f"  + reactivated {reactivated} worker user(s)")
+
+        # Backfill the tier -> qualification bridge for workers who were
+        # already APPROVED before a service existed (e.g. a new service was
+        # just added above). Without this, an already-approved worker's
+        # eligibility for the new service stays NOT_QUALIFIED /
+        # QUALIFICATION_RECORD_MISSING until someone re-runs
+        # sync_tier_qualifications for them. Safe to re-run — it only
+        # unlocks what the worker's real tier/training/certificates already
+        # qualify them for. See backfill_worker_qualifications.py.
+        print("\nBackfilling tier qualifications for already-approved workers...")
+        wres = await session.execute(
+            select(WorkerProfile).where(
+                WorkerProfile.onboarding_status == WorkerOnboardingStatus.approved
+            )
+        )
+        approved_workers = wres.scalars().all()
+        qualifications_synced = 0
+        for worker in approved_workers:
+            updated = await sync_tier_qualifications(session, worker)
+            qualifications_synced += len(updated)
+        await session.commit()
+        print(
+            f"  + synced {qualifications_synced} qualification row(s) across "
+            f"{len(approved_workers)} approved worker(s)"
+        )
+
     print("\n" + "=" * 50)
-    print(f"Done. {services_created} services, {packages_created} packages, {training_created} training modules, {faqs_created} FAQs created.")
-    if services_created == 0 and packages_created == 0 and training_created == 0 and faqs_created == 0:
+    print(
+        f"Done. {services_created} services, {packages_created} packages, "
+        f"{training_created} training modules, {assessments_created} assessments, "
+        f"{workbook_packages_changed} workbook package mappings, {faqs_created} FAQs, "
+        f"{checklists_created} checklist templates created, "
+        f"{checklists_linked} service-checklist links created."
+    )
+    if (
+        services_created == 0 and packages_created == 0 and training_created == 0
+        and assessments_created == 0 and workbook_packages_changed == 0
+        and faqs_created == 0 and checklists_created == 0 and checklists_linked == 0
+    ):
         print("(Everything already existed — database was already seeded.)")
 
     await engine.dispose()
