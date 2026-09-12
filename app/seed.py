@@ -2043,6 +2043,38 @@ async def _run_pending_column_migrations():
         ))
     print("Column migrations: worker_agreements + worker_documents OCR columns ensured")
 
+    # ---- from add_digio_esign_schema.py ---------------------------------
+    async with engine.begin() as conn:
+        await conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS worker_esign_sessions (
+                id UUID PRIMARY KEY,
+                worker_id UUID NOT NULL REFERENCES worker_profiles(id) ON DELETE CASCADE,
+                stage INTEGER NOT NULL DEFAULT 2,
+                provider VARCHAR(50) NOT NULL DEFAULT 'digio',
+                status VARCHAR(20) NOT NULL DEFAULT 'created',
+                digio_document_id VARCHAR(255),
+                sign_url TEXT,
+                rendered_text TEXT NOT NULL,
+                template_version VARCHAR(20) NOT NULL,
+                last_provider_payload JSONB,
+                failure_reason TEXT,
+                signed_at TIMESTAMPTZ,
+                expires_at TIMESTAMPTZ,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+            )
+        """))
+        await conn.execute(text(
+            "CREATE INDEX IF NOT EXISTS ix_worker_esign_sessions_worker_stage ON worker_esign_sessions(worker_id, stage)"
+        ))
+        await conn.execute(text(
+            "CREATE INDEX IF NOT EXISTS ix_worker_esign_sessions_digio_document_id ON worker_esign_sessions(digio_document_id)"
+        ))
+        await conn.execute(text(
+            "CREATE INDEX IF NOT EXISTS ix_worker_esign_sessions_status ON worker_esign_sessions(status)"
+        ))
+    print("Table migrations: worker_esign_sessions ensured")
+
     # ---- from add_availability_slots_and_alertness_schema.py ----------
     async with engine.begin() as conn:
         await conn.execute(text("""

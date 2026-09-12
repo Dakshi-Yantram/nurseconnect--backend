@@ -11,6 +11,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
+from app.core.provider_types import is_physical_capable, is_tele_capable
 from app.core.deps import (
     CurrentUser,
     get_consumer_profile,
@@ -359,6 +360,16 @@ async def new_requests(profile: WorkerProfile = Depends(get_worker_profile), db:
     # neither a fresh current location nor a home location on file.
     worker_origin = effective_origin_for_worker(profile)
 
+    # Tele-only providers (Tele-Doctor) never travel to the patient, so
+    # "how far away is this booking" is a meaningless question for them —
+    # applying it anyway would silently hide teleconsultation bookings from
+    # the one provider type that exists to take them, since a remote doctor
+    # can never be "near" any address. `is_tele_capable and not
+    # is_physical_capable` is true only for tele_doctor: the legacy generic
+    # `doctor` type is both, so it keeps today's geography-based behaviour
+    # unless/until it's explicitly re-typed to tele_doctor.
+    worker_is_tele_only = is_tele_capable(profile.worker_type) and not is_physical_capable(profile.worker_type)
+
     visible: list[tuple[Booking, Optional[float]]] = []
     svc_cache: dict = {}
     pkg_cache: dict = {}
@@ -397,34 +408,39 @@ async def new_requests(profile: WorkerProfile = Depends(get_worker_profile), db:
             wave_dirty.append(b)
 
         # ----- Patch 3 — proximity / wave radius filter ----------------------
-        radius_km = radius_for_wave(b.assignment_wave or 1, b.is_urgent)
+        # Skipped entirely for tele-only providers: waves and radii exist to
+        # progressively widen a PHYSICAL search area, which has no meaning
+        # for a video consultation. A tele-doctor sees every otherwise-
+        # eligible booking regardless of the patient's address.
         distance_km: Optional[float] = None
-        if radius_km is None:
-            # Past last wave → escalated. Do not show to workers; admin handles.
-            continue
+        if not worker_is_tele_only:
+            radius_km = radius_for_wave(b.assignment_wave or 1, b.is_urgent)
+            if radius_km is None:
+                # Past last wave → escalated. Do not show to workers; admin handles.
+                continue
 
-        booking_has_coords = b.latitude is not None and b.longitude is not None
-        if booking_has_coords and worker_origin is not None:
-            distance_km = haversine_km(
-                worker_origin[0], worker_origin[1], b.latitude, b.longitude
-            )
-            if distance_km > radius_km:
-                continue
-        elif booking_has_coords and worker_origin is None:
-            # Worker has no fresh-or-home coordinates: per spec, urgent jobs
-            # must NOT be shown. For normal jobs we fall back to city match.
-            if b.is_urgent:
-                continue
-            addr_city = (b.address_snapshot or {}).get("city") if isinstance(b.address_snapshot, dict) else None
-            if profile.base_city and addr_city and profile.base_city != addr_city:
-                continue
-        # If booking has no lat/lng we fall back to city/zone match as well.
-        elif not booking_has_coords:
-            addr_city = (b.address_snapshot or {}).get("city") if isinstance(b.address_snapshot, dict) else None
-            if profile.base_city and addr_city and profile.base_city != addr_city:
-                continue
-            if b.is_urgent and worker_origin is None:
-                continue
+            booking_has_coords = b.latitude is not None and b.longitude is not None
+            if booking_has_coords and worker_origin is not None:
+                distance_km = haversine_km(
+                    worker_origin[0], worker_origin[1], b.latitude, b.longitude
+                )
+                if distance_km > radius_km:
+                    continue
+            elif booking_has_coords and worker_origin is None:
+                # Worker has no fresh-or-home coordinates: per spec, urgent jobs
+                # must NOT be shown. For normal jobs we fall back to city match.
+                if b.is_urgent:
+                    continue
+                addr_city = (b.address_snapshot or {}).get("city") if isinstance(b.address_snapshot, dict) else None
+                if profile.base_city and addr_city and profile.base_city != addr_city:
+                    continue
+            # If booking has no lat/lng we fall back to city/zone match as well.
+            elif not booking_has_coords:
+                addr_city = (b.address_snapshot or {}).get("city") if isinstance(b.address_snapshot, dict) else None
+                if profile.base_city and addr_city and profile.base_city != addr_city:
+                    continue
+                if b.is_urgent and worker_origin is None:
+                    continue
 
         # Only surface bookings the worker is actually free for.
         if await worker_has_schedule_conflict(db, profile.id, b):

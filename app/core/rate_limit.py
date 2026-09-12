@@ -39,7 +39,7 @@ def _throttling_disabled() -> bool:
     test in this repo exercises the throttling behaviour itself, so this is
     safe to skip outside of real deployments.
     """
-    return bool(settings.OTP_DEV_MODE)
+    return bool(settings.otp_dev_mode)
 
 
 def client_ip(request: Request) -> str:

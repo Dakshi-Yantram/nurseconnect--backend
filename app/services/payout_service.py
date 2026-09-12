@@ -147,6 +147,13 @@ async def create_payout_for_booking(db: AsyncSession, booking: Booking) -> Optio
     # one-shot ₹200 hit on booking #1.
     await apply_onboarding_fee_increment(db, booking.worker_id, payout)
 
+    # Recover any customer cash the provider is still holding from cash
+    # bookings. Runs AFTER the onboarding fee deliberately: the onboarding
+    # fee is a small fixed installment, whereas cash recovery can consume
+    # the entire payout, and taking it first would starve the fee
+    # indefinitely for a provider working mostly cash bookings.
+    await apply_cash_recovery(db, booking.worker_id, payout)
+
     return payout
 
 
@@ -243,7 +250,27 @@ async def build_payout_breakdown(db: AsyncSession, payout: WorkerPayout):
     # when the payout was created. Surface it as an explicit deduction line so
     # the statement's arithmetic visibly reconciles to the stored net_amount.
     expected_net = _money(breakdown.worker_gross - breakdown.total_deductions)
-    recovered = _money(expected_net - Decimal(payout.net_amount))
+    gap = _money(expected_net - Decimal(payout.net_amount))
+
+    # Cash recovery also reduces net_amount, so the gap is no longer
+    # attributable to the e-stamp advance alone. Split it out first using the
+    # amount actually recorded on the payout — otherwise cash the provider
+    # collected would appear on their statement as an "E-Stamp Advance
+    # Recovery", which is simply the wrong explanation for where their money
+    # went.
+    cash_recovered = _money(Decimal(payout.cash_recovered or 0))
+    if cash_recovered > 0:
+        deductions.append(
+            Deduction(
+                code="cash_recovery",
+                label="Cash collected at visit (recovered)",
+                amount=cash_recovered,
+                note="Customer paid you in cash; that amount is netted off here.",
+            )
+        )
+        gap = _money(gap - cash_recovered)
+
+    recovered = gap
     if recovered > 0:
         agreement = await _stage2_agreement(db, payout.worker_id)
         note = None
@@ -266,6 +293,10 @@ async def build_payout_breakdown(db: AsyncSession, payout: WorkerPayout):
                 note=note,
             )
         )
+        breakdown = breakdown.with_deductions(deductions)
+    elif cash_recovered > 0:
+        # No e-stamp instalment on this payout, but a cash recovery line was
+        # added above and still has to reach the statement.
         breakdown = breakdown.with_deductions(deductions)
 
     return breakdown
@@ -555,3 +586,96 @@ async def process_payout(db: AsyncSession, payout: WorkerPayout) -> dict:
     in release_payout().
     """
     return await release_payout(db, payout)
+
+
+async def apply_cash_recovery(
+    db: AsyncSession, worker_id: UUID, payout: WorkerPayout
+) -> Optional[Decimal]:
+    """Net off cash this provider collected at a visit but hasn't remitted.
+
+    On a cash booking the provider physically takes the customer's full
+    payment at the door. That money is the company's — the provider is owed
+    only their fee. Without this, a provider working cash bookings would be
+    paid their fee *while still holding* the customer's payment, i.e. paid
+    twice, and the company's cash would never come back.
+
+    Recovery works by offset: we deduct from this payout and mark the
+    corresponding bookings remitted, oldest first, so the same cash can
+    never be recovered twice. A booking is only ever marked remitted for
+    the portion actually recovered — partial recovery leaves the remainder
+    outstanding for the next payout rather than writing it off.
+
+    Mirrors apply_onboarding_fee_increment: clamps to the payout's
+    net_amount so a payout can never go negative, and spreads across
+    successive payouts when one payout cannot absorb the whole balance.
+
+    No-op (returns None) when the provider holds no unremitted cash or this
+    payout's net_amount is already zero.
+    """
+    from app.models.enums import PaymentMethod
+
+    if payout.net_amount <= 0:
+        return None
+
+    # Oldest first: the longest-outstanding cash is recovered first.
+    res = await db.execute(
+        select(Booking)
+        .where(
+            Booking.payment_method == PaymentMethod.cash,
+            Booking.cash_collected_by == worker_id,
+            Booking.cash_collected_at.isnot(None),
+            Booking.cash_remitted_at.is_(None),
+        )
+        .order_by(Booking.cash_collected_at.asc())
+    )
+    outstanding = list(res.scalars().all())
+    if not outstanding:
+        return None
+
+    budget = _money(payout.net_amount)
+    recovered = Decimal("0")
+    now = datetime.now(timezone.utc)
+
+    for booking in outstanding:
+        if budget <= 0:
+            break
+        held = _money(Decimal(booking.cash_collected_amount or 0))
+        if held <= 0:
+            continue
+        if held <= budget:
+            # Fully recovered — this booking's cash is now settled.
+            booking.cash_remitted_at = now
+            budget = _money(budget - held)
+            recovered = _money(recovered + held)
+        else:
+            # This payout cannot absorb the whole booking. Recover what we
+            # can and leave the rest outstanding: reducing the recorded
+            # collected amount would falsify what the customer actually
+            # paid, so instead we take the partial amount and leave
+            # cash_remitted_at unset for the next payout to finish.
+            partial = budget
+            booking.cash_collected_amount = _money(held - partial)
+            recovered = _money(recovered + partial)
+            budget = Decimal("0")
+
+    if recovered <= 0:
+        return None
+
+    payout.net_amount = _money(payout.net_amount - recovered)
+    payout.cash_recovered = _money(Decimal(payout.cash_recovered or 0) + recovered)
+
+    await post_ledger_entry(
+        db,
+        LedgerEntryType.payment_collected,
+        recovered,
+        booking_id=payout.booking_id,
+        worker_id=worker_id,
+        debit_account="company_bank",
+        credit_account="cash_in_hand_provider",
+        description=(
+            f"Cash recovered by offset against payout for booking {payout.booking_id} "
+            f"(₹{recovered})"
+        ),
+    )
+    await db.flush()
+    return recovered

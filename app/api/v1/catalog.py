@@ -8,25 +8,86 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
 from app.core.deps import get_current_user
+from app.models.enums import WorkerType
 from app.models.models import CarePackage, ChecklistTemplate, ServiceCatalogue
 from app.schemas.schemas import CarePackageOut, PackageServiceSummary, ServiceOut
 
 router = APIRouter(tags=["catalog"])
 
 
+# ---------------------------------------------------------------------------
+# Provider-Type filtering.
+#
+# Both ServiceCatalogue and CarePackage already carry `allowed_provider_types`
+# and it is already enforced at qualification time
+# (app/services/qualification.py -> PROVIDER_TYPE_NOT_ALLOWED). What was
+# missing is the *discovery* half: every worker was shown the entire
+# catalogue and only found out a package didn't apply to them when they
+# tried to opt in. These helpers make the same rule drive what is listed,
+# so a Nurse sees Nurse packages, a Doctor sees Doctor packages, and so on.
+#
+# Deliberately additive: `provider_type` is an optional query param and
+# omitting it returns exactly what these endpoints returned before, so the
+# consumer-facing booking screens are unaffected.
+# ---------------------------------------------------------------------------
+def _matches_provider_type(offering, provider_type: Optional[WorkerType]) -> bool:
+    """True if this service/package is offered by the given provider type.
+
+    A NULL/empty `allowed_provider_types` means "no restriction" and matches
+    every provider type — that is the existing back-compat contract and is
+    what keeps pre-existing catalogue rows visible.
+    """
+    if provider_type is None:
+        return True
+    allowed = list(getattr(offering, "allowed_provider_types", None) or [])
+    if not allowed:
+        return True
+    return provider_type.value in allowed
+
+
+def _parse_provider_type(raw: Optional[str]) -> Optional[WorkerType]:
+    if raw is None or not str(raw).strip():
+        return None
+    try:
+        return WorkerType(str(raw).strip().lower())
+    except ValueError:
+        valid = ", ".join(t.value for t in WorkerType)
+        raise HTTPException(
+            status_code=422,
+            detail=f"Unknown provider_type '{raw}'. Expected one of: {valid}",
+        ) from None
+
+
 @router.get("/services", response_model=List[ServiceOut])
 async def list_services(
     category: Optional[str] = None,
     active_only: bool = True,
+    provider_type: Optional[str] = Query(
+        None,
+        description=(
+            "Only return services this Provider Type may deliver "
+            "(nurse | caregiver | doctor | dentist | physiotherapist | "
+            "mother_baby_caregiver). Omit for the full catalogue."
+        ),
+    ),
     db: AsyncSession = Depends(get_db),
 ):
+    ptype = _parse_provider_type(provider_type)
     conds = []
     if active_only:
         conds.append(ServiceCatalogue.is_active.is_(True))
     if category:
         conds.append(ServiceCatalogue.category == category)
     res = await db.execute(select(ServiceCatalogue).where(and_(*conds)) if conds else select(ServiceCatalogue))
-    return [ServiceOut.model_validate(s) for s in res.scalars().all()]
+    # Filtered in Python rather than SQL: allowed_provider_types is a
+    # nullable ARRAY and "NULL means unrestricted" does not express cleanly
+    # as an indexable predicate. The catalogue is small and already fully
+    # loaded here, so this costs nothing measurable.
+    return [
+        ServiceOut.model_validate(s)
+        for s in res.scalars().all()
+        if _matches_provider_type(s, ptype)
+    ]
 
 
 @router.get("/services/{service_id}", response_model=ServiceOut)
@@ -98,17 +159,27 @@ async def _care_packages_out(
 async def list_care_packages(
     city: Optional[str] = None,
     active_only: bool = True,
+    provider_type: Optional[str] = Query(
+        None,
+        description=(
+            "Only return packages this Provider Type may deliver, so a Nurse "
+            "sees Nurse packages, a Doctor sees Doctor packages, etc. "
+            "Omit for the full catalogue (consumer booking screens)."
+        ),
+    ),
     db: AsyncSession = Depends(get_db),
 ):
+    ptype = _parse_provider_type(provider_type)
     # Deleted packages never appear in any list — admin's active_only=false
     # is only meant to surface disabled-but-not-deleted packages.
     conds = [CarePackage.is_deleted.is_(False)]
     if active_only:
         conds.append(CarePackage.is_active.is_(True))
     res = await db.execute(select(CarePackage).where(and_(*conds)))
-    items = res.scalars().all()
+    items = list(res.scalars().all())
     if city:
         items = [p for p in items if not p.available_cities or city in p.available_cities]
+    items = [p for p in items if _matches_provider_type(p, ptype)]
     return await _care_packages_out(items, db)
 
 

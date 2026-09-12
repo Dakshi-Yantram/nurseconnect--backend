@@ -64,6 +64,25 @@ class Settings(BaseSettings):
     RAZORPAY_KEY_SECRET: str = ""
     RAZORPAY_WEBHOOK_SECRET: str = ""
 
+    # Digio — Aadhaar eSign on state e-Stamp paper for the Stage 2 Master
+    # Agreement (see app/integrations/providers.py::DigioClient and
+    # app/api/v1/contracts.py). CLIENT_ID/CLIENT_SECRET authenticate our
+    # server to Digio's API; WEBHOOK_SECRET verifies that a completion
+    # notification actually came from Digio rather than being forged by a
+    # client that wants Stage 2 marked signed without ever signing anything.
+    DIGIO_BASE_URL: str = "https://api.digio.in"
+    DIGIO_CLIENT_ID: str = ""
+    DIGIO_CLIENT_SECRET: str = ""
+    DIGIO_WEBHOOK_SECRET: str = ""
+    # Where Digio's hosted signing page redirects the signer's browser once
+    # they finish (or abandon) the flow. The mobile app opens this inside an
+    # in-app browser/WebView and watches for navigation to this URL to know
+    # the session ended — see mobile app/(nurse)/contract.tsx.
+    DIGIO_REDIRECT_URL: str = "nurseconnect://esign-complete"
+    # A signing session left untouched this long is treated as abandoned so
+    # it doesn't block a worker from starting a fresh one indefinitely.
+    DIGIO_SESSION_EXPIRE_MINUTES: int = 60
+
     # ---------------------------------------------------------------------
     # Company identity printed on every invoice and payout statement.
     # Centralised here so the GSTIN/address exist in exactly one place and
@@ -224,6 +243,90 @@ class Settings(BaseSettings):
         if self.CORS_ORIGINS == "*":
             return ["*"]
         return [o.strip() for o in self.CORS_ORIGINS.split(",") if o.strip()]
+
+    # -----------------------------------------------------------------
+    # Environment
+    #
+    # OTP_DEV_MODE and EMAIL_DEV_MODE both default to True, and both were
+    # previously independent of APP_ENV. That is why the live site showed
+    # "Dev mode code: 654321" next to a real customer's email address and
+    # no mail was ever sent: the deployment simply never set them to False,
+    # and nothing forced the issue.
+    #
+    # Dev mode is now a property of the environment, not a standalone flag.
+    # It can only be on in development, so a missing env var can no longer
+    # downgrade production auth to a fixed, publicly-visible code.
+    # -----------------------------------------------------------------
+    _PRODUCTION_ENVS = {"production", "prod", "staging", "stage", "uat"}
+
+    @property
+    def is_production(self) -> bool:
+        return self.APP_ENV.strip().lower() in self._PRODUCTION_ENVS
+
+    @property
+    def otp_dev_mode(self) -> bool:
+        """Fixed OTP + code echoed in the API response. Never in production."""
+        return bool(self.OTP_DEV_MODE) and not self.is_production
+
+    @property
+    def email_dev_mode(self) -> bool:
+        """Fixed email code + no mail dispatched. Never in production."""
+        return bool(self.EMAIL_DEV_MODE) and not self.is_production
+
+    @property
+    def email_delivery_configured(self) -> bool:
+        return bool(self.RESEND_API_KEY and self.EMAIL_FROM_ADDRESS)
+
+    def startup_warnings(self) -> List[str]:
+        """Misconfigurations that silently break user-facing flows.
+
+        Surfaced at boot (see app/main.py) so they are caught on deploy
+        rather than by a customer who never receives a verification code.
+        """
+        problems: List[str] = []
+        if self.is_production:
+            if self.OTP_DEV_MODE:
+                problems.append(
+                    "OTP_DEV_MODE is set in a production environment — ignoring it. "
+                    "Remove it from the environment."
+                )
+            if self.EMAIL_DEV_MODE:
+                problems.append(
+                    "EMAIL_DEV_MODE is set in a production environment — ignoring it. "
+                    "Remove it from the environment."
+                )
+            if not self.email_delivery_configured:
+                problems.append(
+                    "RESEND_API_KEY/EMAIL_FROM_ADDRESS are not set — verification "
+                    "emails cannot be delivered."
+                )
+            if not (self.RAZORPAY_KEY_ID and self.RAZORPAY_KEY_SECRET):
+                problems.append(
+                    "RAZORPAY_KEY_ID/RAZORPAY_KEY_SECRET are not both set — payment "
+                    "signature verification will reject every payment."
+                )
+            if not self.RAZORPAY_WEBHOOK_SECRET:
+                problems.append(
+                    "RAZORPAY_WEBHOOK_SECRET is not set — Razorpay webhooks will be "
+                    "rejected, so payments captured out-of-band will not settle."
+                )
+            if not (self.DIGIO_CLIENT_ID and self.DIGIO_CLIENT_SECRET):
+                problems.append(
+                    "DIGIO_CLIENT_ID/DIGIO_CLIENT_SECRET are not both set — Stage 2 "
+                    "e-Stamp agreements cannot be sent for signing."
+                )
+            if not self.DIGIO_WEBHOOK_SECRET:
+                problems.append(
+                    "DIGIO_WEBHOOK_SECRET is not set — Digio's signing-completion "
+                    "webhook will be rejected, so Stage 2 agreements will never "
+                    "finalize automatically."
+                )
+            if self.MOCK_EXTERNAL_PROVIDERS:
+                problems.append(
+                    "MOCK_EXTERNAL_PROVIDERS is on in a production environment — "
+                    "payments and SMS are being faked."
+                )
+        return problems
 
 
 @lru_cache(maxsize=1)

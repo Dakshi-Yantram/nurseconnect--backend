@@ -30,6 +30,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.database import get_db
 from app.core.deps import CurrentUser, get_current_user, get_worker_profile, is_admin
 from app.integrations.providers import ExternalProviderError, cloudinary_client
+from app.core.provider_types import is_doctor
 from app.models.enums import PrescriptionStatus, WorkerType
 from app.models.models import Booking, Patient, Prescription, TeleConsultation, User, WorkerProfile
 from app.services import eprescription_service
@@ -39,7 +40,16 @@ router = APIRouter(prefix="/eprescriptions", tags=["eprescriptions"])
 
 
 def _require_doctor(worker: WorkerProfile = Depends(get_worker_profile)) -> WorkerProfile:
-    if worker.worker_type != WorkerType.doctor:
+    """Any doctor may issue an e-prescription, in either practice mode.
+
+    Prescribing authority comes from medical registration, not from whether
+    the consultation happened over video or at the patient's home — both
+    Tele-Doctor and Physical Doctor carry the same medical_registration
+    requirement (see app/core/provider_types.py). Gating this on the
+    generic `doctor` type alone would have silently locked both new types
+    out of prescribing.
+    """
+    if not is_doctor(worker.worker_type):
         raise HTTPException(status_code=403, detail="Doctor account required")
     return worker
 

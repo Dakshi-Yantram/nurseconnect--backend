@@ -21,6 +21,8 @@ PROVIDER_TYPE_LABELS = {
     WorkerType.nurse: "Nurse",
     WorkerType.caregiver: "Caregiver",
     WorkerType.doctor: "Doctor",
+    WorkerType.tele_doctor: "Tele-Doctor",
+    WorkerType.physical_doctor: "Physical Doctor",
     WorkerType.dentist: "Dentist",
     WorkerType.physiotherapist: "Physiotherapist",
     WorkerType.mother_baby_caregiver: "Mother & Baby Caregiver",
@@ -33,14 +35,70 @@ PROVIDER_TYPE_LABELS = {
 LICENSED_PROVIDER_TYPES = {
     WorkerType.nurse,
     WorkerType.doctor,
+    WorkerType.tele_doctor,
+    WorkerType.physical_doctor,
     WorkerType.dentist,
     WorkerType.physiotherapist,
 }
+
+# ---------------------------------------------------------------------------
+# Tele vs Physical capability.
+#
+# The single predicate the rest of the system branches on when deciding
+# whether a provider gets tele-consultation features (waiting queue, call
+# button, video room) or physical-visit features (visible patient, on-site
+# reports, procedures).
+#
+# `doctor` — the pre-existing generic type — appears in BOTH sets. Every
+# doctor onboarded before Tele/Physical existed keeps the behaviour they
+# have today; nothing regresses. New doctors pick a specific type and get
+# only the features that apply to them, which is what stops a Physical
+# Doctor being shown tele-consultation UI.
+# ---------------------------------------------------------------------------
+TELE_CAPABLE_PROVIDER_TYPES = {
+    WorkerType.doctor,
+    WorkerType.tele_doctor,
+}
+
+PHYSICAL_CAPABLE_PROVIDER_TYPES = {
+    WorkerType.doctor,
+    WorkerType.physical_doctor,
+    WorkerType.nurse,
+    WorkerType.caregiver,
+    WorkerType.dentist,
+    WorkerType.physiotherapist,
+    WorkerType.mother_baby_caregiver,
+}
+
+# Every provider type that practises medicine as a doctor, in either mode.
+DOCTOR_PROVIDER_TYPES = {
+    WorkerType.doctor,
+    WorkerType.tele_doctor,
+    WorkerType.physical_doctor,
+}
+
+
+def is_tele_capable(worker_type: WorkerType) -> bool:
+    """True if this provider type may run tele-consultations."""
+    return worker_type in TELE_CAPABLE_PROVIDER_TYPES
+
+
+def is_physical_capable(worker_type: WorkerType) -> bool:
+    """True if this provider type attends in-person visits."""
+    return worker_type in PHYSICAL_CAPABLE_PROVIDER_TYPES
+
+
+def is_doctor(worker_type: WorkerType) -> bool:
+    return worker_type in DOCTOR_PROVIDER_TYPES
 
 # Documents that block onboarding submission until uploaded + verified.
 REQUIRED_DOCUMENTS_BY_PROVIDER_TYPE = {
     WorkerType.nurse: {"aadhaar", "nursing_license", "degree_certificate", "police_verification"},
     WorkerType.doctor: {"aadhaar", "medical_registration", "degree_certificate", "police_verification"},
+    # Both doctor modes carry identical credentialling requirements — the
+    # mode changes how they deliver care, not what licenses them to.
+    WorkerType.tele_doctor: {"aadhaar", "medical_registration", "degree_certificate", "police_verification"},
+    WorkerType.physical_doctor: {"aadhaar", "medical_registration", "degree_certificate", "police_verification"},
     WorkerType.dentist: {"aadhaar", "dental_registration", "degree_certificate", "police_verification"},
     WorkerType.physiotherapist: {"aadhaar", "degree_certificate", "police_verification"},
     WorkerType.caregiver: {"aadhaar", "police_verification"},
@@ -52,6 +110,8 @@ REQUIRED_DOCUMENTS_BY_PROVIDER_TYPE = {
 OPTIONAL_DOCUMENTS_BY_PROVIDER_TYPE = {
     WorkerType.nurse: {"experience_certificate", "specialization_certificate"},
     WorkerType.doctor: {"experience_certificate", "specialization_certificate"},
+    WorkerType.tele_doctor: {"experience_certificate", "specialization_certificate"},
+    WorkerType.physical_doctor: {"experience_certificate", "specialization_certificate"},
     WorkerType.dentist: {"experience_certificate", "specialization_certificate"},
     WorkerType.physiotherapist: {"physio_registration", "experience_certificate", "specialization_certificate"},
     WorkerType.caregiver: {"caregiver_training_certificate", "first_aid_certificate", "degree_certificate", "experience_certificate"},
