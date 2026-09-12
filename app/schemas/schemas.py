@@ -7,6 +7,7 @@ from uuid import UUID
 from pydantic import BaseModel, ConfigDict, EmailStr, Field
 
 from app.models.enums import (
+    PaymentMethod,
     WorkerType,
     BillingTrigger,
     BookingStatus,
@@ -49,6 +50,13 @@ class OtpSendResponse(BaseModel):
     phone_e164: str
     expires_in_seconds: int
     dev_otp: Optional[str] = None  # populated in dev mode only
+    # The role this number is ALREADY registered under, if any. Lets the
+    # client route the user to the right sign-in before they type a code,
+    # instead of collecting an OTP and then rejecting it with a 409.
+    # None means the number is new — whatever role was requested applies.
+    existing_role: Optional[UserRole] = None
+    # True when `existing_role` differs from the role the client asked for.
+    role_mismatch: bool = False
 
 
 class OtpVerifyRequest(BaseModel):
@@ -93,6 +101,11 @@ class RegisterResponse(BaseModel):
     verification_required: bool = True
     expires_in_seconds: int
     dev_verification_code: Optional[str] = None
+    # Whether the verification email was actually dispatched. False means
+    # the user has NO way to obtain a code (mail provider unconfigured or
+    # the send failed), so the UI must say so rather than claiming "we've
+    # emailed you a code" and leaving them stuck on the code screen.
+    email_sent: bool = True
 
 
 
@@ -147,6 +160,14 @@ class UserOut(ORMModel):
 class AuthResponse(BaseModel):
     user: UserOut
     tokens: TokenPair
+    # The role the session was actually issued for. Always equals
+    # `user.role`; surfaced separately so a client that asked to sign in as
+    # one role and was authenticated as another (because the number is
+    # already registered) can see that plainly and route accordingly,
+    # rather than being handed a 409 and a dead end.
+    authenticated_role: Optional[UserRole] = None
+    # True when the caller's requested role differed from `authenticated_role`.
+    role_switched: bool = False
 
 
 # ----- CONSUMER / PATIENT -----
@@ -464,6 +485,16 @@ class BookingOut(ORMModel):
     tax_amount: Decimal
     total_amount: Decimal
     payment_status: PaymentStatus
+    # Without this the apps cannot tell a cash booking from an online one:
+    # the mobile mapper read `payment_method` off this payload and silently
+    # fell back to 'razorpay' for every booking, so cash bookings were
+    # indistinguishable from card ones everywhere outside the payment screen.
+    payment_method: PaymentMethod = PaymentMethod.razorpay
+    # Cash lifecycle, surfaced so the provider app can show "collect at
+    # visit" and the customer app can show "pay at visit" without a second
+    # round-trip per booking.
+    cash_collected_at: Optional[datetime] = None
+    cash_collected_amount: Optional[Decimal] = None
     razorpay_order_id: Optional[str] = None
     special_instructions: Optional[str] = None
     cancellation_reason: Optional[str] = None

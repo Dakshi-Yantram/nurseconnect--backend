@@ -30,6 +30,7 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.core.database import Base
 from app.models.enums import (
+    PaymentMethod,
     WorkerType,
     ProviderStatusChangeReason,
     AlertnessTier,
@@ -723,8 +724,25 @@ class Booking(Base):
     tax_amount: Mapped[Decimal] = mapped_column(Numeric(10, 2), default=0)
     total_amount: Mapped[Decimal] = mapped_column(Numeric(10, 2), nullable=False)
     payment_status: Mapped[PaymentStatus] = mapped_column(SQLEnum(PaymentStatus, name="payment_status"), default=PaymentStatus.pending)
+    # How the customer chose to pay. Defaults to razorpay so every existing
+    # row keeps its current meaning without a data backfill.
+    payment_method: Mapped[PaymentMethod] = mapped_column(
+        SQLEnum(PaymentMethod, name="payment_method"),
+        default=PaymentMethod.razorpay,
+        server_default="razorpay",
+        nullable=False,
+    )
     razorpay_order_id: Mapped[Optional[str]] = mapped_column(String(100), index=True)
     razorpay_payment_id: Mapped[Optional[str]] = mapped_column(String(100), index=True)
+    # --- Cash collection (payment_method=cash only) ---
+    # Set when the provider records that they took the money at the visit.
+    cash_collected_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    cash_collected_by: Mapped[Optional[UUID]] = mapped_column(PG_UUID(as_uuid=True), ForeignKey("worker_profiles.id"))
+    cash_collected_amount: Mapped[Optional[Decimal]] = mapped_column(Numeric(10, 2))
+    # Set when finance confirms the cash reached the company account. Cash
+    # sits as a receivable against the provider until this is set, which is
+    # what the payout deduction is computed from.
+    cash_remitted_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
     special_instructions: Mapped[Optional[str]] = mapped_column(Text)
     cancellation_reason: Mapped[Optional[str]] = mapped_column(Text)
     cancelled_by: Mapped[Optional[UUID]] = mapped_column(PG_UUID(as_uuid=True), ForeignKey("users.id"))
@@ -1316,6 +1334,11 @@ class WorkerPayout(Base):
     gross_amount: Mapped[Decimal] = mapped_column(Numeric(10, 2), nullable=False)
     tds_deducted: Mapped[Decimal] = mapped_column(Numeric(10, 2), default=0)
     net_amount: Mapped[Decimal] = mapped_column(Numeric(10, 2), nullable=False)
+    # Cash the provider collected at a visit and had not yet remitted, which
+    # was recovered by netting it off this payout. Recorded so the payout
+    # advice can explain the difference between gross and net, and so the
+    # recovery is auditable rather than an unexplained shortfall.
+    cash_recovered: Mapped[Decimal] = mapped_column(Numeric(10, 2), default=0, server_default="0")
     razorpay_payout_id: Mapped[Optional[str]] = mapped_column(Text)
     status: Mapped[WorkerPayoutStatus] = mapped_column(SQLEnum(WorkerPayoutStatus, name="worker_payout_status"), default=WorkerPayoutStatus.pending, index=True)
     # Two-step release: an admin must approve() a payout before process()
@@ -2114,4 +2137,55 @@ class WorkerAgreement(Base):
 
     __table_args__ = (
         Index("ix_worker_agreements_worker_stage", "worker_id", "stage"),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Digio e-Stamp / Aadhaar eSign session tracking.
+#
+# Kept separate from WorkerAgreement rather than reusing its esign_* columns,
+# because those columns previously stored whatever the CLIENT claimed the
+# signing outcome was — the accept endpoint trusted a client-supplied
+# esign_reference_id with no server-side proof a real signing session ever
+# happened. This table is the server's own record of a Digio session: it is
+# created when we ask Digio to start one, and its status field is written
+# ONLY by the Digio webhook or an authenticated status poll — never by a
+# request body. WorkerAgreement.esign_reference_id is populated by copying
+# THIS row's digio_document_id once its status is confirmed "signed", so the
+# final agreement record still carries a reference, but that reference can
+# no longer be forged by whatever the app happens to send.
+class WorkerEsignSession(Base):
+    __tablename__ = "worker_esign_sessions"
+    id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), primary_key=True, default=_uuid)
+    worker_id: Mapped[UUID] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("worker_profiles.id", ondelete="CASCADE"), index=True
+    )
+    stage: Mapped[int] = mapped_column(Integer, nullable=False, default=2)
+    provider: Mapped[str] = mapped_column(String(50), default="digio", server_default="digio")
+    # created  -> we asked Digio to create a signing session
+    # sent     -> Digio has a sign_url and is waiting on the signer
+    # signed   -> Digio confirmed (via webhook or status poll) the document is signed
+    # failed   -> signer declined, session errored, or expired unsigned
+    status: Mapped[str] = mapped_column(String(20), default="created", server_default="created", index=True)
+    digio_document_id: Mapped[Optional[str]] = mapped_column(String(255), index=True)
+    sign_url: Mapped[Optional[str]] = mapped_column(Text)
+    # The exact contract text this session was created for, frozen at
+    # initiation. accept_stage2 signs off on THIS text, not whatever the
+    # live template renders at finalize time, so a template edit mid-flight
+    # can never be attributed to a signature given for different wording.
+    rendered_text: Mapped[str] = mapped_column(Text, nullable=False)
+    template_version: Mapped[str] = mapped_column(String(20), nullable=False)
+    # Raw payload from the most recent webhook/status call, kept for audit
+    # and support — never read back into any decision, only displayed.
+    last_provider_payload: Mapped[Optional[dict]] = mapped_column(JSONB)
+    failure_reason: Mapped[Optional[str]] = mapped_column(Text)
+    signed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    expires_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now, server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_now, server_default=func.now(), onupdate=_now
+    )
+
+    __table_args__ = (
+        Index("ix_worker_esign_sessions_worker_stage", "worker_id", "stage"),
     )

@@ -3,7 +3,8 @@ e-stamp Master Agreement, rendered per provider type (see
 app/core/contracts.py), plus the OCR-suggestion-apply endpoint used by the
 document upload flow to fill in a worker's name/registration number.
 """
-from datetime import datetime, timezone
+import logging
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 from uuid import UUID
 
@@ -19,8 +20,18 @@ from app.core.deps import CurrentUser, get_current_user, get_worker_profile, req
 from app.core.provider_types import LICENSED_PROVIDER_TYPES, PROVIDER_TYPE_LABELS
 from app.core.rate_limit import client_ip, enforce_rate_limit
 from app.core.security import hash_password, verify_password
-from app.models.models import OtpCode, User, WorkerAgreement, WorkerDocument, WorkerPayout, WorkerProfile
+from app.models.models import (
+    OtpCode,
+    User,
+    WorkerAgreement,
+    WorkerDocument,
+    WorkerEsignSession,
+    WorkerPayout,
+    WorkerProfile,
+)
 from app.services import ocr_service
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/contracts", tags=["contracts"])
 
@@ -44,10 +55,25 @@ class Stage1AcceptRequest(BaseModel):
 
 
 class Stage2AcceptRequest(BaseModel):
-    esign_reference_id: str
-    esign_document_url: Optional[str] = None
-    esign_provider: str = "digio"
+    # No esign fields here anymore — see the ROOT-CAUSE NOTE above
+    # accept_stage2(). Whether the signature is genuine is decided entirely
+    # server-side, from our own WorkerEsignSession record, never from
+    # anything the client sends in this body.
     address: Optional[str] = None  # allow a final address confirmation at signing time
+
+
+class EsignInitiateOut(BaseModel):
+    session_id: str
+    status: str
+    sign_url: Optional[str] = None
+    expires_at: Optional[datetime] = None
+
+
+class EsignStatusOut(BaseModel):
+    session_id: str
+    status: str  # created | sent | signed | failed
+    sign_url: Optional[str] = None
+    failure_reason: Optional[str] = None
 
 
 class ApplyOcrRequest(BaseModel):
@@ -238,10 +264,266 @@ async def accept_stage1(
 
 # ---------------------------------------------------------------------------
 # Stage 2 — Master Agreement, executed after first completed booking via
-# Aadhaar eSign on state e-Stamp paper (Digio/Leegality/ASP integration —
-# esign_reference_id is whatever that provider returns after the signing
-# session completes; this endpoint just records the outcome).
+# Aadhaar eSign on state e-Stamp paper, via Digio (app/integrations/
+# providers.py::DigioClient).
+#
+# ROOT-CAUSE NOTE: this used to be a single endpoint that trusted whatever
+# `esign_reference_id`/`esign_document_url` the client body claimed —
+# nothing was ever actually verified with an eSign provider, so any worker
+# could POST an arbitrary string (the mobile app literally sent the literal
+# string "PENDING_ASP_INTEGRATION") and have Stage 2 marked "accepted" and
+# executed without ever signing anything. That's a legal-enforceability
+# problem, not just a data-quality one — the whole point of Stage 2 is a
+# provider having genuinely executed a Master Agreement.
+#
+# The fix splits this into three steps, none of which trust the client's
+# say-so about the outcome:
+#   1. POST .../esign/initiate  — we render the agreement, upload it to
+#      Digio ourselves, and hand back Digio's own hosted sign_url.
+#   2. Digio's webhook (or, as a fallback, a status poll) tells US whether
+#      it was actually signed — this is the only thing that can ever move
+#      a WorkerEsignSession to "signed".
+#   3. POST .../stage2/accept finalizes — it looks up the caller's OWN
+#      session and requires session.status == "signed" before creating the
+#      executed WorkerAgreement row. The request body carries no esign
+#      fields anymore; there is nothing left in it that could forge a
+#      signature.
 # ---------------------------------------------------------------------------
+async def _latest_esign_session(db: AsyncSession, worker_id: UUID, stage: int) -> Optional[WorkerEsignSession]:
+    res = await db.execute(
+        select(WorkerEsignSession)
+        .where(WorkerEsignSession.worker_id == worker_id, WorkerEsignSession.stage == stage)
+        .order_by(WorkerEsignSession.created_at.desc())
+        .limit(1)
+    )
+    return res.scalar_one_or_none()
+
+
+def _session_expired(session: WorkerEsignSession) -> bool:
+    return bool(
+        session.expires_at
+        and session.status in ("created", "sent")
+        and datetime.now(timezone.utc) >= session.expires_at
+    )
+
+
+@router.post("/me/stage2/esign/initiate", response_model=EsignInitiateOut)
+async def initiate_stage2_esign(
+    worker: WorkerProfile = Depends(get_worker_profile),
+    current: CurrentUser = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Render the Stage 2 agreement and send it to Digio for signing.
+
+    Returns Digio's own sign_url — the mobile app opens this in an in-app
+    browser/WebView. Nothing here marks anything signed; that only happens
+    via the webhook or a status poll, both of which check with Digio
+    directly (see get_document_status / verify_webhook_signature).
+    """
+    if (worker.completed_visits_count or 0) < 1:
+        raise HTTPException(status_code=403, detail="Stage 2 unlocks only after your first completed booking.")
+
+    existing_agreement = await _get_stage(db, worker.id, 2)
+    if existing_agreement and existing_agreement.status == "accepted":
+        raise HTTPException(status_code=409, detail="Stage 2 agreement already executed.")
+
+    # Reuse an in-flight, not-yet-expired session rather than spamming Digio
+    # with a fresh signing request every time the screen is reopened.
+    current_session = await _latest_esign_session(db, worker.id, 2)
+    if current_session and current_session.status in ("created", "sent") and not _session_expired(current_session):
+        return EsignInitiateOut(
+            session_id=str(current_session.id),
+            status=current_session.status,
+            sign_url=current_session.sign_url,
+            expires_at=current_session.expires_at,
+        )
+
+    rendered = contract_templates.render_stage2(
+        full_name=current.user.full_name or "",
+        address=worker.home_address or "",
+        worker_type=worker.worker_type,
+        registration_no=worker.registration_no,
+        registration_authority=worker.registration_authority,
+        execution_date=datetime.now(timezone.utc).date(),
+    )
+
+    from app.integrations.providers import ExternalProviderError, digio_client
+    from app.services.agreement_pdf import render_agreement_pdf
+
+    pdf_bytes = render_agreement_pdf(
+        title="Master Independent Contractor Agreement",
+        body_text=rendered,
+    )
+
+    signer_identifier = current.user.email or current.user.phone_e164
+    try:
+        digio_resp = await digio_client.create_esign_request(
+            pdf_bytes=pdf_bytes,
+            signer_name=current.user.full_name or "Provider",
+            signer_identifier=signer_identifier,
+            reason="Master Independent Contractor Agreement",
+        )
+    except ExternalProviderError as exc:
+        raise HTTPException(status_code=502, detail=f"Could not start e-Sign: {exc}") from None
+
+    sign_url = None
+    parties = digio_resp.get("signing_parties") or []
+    if parties:
+        sign_url = parties[0].get("sign_url")
+
+    session = WorkerEsignSession(
+        worker_id=worker.id,
+        stage=2,
+        provider="digio",
+        status="sent" if sign_url else "created",
+        digio_document_id=digio_resp.get("id"),
+        sign_url=sign_url,
+        rendered_text=rendered,
+        template_version=contract_templates.TEMPLATE_VERSION,
+        last_provider_payload=digio_resp,
+        expires_at=datetime.now(timezone.utc) + timedelta(minutes=settings.DIGIO_SESSION_EXPIRE_MINUTES),
+    )
+    db.add(session)
+    await db.commit()
+    await db.refresh(session)
+
+    return EsignInitiateOut(
+        session_id=str(session.id),
+        status=session.status,
+        sign_url=session.sign_url,
+        expires_at=session.expires_at,
+    )
+
+
+@router.get("/me/stage2/esign/status", response_model=EsignStatusOut)
+async def stage2_esign_status(
+    worker: WorkerProfile = Depends(get_worker_profile),
+    db: AsyncSession = Depends(get_db),
+):
+    """Current status of the worker's latest e-Sign session.
+
+    The mobile app polls this after returning from the Digio WebView (in
+    case its own redirect/deep-link is missed) and while waiting for the
+    webhook. If Digio hasn't told us anything new via webhook yet, this
+    actively polls Digio's own status API rather than just returning
+    whatever we last stored — a missed webhook must not leave a worker
+    stuck looking "pending" forever after they've actually signed.
+    """
+    session = await _latest_esign_session(db, worker.id, 2)
+    if not session:
+        raise HTTPException(status_code=404, detail="No e-Sign session found. Start one first.")
+
+    if session.status in ("created", "sent") and session.digio_document_id:
+        from app.integrations.providers import ExternalProviderError, digio_client
+
+        try:
+            status_payload = await digio_client.get_document_status(session.digio_document_id)
+            await _apply_esign_status(db, session, status_payload)
+            await db.commit()
+        except ExternalProviderError:
+            # Digio being briefly unreachable shouldn't be reported to the
+            # worker as their signature having failed — just report our
+            # last known state and let the next poll try again.
+            pass
+
+    if _session_expired(session) and session.status in ("created", "sent"):
+        session.status = "failed"
+        session.failure_reason = "Signing session expired before completion."
+        await db.commit()
+
+    return EsignStatusOut(
+        session_id=str(session.id),
+        status=session.status,
+        sign_url=session.sign_url,
+        failure_reason=session.failure_reason,
+    )
+
+
+async def _apply_esign_status(db: AsyncSession, session: WorkerEsignSession, status_payload: dict) -> None:
+    """Update `session` from a Digio status payload (webhook or poll).
+
+    The only place in this file that is allowed to move a session to
+    "signed" — everything downstream (accept_stage2) trusts this, and this
+    trusts only what Digio itself reported.
+    """
+    from app.integrations.providers import digio_client
+
+    session.last_provider_payload = status_payload
+    if digio_client.is_signed(status_payload):
+        if session.status != "signed":
+            session.status = "signed"
+            session.signed_at = datetime.now(timezone.utc)
+    elif digio_client.is_failed(status_payload):
+        session.status = "failed"
+        session.failure_reason = str(status_payload.get("agreement_status") or "Signing failed")
+
+
+@router.post("/webhook/digio")
+async def digio_webhook(
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+):
+    """Digio's signing-completion callback.
+
+    Configure the exact header name your Digio account sends the signature
+    in against settings.DIGIO_WEBHOOK_SECRET's dashboard counterpart — the
+    verification logic (HMAC-SHA256 over the raw body) is correct regardless
+    of which header carries it; only the header name below may need
+    adjusting per your Digio integration.
+    """
+    from app.integrations.providers import digio_client
+
+    body = await request.body()
+    signature = request.headers.get("x-digio-signature") or request.headers.get("x-webhook-signature")
+    if not digio_client.verify_webhook_signature(body, signature):
+        raise HTTPException(status_code=401, detail="Invalid webhook signature")
+
+    payload = await request.json()
+    document_id = payload.get("id") or payload.get("document_id")
+    if not document_id:
+        return {"received": True, "matched": False}
+
+    res = await db.execute(
+        select(WorkerEsignSession).where(WorkerEsignSession.digio_document_id == document_id)
+    )
+    session = res.scalar_one_or_none()
+    if not session:
+        logger.warning("digio webhook for unknown document_id=%s", document_id)
+        return {"received": True, "matched": False}
+
+    await _apply_esign_status(db, session, payload)
+    await db.commit()
+    return {"received": True, "matched": True, "status": session.status}
+
+
+@router.post("/me/stage2/esign/mock-complete", response_model=EsignStatusOut)
+async def mock_complete_stage2_esign(
+    worker: WorkerProfile = Depends(get_worker_profile),
+    db: AsyncSession = Depends(get_db),
+):
+    """Simulates the Digio WebView finishing successfully — MOCK MODE ONLY.
+
+    This is what the mobile app's built-in mock signing screen calls when
+    MOCK_EXTERNAL_PROVIDERS is on and there's no real Digio sandbox to
+    redirect to. It is hard-gated below: with mock mode off this 403s
+    unconditionally, so it can never become a way to skip signing in
+    production regardless of what a compromised or modified client sends.
+    """
+    if not settings.MOCK_EXTERNAL_PROVIDERS:
+        raise HTTPException(status_code=403, detail="Not available outside mock mode.")
+
+    session = await _latest_esign_session(db, worker.id, 2)
+    if not session:
+        raise HTTPException(status_code=404, detail="No e-Sign session found. Start one first.")
+
+    session.status = "signed"
+    session.signed_at = datetime.now(timezone.utc)
+    session.last_provider_payload = {"id": session.digio_document_id, "agreement_status": "completed", "mock": True}
+    await db.commit()
+
+    return EsignStatusOut(session_id=str(session.id), status=session.status, sign_url=session.sign_url)
+
+
 @router.post("/me/stage2/accept", response_model=ContractPreviewOut)
 async def accept_stage2(
     payload: Stage2AcceptRequest,
@@ -257,29 +539,52 @@ async def accept_stage2(
     if existing and existing.status == "accepted":
         raise HTTPException(status_code=409, detail="Stage 2 agreement already executed.")
 
+    session = await _latest_esign_session(db, worker.id, 2)
+    if not session:
+        raise HTTPException(
+            status_code=409,
+            detail={"code": "ESIGN_NOT_STARTED", "message": "Start e-Sign before accepting Stage 2."},
+        )
+
+    # Re-check with Digio one last time in case the webhook hasn't landed
+    # yet — never finalize on a stale in-memory status.
+    if session.status in ("created", "sent") and session.digio_document_id:
+        from app.integrations.providers import ExternalProviderError, digio_client
+
+        try:
+            status_payload = await digio_client.get_document_status(session.digio_document_id)
+            await _apply_esign_status(db, session, status_payload)
+        except ExternalProviderError:
+            pass
+
+    if session.status != "signed":
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "ESIGN_NOT_SIGNED",
+                "message": "e-Sign has not been completed yet.",
+                "status": session.status,
+            },
+        )
+
     if payload.address:
         worker.home_address = payload.address
 
-    rendered = contract_templates.render_stage2(
-        full_name=current.user.full_name or "",
-        address=worker.home_address or "",
-        worker_type=worker.worker_type,
-        registration_no=worker.registration_no,
-        registration_authority=worker.registration_authority,
-        execution_date=datetime.now(timezone.utc).date(),
-    )
+    # Sign off on the EXACT text the session was created for — not a fresh
+    # render — so a template edit made after the worker started signing can
+    # never be silently substituted into the finalized agreement.
     agreement = WorkerAgreement(
         worker_id=worker.id,
         stage=2,
         status="accepted",
         provider_type_snapshot=worker.worker_type.value,
-        rendered_text=rendered,
-        template_version=contract_templates.TEMPLATE_VERSION,
+        rendered_text=session.rendered_text,
+        template_version=session.template_version,
         accepted_at=datetime.now(timezone.utc),
         ip_address=client_ip(request),
-        esign_provider=payload.esign_provider,
-        esign_reference_id=payload.esign_reference_id,
-        esign_document_url=payload.esign_document_url,
+        esign_provider=session.provider,
+        esign_reference_id=session.digio_document_id,
+        esign_document_url=session.sign_url,
     )
     db.add(agreement)
 
@@ -292,7 +597,7 @@ async def accept_stage2(
     # bearing the full ₹200 hit.
     await db.commit()
 
-    return ContractPreviewOut(stage=2, status="accepted", rendered_text=rendered, unlocked=False)
+    return ContractPreviewOut(stage=2, status="accepted", rendered_text=session.rendered_text, unlocked=False)
 
 
 # ---------------------------------------------------------------------------

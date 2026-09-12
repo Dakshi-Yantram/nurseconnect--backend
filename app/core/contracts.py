@@ -38,6 +38,8 @@ TEMPLATE_VERSION = "v1"
 REGISTRATION_LABEL_BY_TYPE = {
     WorkerType.nurse: "State Nursing Council Reg No.",
     WorkerType.doctor: "Medical Council Registration No.",
+    WorkerType.tele_doctor: "Medical Council Registration No.",
+    WorkerType.physical_doctor: "Medical Council Registration No.",
     WorkerType.dentist: "State Dental Council Reg No.",
     WorkerType.physiotherapist: "State Physiotherapy Council Reg No.",
 }
@@ -100,6 +102,8 @@ AND
 _SERVICE_DESCRIPTION_BY_TYPE = {
     WorkerType.nurse: "home care nursing visits",
     WorkerType.doctor: "home/tele consultations",
+    WorkerType.tele_doctor: "tele consultations",
+    WorkerType.physical_doctor: "in-person home consultations",
     WorkerType.dentist: "home dental consultations",
     WorkerType.physiotherapist: "home physiotherapy sessions",
     WorkerType.caregiver: "home caregiving visits",

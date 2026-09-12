@@ -3,7 +3,7 @@ import json
 import logging
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
-from typing import List
+from typing import List, Optional
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Request
@@ -24,6 +24,7 @@ from app.integrations import razorpay_client
 from app.models.enums import (
     BookingStatus,
     LedgerEntryType,
+    PaymentMethod,
     PaymentStatus,
     UserRole,
     WorkerPayoutStatus,
@@ -43,6 +44,7 @@ from app.models.models import (
     ConsumerProfile,
     FinancialLedger,
     Invoice,
+    User,
     WorkerPayout,
     WorkerProfile,
 )
@@ -91,6 +93,139 @@ async def create_order(
     )
 
 
+# ===========================================================================
+# Payment settlement
+#
+# ROOT-CAUSE NOTE (the "Razorpay succeeded but the app showed
+# 'Verification failed / Request failed (500)'" bug):
+#
+# /verify used to do its best-effort post-payment work — dispatch-notify and
+# invoice generation — on the SAME AsyncSession as the request, each guarded
+# by `except Exception: await db.rollback()`. That guard was the bug.
+# `AsyncSession.rollback()` EXPIRES every ORM instance loaded in that
+# session, `booking` included. The very next line built the response with
+# `booking.status.value`, which is a *synchronous* attribute read on an
+# expired instance, so SQLAlchemy tried to lazy-refresh it from an async
+# engine outside greenlet context and raised MissingGreenlet. FastAPI turned
+# that into a 500.
+#
+# By then the payment row was already committed, which is exactly what the
+# screenshots show: Razorpay says "Payment Successful", the booking reads
+# "Paid ₹1 / Finding a nurse", and the app still shows a 500. The money was
+# never at risk; the response was.
+#
+# The fix has three parts:
+#   1. Commit the money-critical state (payment_status, booking status,
+#      ledger) on its own and nothing else.
+#   2. Snapshot the response into plain primitives IMMEDIATELY after that
+#      commit, so building the response can never touch the ORM again.
+#   3. Run every best-effort step in an ISOLATED session, so a failure in
+#      dispatch-notify or invoicing cannot expire, poison or roll back the
+#      request's session.
+# ===========================================================================
+def _payment_state(booking: Booking, *, replay: bool = False) -> dict:
+    """Snapshot the verify/status response as plain primitives.
+
+    Must be called while `booking` is live (freshly loaded or just
+    committed on a session with expire_on_commit=False). Everything
+    downstream uses this dict, never the ORM instance.
+    """
+    state = {
+        "verified": booking.payment_status == PaymentStatus.captured,
+        "booking_id": str(booking.id),
+        "booking_ref": booking.booking_ref,
+        "booking_status": booking.status.value,
+        "payment_status": booking.payment_status.value,
+        "payment_method": booking.payment_method.value,
+        "razorpay_payment_id": booking.razorpay_payment_id,
+        # True when the booking is arranged and dispatchable but the money
+        # is still to be collected at the visit. Clients use this to show
+        # "Pay ₹X in cash at the visit" instead of a payment failure —
+        # `verified` is correctly False here, but nothing is wrong.
+        "cash_due": booking.payment_status == PaymentStatus.cash_due,
+    }
+    if replay:
+        state["idempotent_replay"] = True
+    return state
+
+
+async def _run_post_payment_side_effects(
+    booking_id: UUID, *, issue_invoice: bool = True
+) -> None:
+    """Dispatch-notify + invoice, on a session of their own.
+
+    `issue_invoice=False` is used by the cash-selection path. A cash booking
+    is confirmed and must be dispatched immediately, but no money has been
+    received yet, so raising the customer's tax invoice at that point would
+    document a payment that has not happened. For cash the invoice is raised
+    at collection instead.
+
+    Isolated deliberately — see the ROOT-CAUSE NOTE above. Nothing in here
+    may propagate to the caller: the payment is already captured and
+    committed, so an invoice or push-notification problem must never be
+    reported to the customer as a failed payment.
+    """
+    from app.core.database import AsyncSessionLocal
+
+    try:
+        async with AsyncSessionLocal() as session:
+            bres = await session.execute(select(Booking).where(Booking.id == booking_id))
+            booking = bres.scalar_one_or_none()
+            if booking is None:
+                return
+
+            # Guarded workflows sit in prescription_pending until a
+            # pharmacist approves the Rx — dispatch must not start yet.
+            if not is_guarded_workflow(booking):
+                try:
+                    from app.services.dispatch import notify_nearby_workers
+
+                    notified = await notify_nearby_workers(session, booking)
+                    await session.commit()
+                    if notified == 0:
+                        # Nobody was reachable, so this booking would sit on
+                        # "Finding a nurse" indefinitely with no one aware of
+                        # it. Escalate to ops so it gets assigned by hand
+                        # instead of silently stalling.
+                        await _escalate_undispatched_booking(session, booking_id)
+                except Exception:  # noqa: BLE001
+                    await session.rollback()
+                    logger.exception("dispatch notify failed for booking %s", booking_id)
+
+            # Re-load: the block above may have rolled back and expired it.
+            if issue_invoice:
+                bres = await session.execute(select(Booking).where(Booking.id == booking_id))
+                booking = bres.scalar_one_or_none()
+                if booking is not None:
+                    await _issue_invoice(session, booking)
+    except Exception:  # noqa: BLE001
+        logger.exception("post-payment side effects failed for booking %s", booking_id)
+
+
+async def _escalate_undispatched_booking(db: AsyncSession, booking_id: UUID) -> None:
+    """Tell ops a paid booking found no eligible worker."""
+    try:
+        from app.services.common_services import notify_admins
+
+        bres = await db.execute(select(Booking).where(Booking.id == booking_id))
+        booking = bres.scalar_one_or_none()
+        if booking is None:
+            return
+        ref = booking.booking_ref
+        await notify_admins(
+            db,
+            "booking.no_worker_found",
+            "Paid booking has no available provider",
+            f"Booking {ref} is paid and confirmed but no approved, online, "
+            f"qualified provider was reachable. Assign one manually.",
+            {"booking_id": str(booking_id), "booking_ref": ref},
+        )
+        await db.commit()
+    except Exception:  # noqa: BLE001
+        await db.rollback()
+        logger.exception("undispatched-booking escalation failed for %s", booking_id)
+
+
 @router.post("/verify")
 async def verify_payment(
     payload: PaymentVerifyRequest,
@@ -103,12 +238,12 @@ async def verify_payment(
         raise HTTPException(status_code=404, detail="Booking not found")
     # Phase 4 hardening: idempotent re-verify — if already captured, return current state.
     if booking.payment_status == PaymentStatus.captured:
-        return {
-            "verified": True,
-            "booking_status": booking.status.value,
-            "payment_status": booking.payment_status.value,
-            "idempotent_replay": True,
-        }
+        state = _payment_state(booking, replay=True)
+        # A replay usually means the first attempt 500'd after committing the
+        # payment. Re-run the side effects so a booking that missed dispatch
+        # or its invoice the first time still gets both.
+        await _run_post_payment_side_effects(booking.id)
+        return state
     ok = razorpay_client.verify_payment_signature(
         payload.razorpay_order_id, payload.razorpay_payment_id, payload.razorpay_signature
     )
@@ -131,12 +266,11 @@ async def verify_payment(
         if booking.dispatch_started_at is None:
             booking.dispatch_started_at = datetime.now(timezone.utc)
         await db.commit()
-        return {
-            "verified": True,
-            "booking_status": booking.status.value,
-            "payment_status": booking.payment_status.value,
-            "idempotent_replay": True,
-        }
+        state = _payment_state(booking, replay=True)
+        # The webhook captured it; it may not have managed the invoice or
+        # dispatch. Re-run both idempotently.
+        await _run_post_payment_side_effects(booking.id)
+        return state
 
     booking.razorpay_payment_id = payload.razorpay_payment_id
     booking.payment_status = PaymentStatus.captured
@@ -175,12 +309,9 @@ async def verify_payment(
         b2 = bres.scalar_one_or_none()
         if not b2:
             raise HTTPException(status_code=409, detail={"code": "concurrency_conflict"}) from None
-        return {
-            "verified": True,
-            "booking_status": b2.status.value,
-            "payment_status": b2.payment_status.value,
-            "idempotent_replay": True,
-        }
+        state = _payment_state(b2, replay=True)
+        await _run_post_payment_side_effects(b2.id)
+        return state
     # Commission calculation (use 20% default if no service)
     commission_pct = Decimal("20")
     if booking.service_id:
@@ -227,26 +358,24 @@ async def verify_payment(
         b2 = bres.scalar_one_or_none()
         if not b2:
             raise HTTPException(status_code=409, detail={"code": "concurrency_conflict", "error": str(e.orig)}) from None
-        return {
-            "verified": True,
-            "booking_status": b2.status.value,
-            "payment_status": b2.payment_status.value,
-            "idempotent_replay": True,
-        }
-    # Booking is now CONFIRMED — push the request to nearby, qualified,
-    # free, online workers (best-effort; must not fail the payment).
-    # Both guarded workflows skip this: they sit in prescription_pending
-    # until the pharmacist approves the Rx.
-    if not is_guarded_workflow(booking):
-        try:
-            from app.services.dispatch import notify_nearby_workers
-            await notify_nearby_workers(db, booking)
-            await db.commit()
-        except Exception:  # noqa: BLE001
-            await db.rollback()
-    # Payment captured -> the customer's tax invoice is due now.
-    await _issue_invoice(db, booking)
-    return {"verified": True, "booking_status": booking.status.value, "payment_status": booking.payment_status.value}
+        state = _payment_state(b2, replay=True)
+        await _run_post_payment_side_effects(b2.id)
+        return state
+
+    # ---------------------------------------------------------------
+    # The money is now committed. From this line on, NOTHING may raise
+    # out of this handler: the customer has paid, so the only correct
+    # response is success. Snapshot first, then do best-effort work on
+    # an isolated session.
+    # ---------------------------------------------------------------
+    state = _payment_state(booking)
+    booking_id = booking.id
+
+    # Dispatch-notify (unless a guarded workflow is waiting on Rx review)
+    # and the customer's tax invoice.
+    await _run_post_payment_side_effects(booking_id)
+
+    return state
 
 
 async def _issue_invoice(db: AsyncSession, booking: Booking) -> None:
@@ -272,6 +401,129 @@ async def _issue_invoice(db: AsyncSession, booking: Booking) -> None:
     except Exception:  # noqa: BLE001
         await db.rollback()
         logger.exception("invoice generation failed for booking %s", booking.id)
+
+
+# ===========================================================================
+# Status + reconciliation
+#
+# These two exist so that a payment can never be stranded. If /verify is
+# interrupted for ANY reason — the app is killed on the Razorpay redirect,
+# the network drops, or the server errors — the client can ask what actually
+# happened instead of showing the customer a failure for money that left
+# their account.
+# ===========================================================================
+@router.get("/status/{booking_id}")
+async def payment_status(
+    booking_id: UUID,
+    profile: ConsumerProfile = Depends(get_consumer_profile),
+    db: AsyncSession = Depends(get_db),
+):
+    """Current, authoritative payment + booking state. Read-only."""
+    res = await db.execute(
+        select(Booking).where(Booking.id == booking_id, Booking.consumer_id == profile.id)
+    )
+    booking = res.scalar_one_or_none()
+    if not booking:
+        raise HTTPException(status_code=404, detail="Booking not found")
+    return _payment_state(booking)
+
+
+@router.post("/reconcile/{booking_id}")
+async def reconcile_payment(
+    booking_id: UUID,
+    profile: ConsumerProfile = Depends(get_consumer_profile),
+    db: AsyncSession = Depends(get_db),
+):
+    """Settle a booking against Razorpay's own record of the order.
+
+    Called by the app when /verify did not return a clean success. It asks
+    Razorpay — not the client — whether a payment was actually captured for
+    this booking's order, and if so completes exactly the same settlement
+    /verify would have done. Safe to call repeatedly.
+
+    This is what turns the reported failure mode ("amount deducted, booking
+    still unpaid") into a self-healing state rather than a support ticket.
+    """
+    res = await db.execute(
+        select(Booking).where(Booking.id == booking_id, Booking.consumer_id == profile.id)
+    )
+    booking = res.scalar_one_or_none()
+    if not booking:
+        raise HTTPException(status_code=404, detail="Booking not found")
+
+    if booking.payment_status == PaymentStatus.captured:
+        state = _payment_state(booking, replay=True)
+        await _run_post_payment_side_effects(booking.id)
+        return state
+
+    if not booking.razorpay_order_id:
+        return {**_payment_state(booking), "reconciled": False, "reason": "no_order"}
+
+    payments = await razorpay_client.fetch_order_payments(booking.razorpay_order_id)
+    captured = next((p for p in payments if p.get("status") == "captured"), None)
+    if captured is None:
+        # No captured payment exists at Razorpay — the customer genuinely
+        # has not been charged, so the booking correctly stays unpaid.
+        return {**_payment_state(booking), "reconciled": False, "reason": "not_captured"}
+
+    payment_id = captured.get("id")
+
+    # Same settlement as /verify, minus the signature check — Razorpay's
+    # own API is a stronger proof than a client-supplied signature.
+    dup = await db.execute(
+        select(FinancialLedger.id)
+        .where(
+            FinancialLedger.razorpay_payment_id == payment_id,
+            FinancialLedger.entry_type == LedgerEntryType.payment_collected,
+        )
+        .limit(1)
+    )
+    ledger_exists = dup.scalar_one_or_none() is not None
+
+    booking.razorpay_payment_id = payment_id
+    booking.payment_status = PaymentStatus.captured
+    booking.status = (
+        BookingStatus.prescription_pending if is_guarded_workflow(booking) else BookingStatus.confirmed
+    )
+    if booking.dispatch_started_at is None:
+        booking.dispatch_started_at = datetime.now(timezone.utc)
+
+    try:
+        if not ledger_exists:
+            await post_ledger_entry(
+                db,
+                LedgerEntryType.payment_collected,
+                booking.total_amount,
+                booking_id=booking.id,
+                consumer_id=booking.consumer_id,
+                debit_account="razorpay_escrow",
+                credit_account="consumer_payment",
+                razorpay_payment_id=payment_id,
+                description=f"Reconciled payment for booking {booking.booking_ref}",
+            )
+        await audit(
+            db,
+            profile.user_id,
+            "consumer",
+            "payment.reconcile",
+            "booking",
+            booking.id,
+            {"razorpay_payment_id": payment_id},
+        )
+        await db.commit()
+    except IntegrityError:
+        await db.rollback()
+        bres = await db.execute(select(Booking).where(Booking.id == booking_id))
+        b2 = bres.scalar_one_or_none()
+        if b2 is None:
+            raise HTTPException(status_code=409, detail={"code": "concurrency_conflict"}) from None
+        state = _payment_state(b2, replay=True)
+        await _run_post_payment_side_effects(b2.id)
+        return {**state, "reconciled": True}
+
+    state = _payment_state(booking)
+    await _run_post_payment_side_effects(booking.id)
+    return {**state, "reconciled": True}
 
 
 @router.post("/webhook/razorpay")
@@ -322,13 +574,9 @@ async def razorpay_webhook(request: Request, x_razorpay_signature: str = Header(
                     description=f"Webhook-captured payment for {b.booking_ref}",
                 )
                 await db.commit()
-                try:
-                    from app.services.dispatch import notify_nearby_workers
-                    await notify_nearby_workers(db, b)
-                    await db.commit()
-                except Exception:  # noqa: BLE001
-                    await db.rollback()
-                await _issue_invoice(db, b)
+                # Isolated session — a failure in dispatch or invoicing must
+                # not roll back (and expire) the webhook's own session.
+                await _run_post_payment_side_effects(b.id)
             except IntegrityError:
                 await db.rollback()
                 logger.info(
@@ -617,3 +865,251 @@ async def worker_payout_statements(
         }
         for st, po, bk in rows
     ]
+
+
+# ===========================================================================
+# Cash on delivery
+#
+# Thin HTTP layer only — all state transitions live in
+# app/services/cash_payment.py so the rules stay in one place and can be
+# reused by admin tooling and the provider app without duplication.
+# ===========================================================================
+class CashSelectRequest(BaseModel):
+    booking_id: UUID
+
+
+class CashCollectRequest(BaseModel):
+    booking_id: UUID
+    amount: Optional[float] = None  # defaults to the booking total
+
+
+@router.get("/methods/{booking_id}")
+async def available_payment_methods(
+    booking_id: UUID,
+    profile: ConsumerProfile = Depends(get_consumer_profile),
+    db: AsyncSession = Depends(get_db),
+):
+    """Which payment methods this booking may use, and why not if not.
+
+    Driven by the booking rather than hardcoded in the apps, so adding or
+    restricting a method is a backend change and every client follows.
+    """
+    res = await db.execute(
+        select(Booking).where(Booking.id == booking_id, Booking.consumer_id == profile.id)
+    )
+    booking = res.scalar_one_or_none()
+    if not booking:
+        raise HTTPException(status_code=404, detail="Booking not found")
+
+    from app.services.cash_payment import is_cash_eligible
+
+    cash_ok, cash_reason = is_cash_eligible(booking)
+    online_ok = booking.payment_status not in (PaymentStatus.captured, PaymentStatus.cash_due)
+
+    return {
+        "booking_id": str(booking.id),
+        "amount": float(booking.total_amount),
+        "current_method": booking.payment_method.value,
+        "methods": [
+            {
+                "method": PaymentMethod.razorpay.value,
+                "label": "Pay online",
+                "description": "UPI, card, net banking or wallet.",
+                "available": online_ok,
+                "reason": None if online_ok else "This booking is already settled.",
+            },
+            {
+                "method": PaymentMethod.cash.value,
+                "label": "Pay cash at the visit",
+                "description": "Hand the amount to your care professional when they arrive.",
+                "available": cash_ok,
+                "reason": cash_reason,
+            },
+        ],
+    }
+
+
+@router.post("/cash/select")
+async def choose_cash_payment(
+    payload: CashSelectRequest,
+    profile: ConsumerProfile = Depends(get_consumer_profile),
+    db: AsyncSession = Depends(get_db),
+):
+    """Customer opts to pay cash. Confirms the booking and starts dispatch.
+
+    Runs the same post-confirmation work as a successful online payment
+    (dispatch-notify + invoice) through the shared isolated-session runner,
+    so a cash booking is dispatched and invoiced exactly like an online one.
+    """
+    res = await db.execute(
+        select(Booking).where(
+            Booking.id == payload.booking_id, Booking.consumer_id == profile.id
+        )
+    )
+    booking = res.scalar_one_or_none()
+    if not booking:
+        raise HTTPException(status_code=404, detail="Booking not found")
+
+    from app.services.cash_payment import CashPaymentError, select_cash_payment
+
+    try:
+        await select_cash_payment(db, booking)
+        await audit(
+            db, profile.user_id, "consumer", "payment.cash_selected", "booking", booking.id
+        )
+        await db.commit()
+    except CashPaymentError as e:
+        await db.rollback()
+        raise HTTPException(status_code=409, detail={"code": e.code, "message": e.message}) from None
+
+    state = _payment_state(booking)
+    # Dispatch now so a nurse starts being found immediately, but hold the
+    # invoice until the money is actually collected at the visit.
+    await _run_post_payment_side_effects(booking.id, issue_invoice=False)
+    return state
+
+
+@router.post("/cash/collect")
+async def collect_cash(
+    payload: CashCollectRequest,
+    current: CurrentUser = Depends(require_roles(UserRole.worker)),
+    db: AsyncSession = Depends(get_db),
+):
+    """Provider records that they took the cash at the visit.
+
+    This is the revenue event for a cash booking — the ledger entry is
+    posted here, not when the customer chose cash.
+    """
+    from app.models.models import WorkerProfile
+
+    wres = await db.execute(select(WorkerProfile).where(WorkerProfile.user_id == current.id))
+    worker = wres.scalar_one_or_none()
+    if not worker:
+        raise HTTPException(status_code=403, detail="Worker profile required")
+
+    res = await db.execute(select(Booking).where(Booking.id == payload.booking_id))
+    booking = res.scalar_one_or_none()
+    if not booking:
+        raise HTTPException(status_code=404, detail="Booking not found")
+    # Only the assigned provider may collect against this booking.
+    if booking.worker_id != worker.id:
+        raise HTTPException(status_code=403, detail="This booking is not assigned to you")
+
+    from app.services.cash_payment import CashPaymentError, record_cash_collection
+
+    try:
+        await record_cash_collection(
+            db,
+            booking,
+            worker_id=worker.id,
+            amount=Decimal(str(payload.amount)) if payload.amount is not None else None,
+        )
+        await audit(db, current.id, "worker", "payment.cash_collected", "booking", booking.id)
+        await db.commit()
+    except CashPaymentError as e:
+        await db.rollback()
+        raise HTTPException(status_code=409, detail={"code": e.code, "message": e.message}) from None
+
+    state = _payment_state(booking)
+    # Cash bookings are invoiced at collection — that is when money moved.
+    await _run_post_payment_side_effects(booking.id)
+    return state
+
+
+@router.post("/cash/remit/{booking_id}")
+async def remit_cash(
+    booking_id: UUID,
+    current: CurrentUser = Depends(require_roles(UserRole.admin, UserRole.operations)),
+    db: AsyncSession = Depends(get_db),
+):
+    """Finance confirms collected cash reached the company account."""
+    res = await db.execute(select(Booking).where(Booking.id == booking_id))
+    booking = res.scalar_one_or_none()
+    if not booking:
+        raise HTTPException(status_code=404, detail="Booking not found")
+
+    from app.services.cash_payment import CashPaymentError, record_cash_remittance
+
+    try:
+        await record_cash_remittance(db, booking)
+        await audit(db, current.id, "admin", "payment.cash_remitted", "booking", booking.id)
+        await db.commit()
+    except CashPaymentError as e:
+        await db.rollback()
+        raise HTTPException(status_code=409, detail={"code": e.code, "message": e.message}) from None
+
+    return {**_payment_state(booking), "remitted": True}
+
+
+@router.get("/cash/outstanding/all")
+async def list_outstanding_cash(
+    current: CurrentUser = Depends(require_roles(UserRole.admin, UserRole.operations)),
+    db: AsyncSession = Depends(get_db),
+):
+    """Every booking with cash collected but not yet remitted, for the
+    finance / admin remittance queue.
+
+    This is the list an admin needs before they can call
+    POST /payments/cash/remit/{booking_id} on anything — without it there
+    was a working remit action with no way to discover what needed
+    remitting. Grouped implicitly by worker_id in the response so the UI
+    can show "this provider owes ₹X across N bookings" without a second
+    round trip.
+    """
+    res = await db.execute(
+        select(Booking)
+        .where(
+            Booking.payment_method == PaymentMethod.cash,
+            Booking.cash_collected_at.isnot(None),
+            Booking.cash_remitted_at.is_(None),
+        )
+        .order_by(Booking.cash_collected_at.asc())
+    )
+    bookings = list(res.scalars().all())
+    if not bookings:
+        return {"total_outstanding": 0.0, "bookings": []}
+
+    worker_ids = {b.cash_collected_by for b in bookings if b.cash_collected_by}
+    names: dict = {}
+    if worker_ids:
+        wres = await db.execute(
+            select(WorkerProfile, User)
+            .join(User, User.id == WorkerProfile.user_id)
+            .where(WorkerProfile.id.in_(worker_ids))
+        )
+        for wp, u in wres.all():
+            names[wp.id] = u.full_name or u.email
+
+    rows = [
+        {
+            "booking_id": str(b.id),
+            "booking_ref": b.booking_ref,
+            "worker_id": str(b.cash_collected_by) if b.cash_collected_by else None,
+            "worker_name": names.get(b.cash_collected_by),
+            "amount": float(b.cash_collected_amount or 0),
+            "collected_at": b.cash_collected_at.isoformat() if b.cash_collected_at else None,
+        }
+        for b in bookings
+    ]
+    return {
+        "total_outstanding": sum(r["amount"] for r in rows),
+        "bookings": rows,
+    }
+
+
+@router.get("/cash/outstanding")
+async def my_outstanding_cash(
+    current: CurrentUser = Depends(require_roles(UserRole.worker)),
+    db: AsyncSession = Depends(get_db),
+):
+    """Cash this provider is holding that has not yet been remitted."""
+    from app.models.models import WorkerProfile
+    from app.services.cash_payment import outstanding_cash_for_worker
+
+    wres = await db.execute(select(WorkerProfile).where(WorkerProfile.user_id == current.id))
+    worker = wres.scalar_one_or_none()
+    if not worker:
+        raise HTTPException(status_code=403, detail="Worker profile required")
+
+    amount = await outstanding_cash_for_worker(db, worker.id)
+    return {"worker_id": str(worker.id), "outstanding_cash": float(amount)}

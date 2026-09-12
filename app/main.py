@@ -23,6 +23,7 @@ from app.api.v1 import (
     care,
     care_workflow,
     catalog,
+    forms,
     composite_care,
     contracts,
     eprescriptions,
@@ -73,6 +74,13 @@ def _ensure_infra_running() -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Config problems that silently break user-facing flows (dev-mode OTP
+    # left on in production, no mail provider, missing Razorpay secrets).
+    # Logged loudly at boot so they're caught on deploy rather than by a
+    # customer who never receives a code or whose payment won't verify.
+    for problem in settings.startup_warnings():
+        logger.error("CONFIG: %s", problem)
+
     _ensure_infra_running()
     # Run seed (creates tables + initial config)
     from app.seed import main as seed
@@ -175,6 +183,7 @@ for r in [
     auth_password_reset.router,
     review_tickets.router,
     catalog.router,
+    forms.router,
     bookings.router,
     visits.router,
     visits.notes_router,

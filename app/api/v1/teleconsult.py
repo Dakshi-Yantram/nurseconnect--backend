@@ -31,16 +31,40 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
 from app.core.deps import CurrentUser, get_worker_profile, require_operations
+from app.core.provider_types import PROVIDER_TYPE_LABELS, is_tele_capable
 from app.models.enums import TeleConsultationStage, WorkerType
 from app.models.models import Booking, Patient, TeleConsultation, User, WorkerProfile
 
 router = APIRouter(prefix="/teleconsult", tags=["teleconsult"])
 
 
-def _require_doctor(worker: WorkerProfile = Depends(get_worker_profile)) -> WorkerProfile:
-    if worker.worker_type != WorkerType.doctor:
-        raise HTTPException(status_code=403, detail="Doctor account required")
+def _require_tele_doctor(worker: WorkerProfile = Depends(get_worker_profile)) -> WorkerProfile:
+    """Only tele-capable doctors may touch the consultation queue.
+
+    This is the gate that keeps the two doctor workflows apart. A Physical
+    Doctor does in-person visits — waiting queues, call buttons and video
+    rooms are not part of their job, so they are refused here rather than
+    being shown tele features that do nothing for them.
+
+    `doctor` (the pre-existing generic type) remains tele-capable, so every
+    doctor who works today keeps working.
+    """
+    if not is_tele_capable(worker.worker_type):
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "code": "TELE_DOCTOR_REQUIRED",
+                "message": (
+                    "This is a tele-consultation feature. Your account is registered "
+                    f"as {PROVIDER_TYPE_LABELS.get(worker.worker_type, worker.worker_type.value)}."
+                ),
+            },
+        )
     return worker
+
+
+# Back-compat alias: existing route signatures below depend on this name.
+_require_doctor = _require_tele_doctor
 
 
 class TeleConsultOut(BaseModel):

@@ -123,7 +123,7 @@ async def _ensure_role_profile(db: AsyncSession, user: User) -> None:
             # ever approves a worker. Outside of dev/CI, a worker still
             # lands in documents_pending and must go through real
             # document review + reviewer approval, same as before.
-            if settings.OTP_DEV_MODE:
+            if settings.otp_dev_mode:
                 worker_kwargs = {
                     "onboarding_status": WorkerOnboardingStatus.approved,
                     "tier": WorkerTier.tier3,
@@ -159,7 +159,7 @@ async def _ensure_role_profile(db: AsyncSession, user: User) -> None:
 async def _create_email_verification(db: AsyncSession, user: User) -> str:
     code = (
         settings.EMAIL_DEV_FIXED_CODE
-        if settings.EMAIL_DEV_MODE
+        if settings.email_dev_mode
         else f"{secrets.randbelow(1000000):06d}"
     )
     expires_at = datetime.now(timezone.utc) + timedelta(
@@ -265,12 +265,13 @@ async def register(payload: RegisterRequest, request: Request, db: AsyncSession 
     code = await _create_email_verification(db, user)
     await audit(db, user.id, user.role.value, "auth.register", "user", user.id)
     await db.commit()
-    await send_verification_email(email, code)
+    sent = await send_verification_email(email, code)
     return RegisterResponse(
         registered=True,
         email=email,
         expires_in_seconds=settings.EMAIL_VERIFICATION_EXPIRE_MINUTES * 60,
-        dev_verification_code=code if settings.EMAIL_DEV_MODE else None,
+        dev_verification_code=code if settings.email_dev_mode else None,
+        email_sent=bool(sent) or settings.email_dev_mode,
     )
 
 
@@ -329,12 +330,13 @@ async def resend_email_verification(
         raise HTTPException(status_code=400, detail="Account does not require email verification")
     code = await _create_email_verification(db, user)
     await db.commit()
-    await send_verification_email(email, code)
+    sent = await send_verification_email(email, code)
     return RegisterResponse(
         registered=True,
         email=email,
         expires_in_seconds=settings.EMAIL_VERIFICATION_EXPIRE_MINUTES * 60,
-        dev_verification_code=code if settings.EMAIL_DEV_MODE else None,
+        dev_verification_code=code if settings.email_dev_mode else None,
+        email_sent=bool(sent) or settings.email_dev_mode,
     )
 
 
@@ -410,11 +412,11 @@ async def phone_login(payload: PhoneLoginRequest, request: Request, db: AsyncSes
     ures = await db.execute(select(User).where(User.phone_e164 == phone))
     user = ures.scalar_one_or_none()
 
-    if user and user.role != payload.role:
-        raise HTTPException(
-            status_code=409,
-            detail="This phone number is already registered under a different role",
-        )
+    # Same reasoning as /otp/verify: an existing number signs in as the
+    # account it already belongs to, under that account's stored role.
+    # Rejecting the request only stranded existing users and pushed them
+    # toward creating a duplicate account under the other role.
+    role_switched = bool(user is not None and user.role != payload.role)
 
     if not user:
         user = User(
@@ -446,7 +448,12 @@ async def phone_login(payload: PhoneLoginRequest, request: Request, db: AsyncSes
     await audit(db, user.id, user.role.value, "auth.phone_login", "user", user.id)
     await db.commit()
     await db.refresh(user)
-    return AuthResponse(user=UserOut.model_validate(user), tokens=tokens)
+    return AuthResponse(
+        user=UserOut.model_validate(user),
+        tokens=tokens,
+        authenticated_role=user.role,
+        role_switched=role_switched,
+    )
 
 
 @router.post("/refresh", response_model=TokenPair)
@@ -520,9 +527,22 @@ async def otp_send(payload: OtpSendRequest, request: Request, db: AsyncSession =
         message="Too many codes requested for this number. Wait a few minutes and try again.",
     )
     await enforce_rate_limit("otp_send:ip", ip, 15, 60 * 60)
+
+    # Role detection up front. The app previously discovered a role clash
+    # only at /otp/verify, i.e. after the user had already received and
+    # typed a code — which is the "This number is registered as a care
+    # professional" dead end. Tell the client now so it can switch to the
+    # right sign-in screen before asking for anything.
+    existing_res = await db.execute(select(User).where(User.phone_e164 == phone))
+    existing_user = existing_res.scalar_one_or_none()
+    existing_role = existing_user.role if existing_user else None
+
+    # `settings.otp_dev_mode` (property) is force-disabled outside
+    # development, so a production deployment can never fall back to the
+    # fixed code even if OTP_DEV_MODE is left set in the environment.
     code = (
         settings.OTP_DEV_FIXED_CODE
-        if settings.OTP_DEV_MODE
+        if settings.otp_dev_mode
         else f"{secrets.randbelow(1000000):06d}"
     )
     expires_at = datetime.now(timezone.utc) + timedelta(minutes=settings.OTP_EXPIRE_MINUTES)
@@ -536,7 +556,7 @@ async def otp_send(payload: OtpSendRequest, request: Request, db: AsyncSession =
     )
     await db.commit()
 
-    if not settings.OTP_DEV_MODE:
+    if not settings.otp_dev_mode:
         try:
             from app.integrations.providers import msg91_client
             await msg91_client.send_otp(phone, code)
@@ -547,7 +567,9 @@ async def otp_send(payload: OtpSendRequest, request: Request, db: AsyncSession =
         sent=True,
         phone_e164=phone,
         expires_in_seconds=settings.OTP_EXPIRE_MINUTES * 60,
-        dev_otp=code if settings.OTP_DEV_MODE else None,
+        dev_otp=code if settings.otp_dev_mode else None,
+        existing_role=existing_role,
+        role_mismatch=bool(existing_role is not None and existing_role != payload.role),
     )
 
 
@@ -592,11 +614,20 @@ async def otp_verify(payload: OtpVerifyRequest, request: Request, db: AsyncSessi
     user_res = await db.execute(select(User).where(User.phone_e164 == phone))
     user = user_res.scalar_one_or_none()
 
-    if user and user.role != payload.role:
-        raise HTTPException(
-            status_code=409,
-            detail=f"This number is registered as a {user.role.value}. Use the correct login for that role.",
-        )
+    # A number that already belongs to an account authenticates AS that
+    # account. This used to 409 whenever the requested role differed from
+    # the stored one, which stranded every existing care professional who
+    # tapped the patient sign-in: correct credentials, correct OTP, no way
+    # through. The OTP proves control of the number, which is the whole
+    # authentication factor here — the role the client happened to guess is
+    # routing information, not a credential.
+    #
+    # The account's stored role always wins. We never rewrite it, and we
+    # never create a second account for a number that already has one, so
+    # this cannot produce duplicate or role-swapped users. The response
+    # reports which role was actually used so the client can route to the
+    # matching dashboard.
+    role_switched = bool(user is not None and user.role != payload.role)
 
     if not user:
         # `full_name` is optional on the OTP signup path — leave it NULL when
@@ -629,7 +660,20 @@ async def otp_verify(payload: OtpVerifyRequest, request: Request, db: AsyncSessi
         device_platform=payload.device_platform,
         fcm_token=payload.fcm_token,
     )
-    await audit(db, user.id, user.role.value, "auth.otp_login", "user", user.id)
+    await audit(
+        db,
+        user.id,
+        user.role.value,
+        "auth.otp_login",
+        "user",
+        user.id,
+        {"requested_role": payload.role.value, "role_switched": role_switched} if role_switched else None,
+    )
     await db.commit()
     await db.refresh(user)
-    return AuthResponse(user=UserOut.model_validate(user), tokens=tokens)
+    return AuthResponse(
+        user=UserOut.model_validate(user),
+        tokens=tokens,
+        authenticated_role=user.role,
+        role_switched=role_switched,
+    )

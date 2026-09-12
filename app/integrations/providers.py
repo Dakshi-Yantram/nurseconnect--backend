@@ -55,7 +55,39 @@ class RazorpayClient:
         client = razorpay.Client(auth=(self.key_id, self.key_secret))
         return client.order.create({"amount": amount_paise, "currency": currency, "receipt": receipt, "notes": notes or {}})
 
+    async def fetch_order_payments(self, order_id: str) -> list:
+        """Every payment attempt Razorpay has recorded against an order.
+
+        This is the authority used by /payments/reconcile to settle a
+        booking whose money left the customer's account but whose
+        /verify call never completed (app killed, network dropped, or a
+        server error on our side). Razorpay's record wins; we never mark a
+        booking paid on the client's say-so.
+
+        Returns [] rather than raising, so reconciliation degrades to "no
+        evidence of payment" instead of erroring.
+        """
+        if self.mock:
+            return []
+        try:
+            import razorpay  # local import
+
+            client = razorpay.Client(auth=(self.key_id, self.key_secret))
+            resp = client.order.payments(order_id)
+            return list(resp.get("items") or [])
+        except Exception:  # noqa: BLE001
+            logger.exception("razorpay order.payments lookup failed for %s", order_id)
+            return []
+
     def verify_payment_signature(self, order_id: str, payment_id: str, signature: str) -> bool:
+        # Guard: without a secret we cannot compute the HMAC at all. This
+        # used to raise AttributeError on `None.encode()` and surface as a
+        # 500 ("verification failed") on a perfectly good payment, which is
+        # indistinguishable to the customer from us losing their money.
+        # Fail closed, loudly, and as a 4xx rather than a crash.
+        if not self.mock and not self.key_secret:
+            logger.error("RAZORPAY_KEY_SECRET is not configured — cannot verify signatures")
+            return False
         if self.mock:
             # Accept any signature in dev for ease of testing
             return signature.startswith("mock_") or signature == "mock_signature" or len(signature) >= 32
@@ -806,6 +838,211 @@ class AbhaClient:
         return {"abha_id": abha_id, "records": []}
 
 
+# ============================================================================
+# Digio — Aadhaar eSign on state e-Stamp paper
+#
+# Used for the Stage 2 Master Independent Contractor Agreement (see
+# app/api/v1/contracts.py). This wraps Digio's v2 Gateway document API:
+#
+#   POST /v2/client/document/uploadpdf   create a signing request from a
+#                                         PDF, with one or more signers
+#   GET  /v2/client/document/{id}        current status + per-signer detail
+#
+# authenticated with HTTP Basic auth using the client id/secret issued from
+# the Digio dashboard, exactly like the razorpay.Client(auth=(...)) pattern
+# above.
+#
+# IMPORTANT — verify against Digio's current developer docs before going
+# live: integration accounts are provisioned per-merchant and Digio has
+# historically offered more than one integration mode (a Gateway/hosted flow
+# and a lower-level Direct API), so exact path segments, the signer-URL
+# field name, and webhook payload shape can differ from what's coded here
+# depending on which mode your Digio account is provisioned for. Nothing in
+# the surrounding contract flow depends on Digio's specific field names —
+# they're only read in this one class — so correcting them is a local,
+# contained change to this class and callers of the well-typed methods
+# below are unaffected.
+#
+# What IS guaranteed correct regardless of the exact wire format: the
+# security model. A signing session is only ever marked "signed" by
+# get_document_status() or a webhook whose signature this class verifies —
+# never by anything a client sends us. See app/api/v1/contracts.py.
+# ============================================================================
+class DigioClient:
+    def __init__(self) -> None:
+        self.client_id = settings.DIGIO_CLIENT_ID
+        self.client_secret = settings.DIGIO_CLIENT_SECRET
+        self.webhook_secret = settings.DIGIO_WEBHOOK_SECRET
+        self.base_url = (settings.DIGIO_BASE_URL or "https://api.digio.in").rstrip("/")
+        self.redirect_url = settings.DIGIO_REDIRECT_URL
+        self.mock = (
+            settings.MOCK_EXTERNAL_PROVIDERS
+            or not self.client_id
+            or not self.client_secret
+            or self.client_id.endswith("_placeholder")
+        )
+
+    def _auth(self) -> tuple[str, str]:
+        return (self.client_id, self.client_secret)
+
+    async def create_esign_request(
+        self,
+        *,
+        pdf_bytes: bytes,
+        signer_name: str,
+        signer_identifier: str,  # phone (E.164) or email — Digio sends the signing link here
+        reason: str = "Master Independent Contractor Agreement",
+        file_name: str = "agreement.pdf",
+    ) -> Dict[str, Any]:
+        """Create a signing request for a rendered PDF. Returns the raw
+        Digio response — callers persist whatever fields they need onto
+        their own WorkerEsignSession row rather than this method assuming
+        a particular schema, since the exact response shape is the part
+        most likely to need adjustment per Digio's current API version.
+
+        Mock mode returns a self-consistent fake response with the same
+        top-level shape (id / signing_parties[0].sign_url) so the rest of
+        the flow — session creation, the mobile WebView, status polling —
+        exercises the exact same code path it will in production. Nothing
+        in mock mode marks the session signed; that only ever happens via
+        mock_mark_signed() below or a real webhook, so the "server decides,
+        not the client" invariant holds in mock mode too.
+        """
+        if self.mock:
+            doc_id = f"DIGIO_MOCK_{uuid.uuid4().hex[:16].upper()}"
+            logger.info(
+                "MOCK digio create_esign_request signer=%s reason=%s -> %s",
+                signer_identifier, reason, doc_id,
+            )
+            return {
+                "id": doc_id,
+                "agreement_status": "requested",
+                "signing_parties": [
+                    {
+                        "identifier": signer_identifier,
+                        "name": signer_name,
+                        # A real Digio sign_url is a hosted page; in mock
+                        # mode this is an address the mobile app recognises
+                        # and renders its own in-app mock signing screen
+                        # for, so the WebView step is still exercised
+                        # end-to-end without a network call.
+                        "sign_url": f"nurseconnect-mock://digio-sign/{doc_id}",
+                    }
+                ],
+            }
+
+        import base64
+        import httpx
+
+        payload = {
+            "signers": [
+                {
+                    "identifier": signer_identifier,
+                    "name": signer_name,
+                    "reason": reason,
+                    "sign_type": "aadhaar",
+                }
+            ],
+            "expire_in_days": max(1, settings.DIGIO_SESSION_EXPIRE_MINUTES // (24 * 60) or 1),
+            "display_on_page": "all",
+            "notify_signers": True,
+            "send_sign_link": True,
+            "file_name": file_name,
+        }
+        try:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(20.0, connect=5.0)) as client:
+                resp = await client.post(
+                    f"{self.base_url}/v2/client/document/uploadpdf",
+                    auth=self._auth(),
+                    data={"request": __import__("json").dumps(payload)},
+                    files={"file": (file_name, pdf_bytes, "application/pdf")},
+                )
+        except httpx.TimeoutException as exc:
+            logger.exception("digio create_esign_request timed out")
+            raise ExternalProviderError("Digio request timed out") from exc
+        except httpx.RequestError as exc:
+            logger.exception("digio create_esign_request failed")
+            raise ExternalProviderError("Digio request failed") from exc
+        if resp.status_code >= 400:
+            logger.error("digio create_esign_request %s: %s", resp.status_code, resp.text[:500])
+            raise ExternalProviderError(f"Digio returned {resp.status_code}")
+        return resp.json()
+
+    async def get_document_status(self, document_id: str) -> Dict[str, Any]:
+        """Authoritative current status for a document, polled directly
+        from Digio. This — not a webhook, and never a client claim — is
+        what /contracts/me/stage2/esign/status falls back to when a
+        webhook hasn't arrived yet, and what the finalize step re-checks
+        before ever creating the executed agreement record.
+        """
+        if self.mock:
+            return {"id": document_id, "agreement_status": "requested"}
+
+        import httpx
+
+        try:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(15.0, connect=5.0)) as client:
+                resp = await client.get(
+                    f"{self.base_url}/v2/client/document/{document_id}",
+                    auth=self._auth(),
+                )
+        except httpx.TimeoutException as exc:
+            logger.exception("digio get_document_status timed out for %s", document_id)
+            raise ExternalProviderError("Digio status request timed out") from exc
+        except httpx.RequestError as exc:
+            logger.exception("digio get_document_status failed for %s", document_id)
+            raise ExternalProviderError("Digio status request failed") from exc
+        if resp.status_code >= 400:
+            logger.error(
+                "digio get_document_status %s -> %s: %s",
+                document_id, resp.status_code, resp.text[:500],
+            )
+            raise ExternalProviderError(f"Digio returned {resp.status_code}")
+        return resp.json()
+
+    @staticmethod
+    def is_signed(status_payload: Dict[str, Any]) -> bool:
+        """True only once Digio itself reports full completion.
+
+        Digio's `agreement_status` moves through requested -> viewed/pending
+        -> completed. Some integration modes report per-signer status inside
+        `signing_parties[].sign_status` instead of (or alongside) the
+        top-level field, so both are checked; either being a completion
+        value is sufficient, but NEITHER being present means not signed —
+        the default is always "not signed", never the reverse.
+        """
+        top = str(status_payload.get("agreement_status") or "").lower()
+        if top in ("completed", "signed", "success"):
+            return True
+        for party in status_payload.get("signing_parties") or []:
+            if str(party.get("sign_status") or "").lower() in ("signed", "completed", "success"):
+                return True
+        return False
+
+    @staticmethod
+    def is_failed(status_payload: Dict[str, Any]) -> bool:
+        top = str(status_payload.get("agreement_status") or "").lower()
+        return top in ("declined", "expired", "failed", "cancelled")
+
+    def verify_webhook_signature(self, body: bytes, signature: Optional[str]) -> bool:
+        """HMAC-SHA256 over the raw request body using DIGIO_WEBHOOK_SECRET.
+
+        Digio lets you configure a shared secret against your webhook URL
+        in their dashboard; this checks the request against that secret the
+        same way app/api/v1/payments.py checks Razorpay's. The header this
+        signature arrives in is configurable (see contracts.py) since it is
+        the one Digio-specific detail most likely to vary by account setup
+        — the verification logic itself doesn't depend on the header name.
+        """
+        if self.mock:
+            return True
+        if not self.webhook_secret or not signature:
+            logger.error("DIGIO_WEBHOOK_SECRET not configured or signature missing — rejecting webhook")
+            return False
+        expected = hmac.new(self.webhook_secret.encode(), body, hashlib.sha256).hexdigest()
+        return hmac.compare_digest(expected, signature)
+
+
 # Singletons
 razorpay_client = RazorpayClient()
 cloudinary_client = CloudinaryClient()
@@ -815,3 +1052,4 @@ firebase_push_client = FirebasePushClient()
 apns_voip_client = ApnsVoipClient()
 abha_client = AbhaClient()
 realtimekit_client = RealtimeKitClient()
+digio_client = DigioClient()

@@ -392,6 +392,25 @@ class PaymentStatus(str, Enum):
     failed = "failed"
     refunded = "refunded"
     partially_refunded = "partially_refunded"
+    # Cash-on-delivery only: the booking is confirmed and dispatchable, but
+    # no money has moved yet — the provider collects it at the visit.
+    # Deliberately distinct from `pending` (nothing arranged) and from
+    # `captured` (money actually received), so revenue reporting, payouts
+    # and the "has this been paid?" question all stay truthful.
+    cash_due = "cash_due"
+
+
+class PaymentMethod(str, Enum):
+    """How the customer chose to pay.
+
+    Kept as its own dimension rather than being folded into PaymentStatus:
+    method answers "how", status answers "where in the lifecycle". Mixing
+    them is what forces `if razorpay_order_id is not None` checks to stand in
+    for "is this an online booking", which then break the moment a second
+    method exists.
+    """
+    razorpay = "razorpay"
+    cash = "cash"
 
 
 class ComplaintStatus(str, Enum):
@@ -495,6 +514,22 @@ class WorkerType(str, Enum):
     dentist = "dentist"
     physiotherapist = "physiotherapist"
     mother_baby_caregiver = "mother_baby_caregiver"
+    # Tele-Doctor and Physical Doctor are separate Provider Types rather
+    # than a mode flag on `doctor`. That choice is deliberate: every piece
+    # of machinery that needs to tell them apart — required documents,
+    # package eligibility (allowed_provider_types), training modules,
+    # onboarding forms, the qualification gate — is already keyed on
+    # Provider Type. Modelling them as types means all of that separates
+    # them automatically, with no parallel branching to keep in sync.
+    #
+    # `doctor` is retained and untouched. Existing doctor rows keep working
+    # exactly as before and are treated as capable of both modes (see
+    # TELE_CAPABLE_PROVIDER_TYPES / PHYSICAL_CAPABLE_PROVIDER_TYPES in
+    # app/core/provider_types.py), so nothing that works today stops
+    # working. New doctors should be onboarded as one of the two specific
+    # types.
+    tele_doctor = "tele_doctor"
+    physical_doctor = "physical_doctor"
 
 
 class ProviderStatusChangeReason(str, Enum):
