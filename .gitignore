@@ -16,3 +16,4 @@ venv/
 * 2.md
 * 2
 *.local-bak
+test-env.ps1
