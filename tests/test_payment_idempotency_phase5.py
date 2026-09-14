@@ -38,10 +38,10 @@ def _unique_phone() -> str:
 
 
 def _login(phone: str, role: str) -> tuple[str, str]:
-    r = requests.post(f"{API}/auth/send-otp", json={"phone_e164": phone, "role": role}, timeout=10)
+    r = requests.post(f"{API}/auth/otp/send", json={"phone_e164": phone, "role": role}, timeout=10)
     assert r.status_code == 200, f"send-otp {r.status_code}: {r.text}"
     r = requests.post(
-        f"{API}/auth/verify-otp",
+        f"{API}/auth/otp/verify",
         json={
             "phone_e164": phone,
             "code": OTP,

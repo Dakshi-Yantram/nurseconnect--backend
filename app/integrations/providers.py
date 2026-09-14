@@ -13,11 +13,16 @@ import hmac
 import logging
 import secrets
 import uuid
+from datetime import timedelta
 from typing import Any, Dict, Optional
 
 from app.core.config import settings
 
 logger = logging.getLogger(__name__)
+
+
+class ExternalProviderError(RuntimeError):
+    """Raised when an upstream provider is unavailable or rejects a request."""
 
 
 # ============================================================================
@@ -50,7 +55,39 @@ class RazorpayClient:
         client = razorpay.Client(auth=(self.key_id, self.key_secret))
         return client.order.create({"amount": amount_paise, "currency": currency, "receipt": receipt, "notes": notes or {}})
 
+    async def fetch_order_payments(self, order_id: str) -> list:
+        """Every payment attempt Razorpay has recorded against an order.
+
+        This is the authority used by /payments/reconcile to settle a
+        booking whose money left the customer's account but whose
+        /verify call never completed (app killed, network dropped, or a
+        server error on our side). Razorpay's record wins; we never mark a
+        booking paid on the client's say-so.
+
+        Returns [] rather than raising, so reconciliation degrades to "no
+        evidence of payment" instead of erroring.
+        """
+        if self.mock:
+            return []
+        try:
+            import razorpay  # local import
+
+            client = razorpay.Client(auth=(self.key_id, self.key_secret))
+            resp = client.order.payments(order_id)
+            return list(resp.get("items") or [])
+        except Exception:  # noqa: BLE001
+            logger.exception("razorpay order.payments lookup failed for %s", order_id)
+            return []
+
     def verify_payment_signature(self, order_id: str, payment_id: str, signature: str) -> bool:
+        # Guard: without a secret we cannot compute the HMAC at all. This
+        # used to raise AttributeError on `None.encode()` and surface as a
+        # 500 ("verification failed") on a perfectly good payment, which is
+        # indistinguishable to the customer from us losing their money.
+        # Fail closed, loudly, and as a 4xx rather than a crash.
+        if not self.mock and not self.key_secret:
+            logger.error("RAZORPAY_KEY_SECRET is not configured — cannot verify signatures")
+            return False
         if self.mock:
             # Accept any signature in dev for ease of testing
             return signature.startswith("mock_") or signature == "mock_signature" or len(signature) >= 32
@@ -64,12 +101,193 @@ class RazorpayClient:
         expected = hmac.new(self.webhook_secret.encode(), body, hashlib.sha256).hexdigest()
         return hmac.compare_digest(expected, signature)
 
-    async def initiate_payout(self, fund_account_id: str, amount_paise: int, reference: str, notes: Optional[Dict] = None) -> Dict[str, Any]:
+    # -----------------------------------------------------------------
+    # RazorpayX Payouts
+    #
+    # Payouts are a different product from Checkout above: a different API
+    # host (api.razorpay.com/v1/payouts), a source account number rather than
+    # an order, and its own webhook secret. The razorpay python SDK does not
+    # wrap payouts, so these call the REST API directly over httpx.
+    #
+    # Terminal states are `processed` (money moved), `reversed`, `cancelled`
+    # and `failed`. `queued`/`pending`/`processing` are NOT terminal — the
+    # caller must keep the payout un-paid until a webhook or a status poll
+    # returns `processed`.
+    # -----------------------------------------------------------------
+    PAYOUT_API = "https://api.razorpay.com/v1"
+
+    TERMINAL_SUCCESS = {"processed"}
+    TERMINAL_FAILURE = {"failed", "cancelled", "reversed", "rejected"}
+
+    @property
+    def payouts_enabled(self) -> bool:
+        """True when a real RazorpayX transfer can actually be attempted."""
+        return bool(
+            not self.mock
+            and settings.RAZORPAYX_ACCOUNT_NUMBER
+            and (settings.RAZORPAYX_KEY_ID or self.key_id)
+            and (settings.RAZORPAYX_KEY_SECRET or self.key_secret)
+        )
+
+    def _payout_auth(self) -> tuple[str, str]:
+        return (
+            settings.RAZORPAYX_KEY_ID or self.key_id,
+            settings.RAZORPAYX_KEY_SECRET or self.key_secret,
+        )
+
+    def verify_payout_webhook_signature(self, body: bytes, signature: str) -> bool:
+        """Payout webhooks are signed with their own secret, not the payments
+        one. Falls back to the payments secret only if the payout-specific
+        secret is unset, so an existing single-secret setup keeps working."""
+        if self.mock:
+            return True
+        secret = settings.RAZORPAYX_WEBHOOK_SECRET or self.webhook_secret
+        if not secret:
+            return False
+        expected = hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
+        return hmac.compare_digest(expected, signature or "")
+
+    async def create_fund_account(
+        self,
+        *,
+        contact_name: str,
+        contact_id: Optional[str],
+        account_number: str,
+        ifsc: str,
+        contact_reference: str,
+        contact_phone: Optional[str] = None,
+        contact_email: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Ensure a RazorpayX contact + bank fund account exists for a nurse.
+
+        Returns {"contact_id": ..., "fund_account_id": ...}. RazorpayX will
+        not pay to a raw account number — money can only be sent to a
+        fund_account_id, so this must run once per nurse before the first
+        transfer. The ids are cached on WorkerProfile by the caller.
+        """
+        if self.mock:
+            return {
+                "contact_id": contact_id or f"cont_mock_{uuid.uuid4().hex[:12]}",
+                "fund_account_id": f"fa_mock_{uuid.uuid4().hex[:12]}",
+            }
+
+        import httpx
+
+        auth = self._payout_auth()
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            if not contact_id:
+                payload: Dict[str, Any] = {
+                    "name": contact_name,
+                    "type": "employee",
+                    "reference_id": contact_reference,
+                }
+                if contact_phone:
+                    payload["contact"] = contact_phone
+                if contact_email:
+                    payload["email"] = contact_email
+                r = await client.post(f"{self.PAYOUT_API}/contacts", json=payload, auth=auth)
+                if r.status_code >= 400:
+                    raise ExternalProviderError(f"RazorpayX contact creation failed: {r.text}")
+                contact_id = r.json()["id"]
+
+            r = await client.post(
+                f"{self.PAYOUT_API}/fund_accounts",
+                json={
+                    "contact_id": contact_id,
+                    "account_type": "bank_account",
+                    "bank_account": {
+                        "name": contact_name,
+                        "ifsc": ifsc,
+                        "account_number": account_number,
+                    },
+                },
+                auth=auth,
+            )
+            if r.status_code >= 400:
+                raise ExternalProviderError(f"RazorpayX fund account creation failed: {r.text}")
+            return {"contact_id": contact_id, "fund_account_id": r.json()["id"]}
+
+    async def initiate_payout(
+        self,
+        fund_account_id: str,
+        amount_paise: int,
+        reference: str,
+        notes: Optional[Dict] = None,
+        idempotency_key: Optional[str] = None,
+        mode: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Create a RazorpayX payout.
+
+        `idempotency_key` is sent as X-Payout-Idempotency. Razorpay returns
+        the ORIGINAL payout for a repeated key instead of creating a second
+        one, which is what makes a retry after a network timeout safe: the
+        caller cannot accidentally pay a nurse twice for one booking.
+
+        The returned `status` is passed through untouched — it is frequently
+        `queued` or `processing`, and the caller must not read that as paid.
+        """
         if self.mock:
             payout_id = f"pout_mock_{uuid.uuid4().hex[:14]}"
-            return {"id": payout_id, "status": "processed", "amount": amount_paise, "reference_id": reference}
-        # Real impl would use razorpay.Client(...).payout.create(...)
-        raise NotImplementedError("Configure real Razorpay credentials")
+            return {
+                "id": payout_id,
+                "entity": "payout",
+                "status": "processed",
+                "amount": amount_paise,
+                "reference_id": reference,
+                "utr": f"MOCKUTR{uuid.uuid4().hex[:12].upper()}",
+                "fund_account_id": fund_account_id,
+            }
+
+        if not settings.RAZORPAYX_ACCOUNT_NUMBER:
+            raise ExternalProviderError(
+                "RAZORPAYX_ACCOUNT_NUMBER is not configured — cannot initiate a payout."
+            )
+
+        import httpx
+
+        headers = {"Content-Type": "application/json"}
+        if idempotency_key:
+            headers["X-Payout-Idempotency"] = idempotency_key
+
+        body = {
+            "account_number": settings.RAZORPAYX_ACCOUNT_NUMBER,
+            "fund_account_id": fund_account_id,
+            "amount": amount_paise,
+            "currency": "INR",
+            "mode": mode or settings.RAZORPAYX_PAYOUT_MODE,
+            "purpose": settings.RAZORPAYX_PAYOUT_PURPOSE,
+            "queue_if_low_balance": True,
+            "reference_id": reference,
+            "narration": (notes or {}).get("narration", "NurseConnect payout"),
+            "notes": {k: str(v) for k, v in (notes or {}).items()},
+        }
+
+        async with httpx.AsyncClient(timeout=40.0) as client:
+            r = await client.post(
+                f"{self.PAYOUT_API}/payouts",
+                json=body,
+                headers=headers,
+                auth=self._payout_auth(),
+            )
+        if r.status_code >= 400:
+            raise ExternalProviderError(f"RazorpayX payout failed [{r.status_code}]: {r.text}")
+        return r.json()
+
+    async def fetch_payout(self, payout_id: str) -> Dict[str, Any]:
+        """Poll a payout's current state — used to resolve `queued`/`processing`
+        payouts and to reconcile when a webhook was missed."""
+        if self.mock:
+            return {"id": payout_id, "status": "processed",
+                    "utr": f"MOCKUTR{payout_id[-10:].upper()}"}
+
+        import httpx
+
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            r = await client.get(f"{self.PAYOUT_API}/payouts/{payout_id}",
+                                 auth=self._payout_auth())
+        if r.status_code >= 400:
+            raise ExternalProviderError(f"RazorpayX payout fetch failed: {r.text}")
+        return r.json()
 
     async def create_refund(self, payment_id: str, amount_paise: int) -> Dict[str, Any]:
         if self.mock:
@@ -89,9 +307,32 @@ class CloudinaryClient:
         self.cloud_name = settings.CLOUDINARY_CLOUD_NAME
         self.api_key = settings.CLOUDINARY_API_KEY
         self.api_secret = settings.CLOUDINARY_API_SECRET
+        # A prod deployment silently falling into mock mode is the single
+        # nastiest failure mode this client has: uploads "succeed" (200 OK,
+        # a plausible-looking URL gets saved to the DB) but the file was
+        # never actually stored anywhere, so every later attempt to view
+        # that document/report/photo 404s. That used to be discoverable
+        # only by reading logs. Now it's loud at boot.
+        if self.mock and settings.APP_ENV.lower() in ("production", "prod"):
+            logger.critical(
+                "Cloudinary is running in MOCK mode while APP_ENV=%s. "
+                "Every document/report upload will be saved with a fake "
+                "res.cloudinary.com/mock/... URL that cannot be viewed. "
+                "Set CLOUDINARY_CLOUD_NAME/CLOUDINARY_API_KEY/CLOUDINARY_API_SECRET "
+                "and MOCK_EXTERNAL_PROVIDERS=false in the production environment.",
+                settings.APP_ENV,
+            )
 
     async def upload_base64(self, b64_payload: str, folder: str = "nurseconnect", resource_type: str = "image") -> Dict[str, Any]:
         if self.mock:
+            if settings.APP_ENV.lower() in ("production", "prod"):
+                # Don't let a misconfigured prod environment quietly eat
+                # people's documents. Fail the upload with a clear error
+                # instead of writing an unviewable fake URL to the DB.
+                raise ExternalProviderError(
+                    "Document storage is not configured for this environment. "
+                    "Please contact support — uploads are temporarily unavailable."
+                )
             public_id = f"{folder}/{uuid.uuid4().hex[:12]}"
             return {
                 "public_id": public_id,
@@ -108,7 +349,11 @@ class CloudinaryClient:
         payload = b64_payload
         if not payload.startswith("data:") and not payload.startswith("http"):
             payload = f"data:application/octet-stream;base64,{payload}"
-        return cloudinary.uploader.upload(payload, folder=folder, resource_type=resource_type)
+        try:
+            return cloudinary.uploader.upload(payload, folder=folder, resource_type=resource_type)
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("Cloudinary upload failed")
+            raise ExternalProviderError("Document storage is temporarily unavailable") from exc
 
     async def delete(self, public_id: str) -> Dict[str, Any]:
         if self.mock:
@@ -130,18 +375,50 @@ class Msg91Client:
         self.template_id = settings.MSG91_TEMPLATE_ID
 
     async def send_otp(self, phone_e164: str, otp: str) -> Dict[str, Any]:
+        """Send an already-generated OTP via MSG91's Flow API.
+
+        Our template lives under SMS > Templates in the MSG91 dashboard
+        (created/verified there, and "Test DLT" from that page sends fine).
+        That's MSG91's *Flow* template pool — a totally separate pool from
+        the dedicated "OTP" product's SendOTP templates. Calling
+        /api/v5/otp with a Flow template_id reliably comes back
+        "Template ID Missing or Invalid Template" even though the ID is
+        right there in the request — MSG91 is looking it up in the wrong
+        pool. /api/v5/flow/ is the correct endpoint for a Flow template.
+        The template content is "Your OTP for login is ##number##...", so
+        the variable name the Flow API expects is "number".
+        ``otp`` here is OUR own generated code (see auth.py); we pass
+        it through so MSG91 just relays it inside the DLT-approved template
+        rather than generating its own (which would break our own hash-based
+        verification in otp_verify()).
+        """
         if self.mock:
             logger.info("MOCK MSG91 send_otp phone=%s code=%s", phone_e164, otp)
             return {"type": "success", "request_id": f"msg91_mock_{uuid.uuid4().hex[:10]}"}
         import httpx
+        payload = {
+            "template_id": self.template_id,
+            "short_url": "0",
+            "recipients": [
+                {
+                    "mobiles": phone_e164.lstrip("+"),
+                    "number": otp,
+                }
+            ],
+        }
+        if self.sender_id:
+            payload["sender"] = self.sender_id
         async with httpx.AsyncClient() as client:
             resp = await client.post(
-                "https://control.msg91.com/api/v5/otp",
-                headers={"authkey": self.auth_key},
-                json={"template_id": self.template_id, "mobile": phone_e164.lstrip("+"), "otp": otp, "sender": self.sender_id},
+                "https://control.msg91.com/api/v5/flow/",
+                json=payload,
+                headers={"authkey": self.auth_key, "content-type": "application/json"},
                 timeout=10,
             )
-            return resp.json()
+            data = resp.json()
+            if data.get("type") != "success":
+                logger.error("MSG91 send_otp failed phone=%s response=%s", phone_e164, data)
+            return data
 
     async def send_sms(self, phone_e164: str, message: str) -> Dict[str, Any]:
         if self.mock:
@@ -176,19 +453,368 @@ class InteraktClient:
 
 
 # ============================================================================
-# Firebase Push
+# Firebase Push (Android)
 # ============================================================================
 class FirebasePushClient:
+    """FCM sender, used for both ordinary notifications and call ringing.
+
+    Two message shapes matter here:
+
+    * ``send_to_token``    — normal notification. The OS renders it; the app
+                             does not need to be running.
+    * ``send_call_push``   — **data-only, priority=high**. Android only lets a
+                             data-only high-priority message wake an app that
+                             the user has swiped away, and only a data-only
+                             message reaches the app's own handler so it can
+                             raise a full-screen CallKeep/ConnectionService UI
+                             rather than a plain notification banner. Adding a
+                             ``notification`` block here would break that: the
+                             system tray would swallow it and the app would
+                             never be invoked.
+    """
+
     def __init__(self) -> None:
         self.mock = settings.MOCK_EXTERNAL_PROVIDERS or not settings.FIREBASE_SERVICE_ACCOUNT_JSON
         self.project_id = settings.FIREBASE_PROJECT_ID
+        self._app = None
 
-    async def send_to_token(self, fcm_token: str, title: str, body: str, data: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
+    def _get_app(self):
+        """Lazily initialise the firebase-admin app.
+
+        Done on first use rather than at import so a deployment without
+        Firebase configured still boots — push simply reports itself as
+        unconfigured instead of taking the process down.
+        """
+        if self._app is not None:
+            return self._app
+        import json as _json
+
+        import firebase_admin
+        from firebase_admin import credentials
+
+        raw = settings.FIREBASE_SERVICE_ACCOUNT_JSON.strip()
+        # Accept either the JSON blob itself or a path to the file.
+        if raw.startswith("{"):
+            cred = credentials.Certificate(_json.loads(raw))
+        else:
+            cred = credentials.Certificate(raw)
+
+        try:
+            self._app = firebase_admin.get_app("nurseconnect")
+        except ValueError:
+            self._app = firebase_admin.initialize_app(cred, name="nurseconnect")
+        return self._app
+
+    async def _send(self, message) -> Dict[str, Any]:
+        """Dispatch on a worker thread — the firebase-admin SDK is blocking."""
+        import asyncio
+
+        from firebase_admin import messaging
+
+        def _do() -> str:
+            return messaging.send(message, app=self._get_app())
+
+        try:
+            message_id = await asyncio.to_thread(_do)
+            return {"success": True, "message_id": message_id}
+        except Exception as e:  # noqa: BLE001
+            # A token goes stale whenever the app is reinstalled. Report it so
+            # the caller can prune it rather than retrying forever.
+            name = type(e).__name__
+            unregistered = name in ("UnregisteredError", "SenderIdMismatchError")
+            if not unregistered:
+                logger.exception("FCM send failed")
+            return {"success": False, "reason": name, "unregistered": unregistered}
+
+    async def send_to_token(
+        self,
+        fcm_token: str,
+        title: str,
+        body: str,
+        data: Optional[Dict[str, str]] = None,
+    ) -> Dict[str, Any]:
         if self.mock:
             logger.info("MOCK Firebase push token=%s title=%s", fcm_token[:12] if fcm_token else None, title)
             return {"success": True, "message_id": f"fcm_mock_{uuid.uuid4().hex[:10]}"}
-        # Real impl via firebase_admin
-        return {"success": False, "reason": "not_configured"}
+        if not fcm_token:
+            return {"success": False, "reason": "no_token"}
+
+        from firebase_admin import messaging
+
+        message = messaging.Message(
+            token=fcm_token,
+            notification=messaging.Notification(title=title, body=body),
+            data={k: str(v) for k, v in (data or {}).items()},
+            android=messaging.AndroidConfig(priority="high"),
+            apns=messaging.APNSConfig(
+                payload=messaging.APNSPayload(aps=messaging.Aps(sound="default")),
+            ),
+        )
+        return await self._send(message)
+
+    async def send_call_push(self, fcm_token: str, data: Dict[str, str]) -> Dict[str, Any]:
+        """Data-only, high-priority ring for Android. See the class docstring
+        for why this must not carry a ``notification`` block."""
+        if self.mock:
+            logger.info("MOCK Firebase CALL push token=%s", fcm_token[:12] if fcm_token else None)
+            return {"success": True, "message_id": f"fcm_mock_call_{uuid.uuid4().hex[:10]}"}
+        if not fcm_token:
+            return {"success": False, "reason": "no_token"}
+
+        from firebase_admin import messaging
+
+        message = messaging.Message(
+            token=fcm_token,
+            data={k: str(v) for k, v in data.items()},
+            android=messaging.AndroidConfig(
+                priority="high",
+                # A ring is worthless if it arrives late, and pointless if it
+                # arrives after the caller gave up — so never let it queue.
+                ttl=timedelta(seconds=45),
+            ),
+        )
+        return await self._send(message)
+
+
+# ============================================================================
+# APNs VoIP (iOS PushKit)
+# ============================================================================
+class ApnsVoipClient:
+    """Sends PushKit VoIP pushes so a force-killed iOS app can ring.
+
+    This is the only mechanism Apple provides for that. A few hard rules are
+    baked in below because getting them wrong fails silently or, worse, gets
+    the app's VoIP push privileges revoked:
+
+    * the topic MUST be ``<bundle-id>.voip`` — the bare bundle id is rejected;
+    * ``apns-push-type`` MUST be ``voip`` and ``apns-priority`` 10;
+    * the payload carries no ``aps.alert`` — iOS does not display a VoIP push,
+      it hands it to the app, which must then report an incoming call to
+      CallKit **immediately**. iOS terminates apps that receive a VoIP push
+      without reporting a call, and repeat offenders stop receiving them.
+
+    Sandbox and production are different hosts and a device token from one is
+    invalid on the other; ``APNS_USE_SANDBOX`` must match how the app was
+    signed (dev build vs TestFlight/App Store).
+    """
+
+    _SANDBOX_HOST = "https://api.sandbox.push.apple.com"
+    _PROD_HOST = "https://api.push.apple.com"
+
+    def __init__(self) -> None:
+        self.mock = (
+            settings.MOCK_EXTERNAL_PROVIDERS
+            or not settings.APNS_KEY_P8
+            or not settings.APNS_KEY_ID
+            or not settings.APNS_TEAM_ID
+        )
+        self.bundle_id = settings.APNS_BUNDLE_ID
+        self._jwt: Optional[str] = None
+        self._jwt_issued_at: float = 0.0
+
+    @property
+    def host(self) -> str:
+        return self._SANDBOX_HOST if settings.APNS_USE_SANDBOX else self._PROD_HOST
+
+    def _private_key(self) -> str:
+        raw = settings.APNS_KEY_P8.strip()
+        if raw.startswith("-----BEGIN"):
+            return raw
+        # Treat anything else as a path to the .p8 file.
+        with open(raw, "r", encoding="utf-8") as fh:
+            return fh.read()
+
+    def _auth_token(self) -> str:
+        """ES256 JWT for APNs.
+
+        Apple rejects tokens older than 1 hour and throttles clients that mint
+        a new one per request, so it's cached and refreshed at ~50 minutes.
+        """
+        import time
+
+        now = time.time()
+        if self._jwt and (now - self._jwt_issued_at) < 3000:
+            return self._jwt
+
+        import jwt as pyjwt
+
+        self._jwt = pyjwt.encode(
+            {"iss": settings.APNS_TEAM_ID, "iat": int(now)},
+            self._private_key(),
+            algorithm="ES256",
+            headers={"kid": settings.APNS_KEY_ID},
+        )
+        self._jwt_issued_at = now
+        return self._jwt
+
+    async def send_voip(self, device_token: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        if self.mock:
+            logger.info(
+                "MOCK APNs VoIP push token=%s payload=%s",
+                device_token[:12] if device_token else None,
+                payload.get("type"),
+            )
+            return {"success": True, "apns_id": f"apns_mock_{uuid.uuid4().hex[:10]}"}
+        if not device_token:
+            return {"success": False, "reason": "no_token"}
+
+        import httpx
+
+        try:
+            # APNs requires HTTP/2.
+            async with httpx.AsyncClient(http2=True, timeout=10.0) as client:
+                resp = await client.post(
+                    f"{self.host}/3/device/{device_token}",
+                    headers={
+                        "authorization": f"bearer {self._auth_token()}",
+                        "apns-topic": f"{self.bundle_id}.voip",
+                        "apns-push-type": "voip",
+                        "apns-priority": "10",
+                        "apns-expiration": "0",  # deliver now or drop it
+                    },
+                    json=payload,
+                )
+        except Exception as e:  # noqa: BLE001
+            logger.exception("APNs VoIP push failed to send")
+            return {"success": False, "reason": type(e).__name__}
+
+        if resp.status_code == 200:
+            return {"success": True, "apns_id": resp.headers.get("apns-id")}
+
+        reason = ""
+        try:
+            reason = resp.json().get("reason", "")
+        except Exception:  # noqa: BLE001
+            reason = resp.text[:200]
+        # BadDeviceToken/Unregistered mean the install is gone — the caller
+        # should drop the token rather than keep pushing to it.
+        stale = reason in ("BadDeviceToken", "Unregistered", "DeviceTokenNotForTopic")
+        if not stale:
+            logger.warning("APNs VoIP push rejected: %s %s", resp.status_code, reason)
+        return {"success": False, "reason": reason, "unregistered": stale}
+
+
+# ============================================================================
+# Cloudflare RealtimeKit (in-app voice calling)
+#
+# Migrated off Dyte, which Cloudflare acquired and put into maintenance mode.
+# RealtimeKit kept Dyte's REST shape verbatim, so this is a base-URL + auth
+# swap: POST /meetings, then POST /meetings/{id}/participants (with a
+# preset_name) which returns the participant's authToken. Auth is HTTP Basic
+# over base64(orgId:apiKey), same as before.
+# ============================================================================
+class RealtimeKitClient:
+    """Thin wrapper over the Cloudflare-native RealtimeKit REST API.
+
+    Cloudflare retired the old Dyte-style developer portal (org_id + api_key,
+    Basic auth, api.realtime.cloudflare.com/v2). RealtimeKit now lives under
+    the standard Cloudflare API, scoped to an account and a RealtimeKit "app":
+
+        https://api.cloudflare.com/client/v4/accounts/{account_id}/realtime/kit/{app_id}/...
+
+    authenticated with a Cloudflare API Token (Bearer) that has the
+    "Realtime / Realtime Admin" permission.
+
+    Flow used by this app:
+      1. create_meeting()  -> once per booking, when the call is first started
+      2. add_participant() -> once per side (nurse / customer) each time they
+                               join; returns an authToken the frontend hands to
+                               the RealtimeKit SDK.
+    """
+
+    def __init__(self) -> None:
+        self.account_id = settings.REALTIMEKIT_ACCOUNT_ID
+        self.app_id = settings.REALTIMEKIT_APP_ID
+        self.api_token = settings.REALTIMEKIT_API_TOKEN
+        self.base_url = settings.REALTIMEKIT_BASE_URL or "https://api.cloudflare.com/client/v4"
+        self.mock = (
+            settings.MOCK_EXTERNAL_PROVIDERS
+            or not self.account_id
+            or not self.app_id
+            or not self.api_token
+        )
+
+    def _headers(self) -> Dict[str, str]:
+        return {
+            "Authorization": f"Bearer {self.api_token}",
+            "Content-Type": "application/json",
+        }
+
+    def _kit_url(self, path: str) -> str:
+        return f"{self.base_url}/accounts/{self.account_id}/realtime/kit/{self.app_id}{path}"
+
+    async def _post(self, path: str, payload: Dict[str, Any], operation: str) -> Dict[str, Any]:
+        import httpx
+
+        try:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(15.0, connect=5.0)) as client:
+                resp = await client.post(
+                    self._kit_url(path),
+                    headers=self._headers(),
+                    json=payload,
+                )
+        except httpx.TimeoutException as exc:
+            logger.exception("realtimekit %s timed out", operation)
+            raise ExternalProviderError("RealtimeKit request timed out") from exc
+        except httpx.RequestError as exc:
+            logger.exception("realtimekit %s request failed", operation)
+            raise ExternalProviderError("RealtimeKit is unreachable") from exc
+
+        if resp.status_code >= 400:
+            logger.error("realtimekit %s failed status=%s body=%s", operation, resp.status_code, resp.text)
+            raise ExternalProviderError(f"RealtimeKit rejected {operation}")
+
+        body = resp.json()
+        data = body.get("result") or body.get("data") or body
+        if not isinstance(data, dict):
+            raise ExternalProviderError(f"RealtimeKit returned an invalid {operation} response")
+        return data
+
+    async def create_meeting(self, title: str) -> Dict[str, Any]:
+        if self.mock:
+            meeting_id = f"meeting_mock_{uuid.uuid4().hex[:16]}"
+            logger.info("MOCK realtimekit create_meeting title=%s -> %s", title, meeting_id)
+            return {"id": meeting_id, "title": title, "status": "ACTIVE"}
+        return await self._post(
+            "/meetings",
+            {"title": title, "record_on_start": False},
+            "create_meeting",
+        )
+
+    async def add_participant(self, meeting_id: str, participant_name: str, participant_id: str, preset_name: str = "group_call_host") -> Dict[str, Any]:
+        if self.mock:
+            auth_token = f"rtk_mock_token_{uuid.uuid4().hex}"
+            logger.info("MOCK realtimekit add_participant meeting=%s participant=%s", meeting_id, participant_id)
+            return {"token": auth_token, "authToken": auth_token, "id": participant_id}
+        data = await self._post(
+            f"/meetings/{meeting_id}/participants",
+            {
+                "name": participant_name,
+                "preset_name": preset_name,
+                "custom_participant_id": participant_id,
+            },
+            "add_participant",
+        )
+        # Normalise so callers can rely on `authToken` regardless of the
+        # exact key the API returns (`token` on some responses).
+        if "authToken" not in data and "token" in data:
+            data["authToken"] = data["token"]
+        if not data.get("authToken"):
+            raise ExternalProviderError("RealtimeKit did not return an auth token")
+        return data
+
+    async def deactivate_meeting(self, meeting_id: str) -> Dict[str, Any]:
+        if self.mock:
+            logger.info("MOCK realtimekit deactivate_meeting %s", meeting_id)
+            return {"id": meeting_id, "status": "INACTIVE"}
+        import httpx
+        async with httpx.AsyncClient() as client:
+            resp = await client.delete(
+                self._kit_url(f"/meetings/{meeting_id}"),
+                headers=self._headers(),
+            )
+            resp.raise_for_status()
+            return {"id": meeting_id, "status": "INACTIVE"}
 
 
 # ============================================================================
@@ -212,10 +838,218 @@ class AbhaClient:
         return {"abha_id": abha_id, "records": []}
 
 
+# ============================================================================
+# Digio — Aadhaar eSign on state e-Stamp paper
+#
+# Used for the Stage 2 Master Independent Contractor Agreement (see
+# app/api/v1/contracts.py). This wraps Digio's v2 Gateway document API:
+#
+#   POST /v2/client/document/uploadpdf   create a signing request from a
+#                                         PDF, with one or more signers
+#   GET  /v2/client/document/{id}        current status + per-signer detail
+#
+# authenticated with HTTP Basic auth using the client id/secret issued from
+# the Digio dashboard, exactly like the razorpay.Client(auth=(...)) pattern
+# above.
+#
+# IMPORTANT — verify against Digio's current developer docs before going
+# live: integration accounts are provisioned per-merchant and Digio has
+# historically offered more than one integration mode (a Gateway/hosted flow
+# and a lower-level Direct API), so exact path segments, the signer-URL
+# field name, and webhook payload shape can differ from what's coded here
+# depending on which mode your Digio account is provisioned for. Nothing in
+# the surrounding contract flow depends on Digio's specific field names —
+# they're only read in this one class — so correcting them is a local,
+# contained change to this class and callers of the well-typed methods
+# below are unaffected.
+#
+# What IS guaranteed correct regardless of the exact wire format: the
+# security model. A signing session is only ever marked "signed" by
+# get_document_status() or a webhook whose signature this class verifies —
+# never by anything a client sends us. See app/api/v1/contracts.py.
+# ============================================================================
+class DigioClient:
+    def __init__(self) -> None:
+        self.client_id = settings.DIGIO_CLIENT_ID
+        self.client_secret = settings.DIGIO_CLIENT_SECRET
+        self.webhook_secret = settings.DIGIO_WEBHOOK_SECRET
+        self.base_url = (settings.DIGIO_BASE_URL or "https://api.digio.in").rstrip("/")
+        self.redirect_url = settings.DIGIO_REDIRECT_URL
+        self.mock = (
+            settings.MOCK_EXTERNAL_PROVIDERS
+            or not self.client_id
+            or not self.client_secret
+            or self.client_id.endswith("_placeholder")
+        )
+
+    def _auth(self) -> tuple[str, str]:
+        return (self.client_id, self.client_secret)
+
+    async def create_esign_request(
+        self,
+        *,
+        pdf_bytes: bytes,
+        signer_name: str,
+        signer_identifier: str,  # phone (E.164) or email — Digio sends the signing link here
+        reason: str = "Master Independent Contractor Agreement",
+        file_name: str = "agreement.pdf",
+    ) -> Dict[str, Any]:
+        """Create a signing request for a rendered PDF. Returns the raw
+        Digio response — callers persist whatever fields they need onto
+        their own WorkerEsignSession row rather than this method assuming
+        a particular schema, since the exact response shape is the part
+        most likely to need adjustment per Digio's current API version.
+
+        Mock mode returns a self-consistent fake response with the same
+        top-level shape (id / signing_parties[0].sign_url) so the rest of
+        the flow — session creation, the mobile WebView, status polling —
+        exercises the exact same code path it will in production. Nothing
+        in mock mode marks the session signed; that only ever happens via
+        mock_mark_signed() below or a real webhook, so the "server decides,
+        not the client" invariant holds in mock mode too.
+        """
+        if self.mock:
+            doc_id = f"DIGIO_MOCK_{uuid.uuid4().hex[:16].upper()}"
+            logger.info(
+                "MOCK digio create_esign_request signer=%s reason=%s -> %s",
+                signer_identifier, reason, doc_id,
+            )
+            return {
+                "id": doc_id,
+                "agreement_status": "requested",
+                "signing_parties": [
+                    {
+                        "identifier": signer_identifier,
+                        "name": signer_name,
+                        # A real Digio sign_url is a hosted page; in mock
+                        # mode this is an address the mobile app recognises
+                        # and renders its own in-app mock signing screen
+                        # for, so the WebView step is still exercised
+                        # end-to-end without a network call.
+                        "sign_url": f"nurseconnect-mock://digio-sign/{doc_id}",
+                    }
+                ],
+            }
+
+        import base64
+        import httpx
+
+        payload = {
+            "signers": [
+                {
+                    "identifier": signer_identifier,
+                    "name": signer_name,
+                    "reason": reason,
+                    "sign_type": "aadhaar",
+                }
+            ],
+            "expire_in_days": max(1, settings.DIGIO_SESSION_EXPIRE_MINUTES // (24 * 60) or 1),
+            "display_on_page": "all",
+            "notify_signers": True,
+            "send_sign_link": True,
+            "file_name": file_name,
+        }
+        try:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(20.0, connect=5.0)) as client:
+                resp = await client.post(
+                    f"{self.base_url}/v2/client/document/uploadpdf",
+                    auth=self._auth(),
+                    data={"request": __import__("json").dumps(payload)},
+                    files={"file": (file_name, pdf_bytes, "application/pdf")},
+                )
+        except httpx.TimeoutException as exc:
+            logger.exception("digio create_esign_request timed out")
+            raise ExternalProviderError("Digio request timed out") from exc
+        except httpx.RequestError as exc:
+            logger.exception("digio create_esign_request failed")
+            raise ExternalProviderError("Digio request failed") from exc
+        if resp.status_code >= 400:
+            logger.error("digio create_esign_request %s: %s", resp.status_code, resp.text[:500])
+            raise ExternalProviderError(f"Digio returned {resp.status_code}")
+        return resp.json()
+
+    async def get_document_status(self, document_id: str) -> Dict[str, Any]:
+        """Authoritative current status for a document, polled directly
+        from Digio. This — not a webhook, and never a client claim — is
+        what /contracts/me/stage2/esign/status falls back to when a
+        webhook hasn't arrived yet, and what the finalize step re-checks
+        before ever creating the executed agreement record.
+        """
+        if self.mock:
+            return {"id": document_id, "agreement_status": "requested"}
+
+        import httpx
+
+        try:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(15.0, connect=5.0)) as client:
+                resp = await client.get(
+                    f"{self.base_url}/v2/client/document/{document_id}",
+                    auth=self._auth(),
+                )
+        except httpx.TimeoutException as exc:
+            logger.exception("digio get_document_status timed out for %s", document_id)
+            raise ExternalProviderError("Digio status request timed out") from exc
+        except httpx.RequestError as exc:
+            logger.exception("digio get_document_status failed for %s", document_id)
+            raise ExternalProviderError("Digio status request failed") from exc
+        if resp.status_code >= 400:
+            logger.error(
+                "digio get_document_status %s -> %s: %s",
+                document_id, resp.status_code, resp.text[:500],
+            )
+            raise ExternalProviderError(f"Digio returned {resp.status_code}")
+        return resp.json()
+
+    @staticmethod
+    def is_signed(status_payload: Dict[str, Any]) -> bool:
+        """True only once Digio itself reports full completion.
+
+        Digio's `agreement_status` moves through requested -> viewed/pending
+        -> completed. Some integration modes report per-signer status inside
+        `signing_parties[].sign_status` instead of (or alongside) the
+        top-level field, so both are checked; either being a completion
+        value is sufficient, but NEITHER being present means not signed —
+        the default is always "not signed", never the reverse.
+        """
+        top = str(status_payload.get("agreement_status") or "").lower()
+        if top in ("completed", "signed", "success"):
+            return True
+        for party in status_payload.get("signing_parties") or []:
+            if str(party.get("sign_status") or "").lower() in ("signed", "completed", "success"):
+                return True
+        return False
+
+    @staticmethod
+    def is_failed(status_payload: Dict[str, Any]) -> bool:
+        top = str(status_payload.get("agreement_status") or "").lower()
+        return top in ("declined", "expired", "failed", "cancelled")
+
+    def verify_webhook_signature(self, body: bytes, signature: Optional[str]) -> bool:
+        """HMAC-SHA256 over the raw request body using DIGIO_WEBHOOK_SECRET.
+
+        Digio lets you configure a shared secret against your webhook URL
+        in their dashboard; this checks the request against that secret the
+        same way app/api/v1/payments.py checks Razorpay's. The header this
+        signature arrives in is configurable (see contracts.py) since it is
+        the one Digio-specific detail most likely to vary by account setup
+        — the verification logic itself doesn't depend on the header name.
+        """
+        if self.mock:
+            return True
+        if not self.webhook_secret or not signature:
+            logger.error("DIGIO_WEBHOOK_SECRET not configured or signature missing — rejecting webhook")
+            return False
+        expected = hmac.new(self.webhook_secret.encode(), body, hashlib.sha256).hexdigest()
+        return hmac.compare_digest(expected, signature)
+
+
 # Singletons
 razorpay_client = RazorpayClient()
 cloudinary_client = CloudinaryClient()
 msg91_client = Msg91Client()
 interakt_client = InteraktClient()
 firebase_push_client = FirebasePushClient()
+apns_voip_client = ApnsVoipClient()
 abha_client = AbhaClient()
+realtimekit_client = RealtimeKitClient()
+digio_client = DigioClient()
