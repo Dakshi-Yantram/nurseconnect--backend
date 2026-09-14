@@ -2140,6 +2140,31 @@ async def process_worker_payout(
         raise HTTPException(status_code=409, detail=result["error"])
     await audit(db, current.id, current.role.value, "payout.process", "worker_payout", payout.id, result)
     await db.commit()
+
+    # Generate the nurse's payout statement here too — this endpoint is a
+    # second, older entry point to the exact same "pay the nurse" action as
+    # /worker-payouts/{id}/release (the Payout Release page), which already
+    # does this. Without it, a payout processed from the Payout Approvals
+    # screen instead of Payout Release silently never gets a statement, and
+    # the nurse's Earnings page shows "Paid" with no advice/PDF to match it.
+    # Best-effort: a PDF/statement problem must never undo a completed payout.
+    try:
+        from app.services.billing_service import (
+            generate_payout_statement,
+            notify_payout_released,
+        )
+
+        statement = await generate_payout_statement(db, payout)
+        await db.commit()
+        await notify_payout_released(db, payout, statement)
+        await db.commit()
+        if statement is not None:
+            result["statement_number"] = statement.statement_number
+            result["statement_pdf_url"] = statement.pdf_url
+    except Exception:  # noqa: BLE001
+        await db.rollback()
+        logger.exception("payout statement generation failed for %s", payout.id)
+
     return result
 
 
