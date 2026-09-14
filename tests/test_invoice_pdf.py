@@ -43,7 +43,7 @@ COMPANY = CompanyIdentity(
     gstin="36AABCY1234F1Z5",
     state_name="Telangana",
     state_code="36",
-    support_email="support@nurseconnect.app",
+    support_email="support@nurseconnect.in",
 )
 
 

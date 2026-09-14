@@ -51,7 +51,7 @@ class Settings(BaseSettings):
     SMTP_PORT: int = 587
     SMTP_USERNAME: str = ""
     SMTP_PASSWORD: str = ""
-    SMTP_FROM_EMAIL: str = "no-reply@nurseconnect.app"
+    SMTP_FROM_EMAIL: str = "no-reply@nurseconnect.in"
     SMTP_FROM_NAME: str = "NurseConnect"
     SMTP_USE_TLS: bool = True
 
@@ -94,7 +94,7 @@ class Settings(BaseSettings):
     COMPANY_GSTIN: str = ""
     COMPANY_STATE_NAME: str = "Telangana"
     COMPANY_STATE_CODE: str = "36"
-    COMPANY_SUPPORT_EMAIL: str = "support@nurseconnect.app"
+    COMPANY_SUPPORT_EMAIL: str = "support@nurseconnect.in"
 
     # Invoice / statement number prefixes. Numbers are allocated per financial
     # year per series (see app/services/billing_service.py).
@@ -209,7 +209,7 @@ class Settings(BaseSettings):
     # PushKit / FCM paths below can ring a killed mobile app.
     VAPID_PUBLIC_KEY: str = ""
     VAPID_PRIVATE_KEY: str = ""
-    VAPID_SUBJECT: str = "mailto:support@nurseconnect.app"
+    VAPID_SUBJECT: str = "mailto:support@nurseconnect.in"
 
     # ---------------------------------------------------------------------
     # APNs — iOS VoIP (PushKit) push.
