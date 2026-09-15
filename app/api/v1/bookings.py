@@ -325,20 +325,6 @@ async def my_worker_bookings(
 
 
 # Backward-compatible alias for older frontend bundles that still call
-def _city_mismatch(worker_city: Optional[str], address_city: Optional[str]) -> bool:
-    """True when a worker's base city definitely differs from a booking's.
-
-    The comparison used to be a raw ``!=`` on two free-text fields, so
-    "Hyderabad" vs "hyderabad", or a trailing space picked up from an
-    address form, silently hid every booking in the worker's own city. An
-    unknown value on either side is never treated as a mismatch -- we only
-    filter on a difference we're sure about.
-    """
-    if not worker_city or not address_city:
-        return False
-    return worker_city.strip().casefold() != address_city.strip().casefold()
-
-
 # /api/bookings/available. Keep it before /{booking_id}, otherwise FastAPI
 # treats "available" as a UUID path param and returns 422.
 @router.get("/available", response_model=List[BookingOut], include_in_schema=False)
@@ -446,12 +432,12 @@ async def new_requests(profile: WorkerProfile = Depends(get_worker_profile), db:
                 if b.is_urgent:
                     continue
                 addr_city = (b.address_snapshot or {}).get("city") if isinstance(b.address_snapshot, dict) else None
-                if _city_mismatch(profile.base_city, addr_city):
+                if profile.base_city and addr_city and profile.base_city != addr_city:
                     continue
             # If booking has no lat/lng we fall back to city/zone match as well.
             elif not booking_has_coords:
                 addr_city = (b.address_snapshot or {}).get("city") if isinstance(b.address_snapshot, dict) else None
-                if _city_mismatch(profile.base_city, addr_city):
+                if profile.base_city and addr_city and profile.base_city != addr_city:
                     continue
                 if b.is_urgent and worker_origin is None:
                     continue
@@ -492,151 +478,6 @@ async def new_requests(profile: WorkerProfile = Depends(get_worker_profile), db:
             bm.distance_km = round(dist, 2)
         out.append(bm)
     return out
-
-
-# NOTE: registered BEFORE the "/{booking_id}" routes below, or FastAPI
-# matches "worker" as a booking UUID and answers 422.
-@router.get("/worker/new-requests/diagnostics")
-async def new_requests_diagnostics(
-    profile: WorkerProfile = Depends(get_worker_profile),
-    db: AsyncSession = Depends(get_db),
-):
-    """Explain why /worker/new-requests is returning what it returns.
-
-    The visibility filter drops bookings for four independent reasons --
-    not qualified, not opted in, out of the current wave radius, schedule
-    conflict -- and used to do so completely silently. A nurse with no
-    qualifications, no opted-in services, or no location on file just saw an
-    empty list forever, which is exactly the "requests only show up for one
-    account" report: the account that worked had been through the seeding
-    scripts, the fresh ones hadn't.
-
-    This endpoint is read-only and exists so that state is visible to the
-    app (and to whoever is debugging an account) instead of being guessed.
-    """
-    from app.services.proximity import (
-        compute_current_wave,
-        effective_origin_for_worker,
-        haversine_km,
-        radius_for_wave,
-    )
-    from app.services.qualification import can_worker_receive_service
-    from app.services.dispatch import worker_has_schedule_conflict
-    from app.models.enums import WorkerPreferenceStatus, WorkerQualificationStatus
-    from app.models.models import WorkerServicePreference, WorkerServiceQualification
-
-    res = await db.execute(
-        select(Booking).where(
-            Booking.worker_id.is_(None),
-            Booking.status.in_([
-                BookingStatus.confirmed,
-                BookingStatus.rematch_pending,
-                BookingStatus.searching_nurse,
-            ]),
-        ).order_by(Booking.scheduled_date.asc()).limit(50)
-    )
-    items: list[Booking] = list(res.scalars().all())
-
-    worker_origin = effective_origin_for_worker(profile)
-    worker_is_tele_only = (
-        is_tele_capable(profile.worker_type) and not is_physical_capable(profile.worker_type)
-    )
-    now = datetime.now(timezone.utc)
-
-    reasons: dict[str, int] = {}
-    samples: list[dict] = []
-
-    def _drop(booking_id, reason: str, detail: str | None = None):
-        reasons[reason] = reasons.get(reason, 0) + 1
-        if len(samples) < 10:
-            samples.append({"booking_id": str(booking_id), "reason": reason, "detail": detail})
-
-    visible = 0
-    for b in items:
-        target = None
-        if b.service_id:
-            sr = await db.execute(select(ServiceCatalogue).where(ServiceCatalogue.id == b.service_id))
-            target = sr.scalar_one_or_none()
-        elif b.package_id:
-            pr = await db.execute(select(CarePackage).where(CarePackage.id == b.package_id))
-            target = pr.scalar_one_or_none()
-        if not target:
-            _drop(b.id, "NO_SERVICE_OR_PACKAGE")
-            continue
-
-        allowed, reason = await can_worker_receive_service(profile, target, db)
-        if not allowed:
-            _drop(b.id, reason or "NOT_ELIGIBLE", getattr(target, "name", None))
-            continue
-
-        if not worker_is_tele_only:
-            wave = compute_current_wave(b, now=now)
-            radius_km = radius_for_wave(max(wave, b.assignment_wave or 1), b.is_urgent)
-            if radius_km is None:
-                _drop(b.id, "ESCALATED_PAST_LAST_WAVE")
-                continue
-            has_coords = b.latitude is not None and b.longitude is not None
-            if has_coords and worker_origin is not None:
-                dist = haversine_km(worker_origin[0], worker_origin[1], b.latitude, b.longitude)
-                if dist > radius_km:
-                    _drop(b.id, "OUTSIDE_WAVE_RADIUS", f"{dist:.1f}km > {radius_km}km")
-                    continue
-            elif has_coords and worker_origin is None:
-                if b.is_urgent:
-                    _drop(b.id, "NO_WORKER_LOCATION_URGENT_HIDDEN")
-                    continue
-                addr_city = (b.address_snapshot or {}).get("city") if isinstance(b.address_snapshot, dict) else None
-                if _city_mismatch(profile.base_city, addr_city):
-                    _drop(b.id, "CITY_MISMATCH", f"{profile.base_city} vs {addr_city}")
-                    continue
-            else:
-                addr_city = (b.address_snapshot or {}).get("city") if isinstance(b.address_snapshot, dict) else None
-                if _city_mismatch(profile.base_city, addr_city):
-                    _drop(b.id, "CITY_MISMATCH", f"{profile.base_city} vs {addr_city}")
-                    continue
-                if b.is_urgent and worker_origin is None:
-                    _drop(b.id, "NO_WORKER_LOCATION_URGENT_HIDDEN")
-                    continue
-
-        if await worker_has_schedule_conflict(db, profile.id, b):
-            _drop(b.id, "SCHEDULE_CONFLICT")
-            continue
-        visible += 1
-
-    # The three things that most often make a new account see nothing.
-    opted_in_res = await db.execute(
-        select(func.count(WorkerServicePreference.id)).where(
-            WorkerServicePreference.worker_id == profile.id,
-            WorkerServicePreference.preference_status == WorkerPreferenceStatus.OPTED_IN,
-        )
-    )
-    qualified_res = await db.execute(
-        select(func.count(WorkerServiceQualification.id)).where(
-            WorkerServiceQualification.worker_id == profile.id,
-            WorkerServiceQualification.qualification_status == WorkerQualificationStatus.APPROVED,
-        )
-    )
-
-    return {
-        "candidate_bookings": len(items),
-        "visible_to_you": visible,
-        "filtered_out_by": reasons,
-        "samples": samples,
-        "your_account": {
-            "onboarding_status": profile.onboarding_status.value,
-            "availability": profile.availability.value,
-            "worker_type": profile.worker_type.value,
-            "tier": profile.tier.value if profile.tier else None,
-            "base_city": profile.base_city,
-            "has_location": worker_origin is not None,
-            "current_location_updated_at": (
-                profile.current_location_updated_at.isoformat()
-                if profile.current_location_updated_at else None
-            ),
-            "approved_qualifications": qualified_res.scalar() or 0,
-            "explicitly_opted_in_services": opted_in_res.scalar() or 0,
-        },
-    }
 
 
 @router.put("/{booking_id}/address", response_model=BookingOut)

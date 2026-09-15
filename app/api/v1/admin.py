@@ -307,12 +307,8 @@ async def approve_worker(
     # Delegates to the shared approve/reject service (app/services/worker_approval.py)
     # so this endpoint and the reviewer-ticket "APPROVED" status update
     # (app/api/v1/review_tickets.py) can never fall out of sync again.
-    # Called ONCE. This used to run twice in a row; the second call was a
-    # no-op only because approve_worker_profile short-circuits on an
-    # already-approved worker, but it also meant the second call's missing
-    # `changed_by` would have blanked the audit trail had that guard ever
-    # moved.
     await approve_worker_profile(db, worker_id, changed_by=current.id)
+    await approve_worker_profile(db, worker_id)
     await db.commit()
     return {"approved": True}
 

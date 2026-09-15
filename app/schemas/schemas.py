@@ -62,10 +62,6 @@ class OtpSendResponse(BaseModel):
     existing_role: Optional[UserRole] = None
     # True when `existing_role` differs from the role the client asked for.
     role_mismatch: bool = False
-    # True when this response handed back a previously-issued code that is
-    # still inside its validity window, and therefore sent no new SMS. The
-    # client should keep showing its existing "enter the code" state.
-    reused: bool = False
 
 
 class OtpVerifyRequest(BaseModel):

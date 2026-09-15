@@ -374,13 +374,7 @@ class Msg91Client:
         self.sender_id = settings.MSG91_SENDER_ID
         self.template_id = settings.MSG91_TEMPLATE_ID
 
-    async def send_otp(
-        self,
-        phone_e164: str,
-        otp: str,
-        template_id: Optional[str] = None,
-        purpose: str = "login",
-    ) -> Dict[str, Any]:
+    async def send_otp(self, phone_e164: str, otp: str) -> Dict[str, Any]:
         """Send an already-generated OTP via MSG91's Flow API.
 
         Our template lives under SMS > Templates in the MSG91 dashboard
@@ -398,25 +392,6 @@ class Msg91Client:
         rather than generating its own (which would break our own hash-based
         verification in otp_verify()).
         """
-        # ``template_id`` lets a caller pick a DIFFERENT DLT template from the
-        # login one. This matters: the visit-start OTP (app/api/v1/visits.py)
-        # used to be relayed through this same login template, so a patient
-        # received "Your OTP for login is 5889" for a code that was really
-        # their nurse's door code -- alongside genuine 6-digit login codes,
-        # which is what made the reported SMS thread look like a duplicate
-        # login-OTP storm. A DLT template cannot be created from code (it has
-        # to be registered and approved in the MSG91 dashboard), so if no
-        # purpose-specific template is configured we fall back to the login
-        # one and say so loudly in the logs.
-        effective_template = template_id or self.template_id
-        if purpose != "login" and not template_id:
-            logger.warning(
-                "MSG91 send_otp: no DLT template configured for purpose=%s; "
-                "falling back to the login template, so this SMS will read "
-                "'Your OTP for login is ...'. Register a %s template in the "
-                "MSG91 dashboard and set the matching setting.",
-                purpose, purpose,
-            )
         if self.mock:
             logger.info(
                 "MOCK MSG91 send_otp phone=%s code=%s purpose=%s", phone_e164, otp, purpose
@@ -424,7 +399,7 @@ class Msg91Client:
             return {"type": "success", "request_id": f"msg91_mock_{uuid.uuid4().hex[:10]}"}
         import httpx
         payload = {
-            "template_id": effective_template,
+            "template_id": self.template_id,
             "short_url": "0",
             "recipients": [
                 {

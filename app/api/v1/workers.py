@@ -185,16 +185,6 @@ async def _onboarding_snapshot(
 
     return {
         "onboarding_status": profile.onboarding_status.value,
-        # THE source of truth for "is this nurse verified". Anything the app
-        # renders as a verification state must read this, not the documents.
-        "account_verified": account_verified,
-        # True when every required document has been individually approved.
-        # Being true while account_verified is false is a normal, expected
-        # state: documents are done, the reviewer hasn't approved the
-        # account yet.
-        "documents_all_verified": documents_all_verified,
-        "awaiting_reviewer_approval": documents_all_verified and not account_verified,
-        "verified_documents": sorted(verified_types & required_types),
         "worker_type": worker_type.value,
         "requires_license": worker_type in LICENSED_PROVIDER_TYPES,
         "background_check_status": profile.background_check_status,

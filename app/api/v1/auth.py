@@ -384,29 +384,6 @@ async def login(payload: PasswordLoginRequest, request: Request, db: AsyncSessio
     if user.status not in (UserStatus.active, UserStatus.onboarding):
         raise HTTPException(status_code=403, detail="Account is not active")
 
-    # Wrong-portal guard. The client tells us which sign-in door the user
-    # came through; an account whose stored role doesn't match is refused
-    # here rather than being signed in and quietly routed to the other
-    # portal. Previously /login ignored role entirely, so signing in with a
-    # family member's credentials on the "Care professional sign in" screen
-    # succeeded and dropped the user into the family app.
-    #
-    # Note this runs AFTER the password check on purpose: answering before
-    # verifying the password would turn this endpoint into an oracle for
-    # "which role owns this email".
-    if payload.expected_role is not None and user.role != payload.expected_role:
-        await clear_failures("login", email)
-        raise HTTPException(
-            status_code=403,
-            detail={
-                "success": False,
-                "code": "ROLE_MISMATCH",
-                "message": _role_mismatch_message(payload.expected_role),
-                "expected_role": payload.expected_role.value,
-                "actual_role": user.role.value,
-            },
-        )
-
     await clear_failures("login", email)
     user.last_login_at = datetime.now(timezone.utc)
     tokens = _issue_token_pair(user)
@@ -559,55 +536,6 @@ async def otp_send(payload: OtpSendRequest, request: Request, db: AsyncSession =
     # 15 sends / hour per IP (mass enumeration). (Automatically skipped in
     # OTP_DEV_MODE — see app/core/rate_limit.py.)
     ip = client_ip(request)
-
-    # Role detection is cheap and must happen even on the reuse path below,
-    # so it runs before anything that can short-circuit.
-    existing_res = await db.execute(select(User).where(User.phone_e164 == phone))
-    existing_user = existing_res.scalar_one_or_none()
-    existing_role = existing_user.role if existing_user else None
-    role_mismatch = bool(existing_role is not None and existing_role != payload.role)
-
-    # ---------------------------------------------------------------- REUSE
-    # Duplicate-OTP fix. This endpoint used to mint and SMS a brand new code
-    # on EVERY call, so any client that re-ran it -- a screen remount, a
-    # retry after a network blip, a user tapping back and forward -- burned
-    # another SMS and invalidated nothing, which is why a single sign-in
-    # attempt produced a burst of "Your OTP for login is ..." messages
-    # minutes apart.
-    #
-    # A code that is still unconsumed, unexpired and under its attempt cap is
-    # perfectly usable, so hand that one back and send nothing. Only an
-    # explicit "Resend code" tap (force_resend) mints a new one.
-    if not payload.force_resend:
-        active_res = await db.execute(
-            select(OtpCode)
-            .where(
-                OtpCode.phone_e164 == phone,
-                OtpCode.purpose == payload.purpose,
-                OtpCode.consumed.is_(False),
-                OtpCode.expires_at > datetime.now(timezone.utc),
-                OtpCode.attempts < 5,
-            )
-            .order_by(OtpCode.created_at.desc())
-            .limit(1)
-        )
-        active = active_res.scalar_one_or_none()
-        if active is not None:
-            remaining = int(
-                (active.expires_at - datetime.now(timezone.utc)).total_seconds()
-            )
-            return OtpSendResponse(
-                sent=True,
-                phone_e164=phone,
-                expires_in_seconds=max(remaining, 0),
-                # The stored code is hashed and unrecoverable. In dev mode the
-                # code is the fixed constant, so echoing it is still correct.
-                dev_otp=settings.OTP_DEV_FIXED_CODE if settings.otp_dev_mode else None,
-                existing_role=existing_role,
-                role_mismatch=role_mismatch,
-                reused=True,
-            )
-
     await enforce_rate_limit(
         "otp_send:phone", phone, 3, 10 * 60,
         message="Too many codes requested for this number. Wait a few minutes and try again.",
@@ -619,6 +547,10 @@ async def otp_send(payload: OtpSendRequest, request: Request, db: AsyncSession =
     # typed a code — which is the "This number is registered as a care
     # professional" dead end. Tell the client now so it can switch to the
     # right sign-in screen before asking for anything.
+    existing_res = await db.execute(select(User).where(User.phone_e164 == phone))
+    existing_user = existing_res.scalar_one_or_none()
+    existing_role = existing_user.role if existing_user else None
+
     # `settings.otp_dev_mode` (property) is force-disabled outside
     # development, so a production deployment can never fall back to the
     # fixed code even if OTP_DEV_MODE is left set in the environment.
@@ -666,8 +598,7 @@ async def otp_send(payload: OtpSendRequest, request: Request, db: AsyncSession =
         expires_in_seconds=settings.OTP_EXPIRE_MINUTES * 60,
         dev_otp=code if settings.otp_dev_mode else None,
         existing_role=existing_role,
-        role_mismatch=role_mismatch,
-        reused=False,
+        role_mismatch=bool(existing_role is not None and existing_role != payload.role),
     )
 
 
