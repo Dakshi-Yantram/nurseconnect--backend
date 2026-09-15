@@ -1851,6 +1851,100 @@ class ComplaintStatusUpdateRequest(BaseModel):
     resolution_notes: Optional[str] = None
 
 
+def _serialize_complaint(
+    c: Complaint,
+    names: dict,
+    bookings: dict,
+    patients: dict,
+    services: dict,
+    workers: dict,
+) -> dict:
+    """Shared shape for the list and detail complaint endpoints.
+
+    Pulls in the linked booking/patient/nurse/service context so an admin
+    reviewing or replying to a complaint isn't stuck with only a subject
+    line and a raiser name — they can see who the patient is, which visit
+    is being complained about, and which nurse worked it.
+    """
+    booking = bookings.get(c.booking_id) if c.booking_id else None
+    patient = patients.get(booking.patient_id) if booking else None
+    service = services.get(booking.service_id) if booking and booking.service_id else None
+    worker = workers.get(booking.worker_id) if booking and booking.worker_id else None
+    return {
+        "id": str(c.id),
+        "subject": c.description[:80],
+        "description": c.description,
+        "category": c.category,
+        "status": c.status.value,
+        "raisedBy": names.get(c.raised_by, "Unknown"),
+        "raiser_role": c.raiser_role,
+        "created": c.created_at.isoformat(),
+        "resolution_notes": c.resolution_notes,
+        "resolved_at": c.resolved_at.isoformat() if c.resolved_at else None,
+        "assigned_to": names.get(c.assigned_to) if c.assigned_to else None,
+        "attachments": c.attachments or [],
+        "booking": (
+            {
+                "id": str(booking.id),
+                "booking_ref": booking.booking_ref,
+                "status": booking.status.value,
+                "scheduled_date": booking.scheduled_date.isoformat(),
+                "service_name": service.name if service else None,
+                "patient_name": patient.full_name if patient else None,
+                "patient_id": str(patient.id) if patient else None,
+                "patient_medical_conditions": (patient.medical_conditions or []) if patient else [],
+                "patient_allergies": (patient.allergies or []) if patient else [],
+                "nurse_name": names.get(worker.user_id) if worker else None,
+                "nurse_id": str(worker.id) if worker else None,
+            }
+            if booking
+            else None
+        ),
+    }
+
+
+async def _load_complaint_context(db: AsyncSession, complaints: list):
+    """Batch-loads everything `_serialize_complaint` needs for a set of
+    complaints in a handful of queries, rather than one query per row."""
+    raiser_ids = {c.raised_by for c in complaints} | {c.assigned_to for c in complaints if c.assigned_to}
+    names: dict = {}
+    if raiser_ids:
+        ures = await db.execute(select(User).where(User.id.in_(raiser_ids)))
+        names = {u.id: (u.full_name or u.email) for u in ures.scalars().all()}
+
+    booking_ids = {c.booking_id for c in complaints if c.booking_id}
+    bookings: dict = {}
+    if booking_ids:
+        bres = await db.execute(select(Booking).where(Booking.id.in_(booking_ids)))
+        bookings = {b.id: b for b in bres.scalars().all()}
+
+    patient_ids = {b.patient_id for b in bookings.values()}
+    patients: dict = {}
+    if patient_ids:
+        pres = await db.execute(select(Patient).where(Patient.id.in_(patient_ids)))
+        patients = {p.id: p for p in pres.scalars().all()}
+
+    service_ids = {b.service_id for b in bookings.values() if b.service_id}
+    services: dict = {}
+    if service_ids:
+        sres = await db.execute(select(ServiceCatalogue).where(ServiceCatalogue.id.in_(service_ids)))
+        services = {s.id: s for s in sres.scalars().all()}
+
+    worker_ids = {b.worker_id for b in bookings.values() if b.worker_id}
+    workers: dict = {}
+    if worker_ids:
+        wres = await db.execute(select(WorkerProfile).where(WorkerProfile.id.in_(worker_ids)))
+        workers = {w.id: w for w in wres.scalars().all()}
+        # names dict above is keyed by User.id, but we look nurses up by
+        # WorkerProfile.user_id, so make sure those users are loaded too.
+        worker_user_ids = {w.user_id for w in workers.values()} - set(names.keys())
+        if worker_user_ids:
+            wures = await db.execute(select(User).where(User.id.in_(worker_user_ids)))
+            names.update({u.id: (u.full_name or u.email) for u in wures.scalars().all()})
+
+    return names, bookings, patients, services, workers
+
+
 @router.get("/complaints")
 async def list_complaints(
     status: Optional[str] = None,
@@ -1862,23 +1956,26 @@ async def list_complaints(
         q = q.where(Complaint.status == status)
     rows = await db.execute(q)
     complaints = rows.scalars().all()
-    raiser_ids = {c.raised_by for c in complaints}
-    names: dict = {}
-    if raiser_ids:
-        ures = await db.execute(select(User).where(User.id.in_(raiser_ids)))
-        names = {u.id: (u.full_name or u.email) for u in ures.scalars().all()}
-    return [
-        {
-            "id": str(c.id),
-            "subject": c.description[:80],
-            "category": c.category,
-            "status": c.status.value,
-            "raisedBy": names.get(c.raised_by, "Unknown"),
-            "created": c.created_at.isoformat(),
-            "resolution_notes": c.resolution_notes,
-        }
-        for c in complaints
-    ]
+    names, bookings, patients, services, workers = await _load_complaint_context(db, complaints)
+    return [_serialize_complaint(c, names, bookings, patients, services, workers) for c in complaints]
+
+
+@router.get("/complaints/{complaint_id}")
+async def get_complaint(
+    complaint_id: UUID,
+    current: CurrentUser = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Single-complaint detail — the list endpoint truncates the
+    description to 80 chars for the table view; this returns the full
+    complaint plus the same linked booking/patient/nurse context so the
+    detail page has everything needed to actually respond to it."""
+    res = await db.execute(select(Complaint).where(Complaint.id == complaint_id))
+    complaint = res.scalar_one_or_none()
+    if not complaint:
+        raise HTTPException(status_code=404, detail="Complaint not found")
+    names, bookings, patients, services, workers = await _load_complaint_context(db, [complaint])
+    return _serialize_complaint(complaint, names, bookings, patients, services, workers)
 
 
 @router.post("/complaints/{complaint_id}/status")
@@ -1898,6 +1995,7 @@ async def update_complaint_status(
         complaint.resolution_notes = payload.resolution_notes
     if payload.status in (ComplaintStatus.resolved_action_taken.value, ComplaintStatus.resolved_no_action.value, ComplaintStatus.closed.value):
         complaint.resolved_at = datetime.now(timezone.utc)
+    await audit(db, current.id, current.role.value, "complaint.status_update", "complaint", complaint.id, {"status": payload.status})
     await db.commit()
     return {"id": str(complaint.id), "status": complaint.status}
 
@@ -1965,19 +2063,46 @@ async def resolve_dispute(
 # ============================================================================
 # Payouts
 # ============================================================================
+def _batch_financials(payouts: list) -> dict:
+    """Every payout batch row is derived, never stored redundantly: gross,
+    net and commission all come straight off the underlying WorkerPayout
+    rows so this can never drift from what /worker-payouts actually shows."""
+    gross = sum((p.gross_amount for p in payouts), Decimal("0"))
+    net = sum((p.net_amount for p in payouts), Decimal("0"))
+    tds = sum((p.tds_deducted for p in payouts), Decimal("0"))
+    commission = gross - net - tds
+    pending = sum(1 for p in payouts if p.approval_status == PayoutApprovalStatus.pending_approval)
+    return {
+        "gross": float(gross),
+        "commission": float(commission),
+        "net_payout": float(net),
+        "pending_approval_count": pending,
+        # Batch-level approval state: "pending" while any payout in the
+        # batch still needs a decision, "approved" once every payout has
+        # been approved or rejected. This is what the Financial
+        # Reconciliation screen's "Approve" button gates on.
+        "approval_status": "pending" if pending > 0 else "approved",
+    }
+
+
 @router.get("/payouts")
 async def list_payout_batches(current: CurrentUser = Depends(require_admin), db: AsyncSession = Depends(get_db)):
-    rows = await db.execute(select(PayoutBatch).order_by(PayoutBatch.created_at.desc()))
+    rows = (await db.execute(select(PayoutBatch).order_by(PayoutBatch.created_at.desc()))).scalars().all()
+    batch_ids = {b.id for b in rows}
+    payouts_by_batch: dict = {bid: [] for bid in batch_ids}
+    if batch_ids:
+        prows = await db.execute(select(WorkerPayout).where(WorkerPayout.payout_batch_id.in_(batch_ids)))
+        for p in prows.scalars().all():
+            payouts_by_batch.setdefault(p.payout_batch_id, []).append(p)
     return [
         {
             "id": str(p.id),
             "batch": p.batch_reference,
             "nurses": p.total_payouts,
-            "gross": float(p.total_amount),
-            "status": p.status.value,
             "date": p.created_at.isoformat(),
+            **_batch_financials(payouts_by_batch.get(p.id, [])),
         }
-        for p in rows.scalars().all()
+        for p in rows
     ]
 
 
@@ -1997,8 +2122,8 @@ async def get_payout_batch(
         "id": str(batch.id),
         "batch": batch.batch_reference,
         "status": batch.status.value,
-        "total_amount": float(batch.total_amount),
         "created_at": batch.created_at.isoformat(),
+        **_batch_financials(payouts),
         "payouts": [
             {
                 "id": str(p.id),
@@ -2006,9 +2131,58 @@ async def get_payout_batch(
                 "gross_amount": float(p.gross_amount),
                 "net_amount": float(p.net_amount),
                 "status": p.status.value,
+                "approval_status": p.approval_status.value,
             }
             for p in payouts
         ],
+    }
+
+
+@router.post("/payouts/{batch_id}/approve")
+async def approve_payout_batch(
+    batch_id: UUID,
+    current: CurrentUser = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Bulk-approves every payout in a batch in one action.
+
+    This is a batch-level shortcut over the same gate `/worker-payouts/{id}/approve`
+    uses — it approves ALL nurse payouts belonging to this batch, not just
+    one. An admin who wants to review or reject individual nurses within
+    the batch should use the Payout Approvals screen instead; this button
+    is for "I've reviewed this whole batch, release all of it."
+    """
+    res = await db.execute(select(PayoutBatch).where(PayoutBatch.id == batch_id))
+    batch = res.scalar_one_or_none()
+    if not batch:
+        raise HTTPException(status_code=404, detail="Payout batch not found")
+
+    prows = await db.execute(
+        select(WorkerPayout).where(
+            WorkerPayout.payout_batch_id == batch_id,
+            WorkerPayout.approval_status == PayoutApprovalStatus.pending_approval,
+        )
+    )
+    payouts = prows.scalars().all()
+    now = datetime.now(timezone.utc)
+    for p in payouts:
+        p.approval_status = PayoutApprovalStatus.approved
+        p.approved_by = current.id
+        p.approved_at = now
+        p.approval_rejection_reason = None
+
+    await audit(
+        db, current.id, current.role.value, "payout_batch.approve", "payout_batch", batch.id,
+        {"approved_count": len(payouts)},
+    )
+    await db.commit()
+
+    all_prows = await db.execute(select(WorkerPayout).where(WorkerPayout.payout_batch_id == batch_id))
+    all_payouts = all_prows.scalars().all()
+    return {
+        "id": str(batch.id),
+        "approved_count": len(payouts),
+        **_batch_financials(all_payouts),
     }
 
 
