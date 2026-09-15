@@ -514,6 +514,26 @@ async def validate_documentation_completion(
                 if item["blocks_checkout"]:
                     blocking.append(item)
 
+    # ---------------------------------------------------------------- BASELINE
+    # Completion gate fix (nurse app items 2 & 10).
+    #
+    # Everything above is template-driven. When a booking's package/service
+    # has no checklist template AND no documentation template seeded -- which
+    # is the case for most catalogue entries today -- `blocking` came out
+    # empty and `can_checkout` was True, so a nurse could mark a visit
+    # Complete having filled in nothing at all. The gate silently degraded
+    # into no gate.
+    #
+    # So: every visit needs a report, template or not. When no template
+    # governs the booking we fall back to a minimum report -- what was done
+    # (care notes) and what the family is told (family summary) -- read off
+    # the VisitRecord. A template, when one exists, still fully defines the
+    # requirements and this baseline stays out of the way.
+    if not wf.checklist_template and not wf.documentation_template:
+        for item in await _baseline_report_items(db, visit_record_id):
+            missing.append(item)
+            blocking.append(item)
+
     can_checkout = len(blocking) == 0
     return {
         "can_checkout": can_checkout,
@@ -524,6 +544,66 @@ async def validate_documentation_completion(
         "checklist_template": _template_summary(wf.checklist_template) if wf.checklist_template else None,
         "documentation_template": _doc_template_summary(wf.documentation_template) if wf.documentation_template else None,
     }
+
+
+# Minimum fields that constitute a visit report when no documentation
+# template governs the booking. Kept deliberately small: this is the floor
+# below which a visit cannot be called complete, not a clinical form.
+BASELINE_REPORT_FIELDS = (
+    (
+        "care_notes",
+        "What you did during this visit",
+        "textarea",
+    ),
+    (
+        "family_summary",
+        "Summary for the patient's family",
+        "textarea",
+    ),
+)
+
+# A report has to say something. One word in each box is not a report, but
+# nor should the gate be so strict that a short honest note is rejected.
+_MIN_REPORT_CHARS = 10
+
+
+async def _baseline_report_items(
+    db: AsyncSession,
+    visit_record_id: Optional[UUID],
+) -> List[Dict[str, Any]]:
+    """Outstanding baseline report fields for a visit, or [] when complete."""
+    from app.models.models import VisitRecord
+
+    if visit_record_id is None:
+        # No visit record yet means nothing has been recorded at all.
+        return [
+            {
+                "type": "report",
+                "id": fid,
+                "label": label,
+                "kind": kind,
+                "blocks_checkout": True,
+            }
+            for fid, label, kind in BASELINE_REPORT_FIELDS
+        ]
+
+    vres = await db.execute(select(VisitRecord).where(VisitRecord.id == visit_record_id))
+    visit = vres.scalar_one_or_none()
+
+    out: List[Dict[str, Any]] = []
+    for fid, label, kind in BASELINE_REPORT_FIELDS:
+        value = (getattr(visit, fid, None) or "").strip() if visit else ""
+        if len(value) < _MIN_REPORT_CHARS:
+            out.append(
+                {
+                    "type": "report",
+                    "id": fid,
+                    "label": label,
+                    "kind": kind,
+                    "blocks_checkout": True,
+                }
+            )
+    return out
 
 
 def _template_summary(t: ChecklistTemplate) -> Dict[str, Any]:

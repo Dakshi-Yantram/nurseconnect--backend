@@ -43,6 +43,11 @@ class OtpSendRequest(BaseModel):
     phone_e164: str = Field(min_length=8, max_length=20)
     role: UserRole = UserRole.consumer
     purpose: str = "login"
+    # Set true ONLY when the user explicitly taps "Resend code". Left false
+    # (the default), /auth/otp/send returns the still-valid code already
+    # issued for this number instead of minting and SMSing another one --
+    # see the duplicate-OTP fix in app/api/v1/auth.py.
+    force_resend: bool = False
 
 
 class OtpSendResponse(BaseModel):
@@ -125,6 +130,12 @@ class PasswordLoginRequest(BaseModel):
     device_id: Optional[str] = None
     device_platform: Optional[str] = None
     fcm_token: Optional[str] = None
+    # Which sign-in door the user came through ("Care professional sign in"
+    # vs "Patient / family sign in"). When set, /auth/login refuses an
+    # account whose stored role doesn't match, instead of silently signing
+    # them into the other portal. Optional so existing clients and the staff
+    # web portal (many distinct roles) are unaffected.
+    expected_role: Optional[UserRole] = None
 
 
 class PhoneLoginRequest(BaseModel):
@@ -1018,6 +1029,10 @@ class NotificationOut(ORMModel):
     status: str
     read_at: Optional[datetime] = None
     created_at: datetime
+    # In-app destination for this notification, resolved server-side so the
+    # nurse app and the family app route identically. None = no destination,
+    # and the client should render the row as non-tappable rather than guess.
+    route: Optional[str] = None
 
 
 # ----- CALLING (Dyte) -----

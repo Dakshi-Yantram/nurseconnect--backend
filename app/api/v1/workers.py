@@ -164,6 +164,25 @@ async def _onboarding_snapshot(
     rejected_documents = sorted(
         d.document_type for d in docs if d.verification_status == "rejected"
     )
+
+    # ---- document-level vs account-level verification -----------------------
+    # These are two different things and conflating them is what made the
+    # nurse app report "all verified" for an account the admin panel still
+    # showed as pending. Per-document `verification_status` is set by a
+    # reviewer PATCHing each document; it does NOT advance
+    # WorkerProfile.onboarding_status, which is the only field that decides
+    # whether a nurse can actually work. Both are reported explicitly now so
+    # no client can mistake one for the other.
+    required_types = _required_docs(profile)
+    verified_types = {
+        d.document_type
+        for d in docs
+        if d.verification_status == "verified"
+        and (d.valid_until is None or d.valid_until >= date.today())
+    }
+    documents_all_verified = bool(required_types) and not (required_types - verified_types)
+    account_verified = profile.onboarding_status == WorkerOnboardingStatus.approved
+
     return {
         "onboarding_status": profile.onboarding_status.value,
         "worker_type": worker_type.value,
