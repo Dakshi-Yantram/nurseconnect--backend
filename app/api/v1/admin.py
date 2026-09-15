@@ -1,4 +1,4 @@
-"""Admin endpoints (catalog mgmt, worker approval, ledger, dashboards)."""
+﻿"""Admin endpoints (catalog mgmt, worker approval, ledger, dashboards)."""
 import logging
 import re
 from typing import List, Optional
@@ -308,7 +308,6 @@ async def approve_worker(
     # so this endpoint and the reviewer-ticket "APPROVED" status update
     # (app/api/v1/review_tickets.py) can never fall out of sync again.
     await approve_worker_profile(db, worker_id, changed_by=current.id)
-    await approve_worker_profile(db, worker_id)
     await db.commit()
     return {"approved": True}
 
@@ -377,7 +376,6 @@ async def reject_worker(
     db: AsyncSession = Depends(get_db),
 ):
     await reject_worker_profile(db, worker_id, payload.reason.strip(), changed_by=current.id)
-    await reject_worker_profile(db, worker_id, payload.reason.strip())
     await db.commit()
     return {"rejected": True}
 
