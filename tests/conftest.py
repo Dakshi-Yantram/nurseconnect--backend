@@ -17,10 +17,10 @@ ADMIN_CLINICAL_PHONE = "+919999000006"
 
 def _login(phone: str, role: str) -> dict:
     s = requests.Session()
-    r = s.post(f"{API}/auth/send-otp", json={"phone_e164": phone, "role": role}, timeout=10)
-    assert r.status_code == 200, f"send-otp failed: {r.status_code} {r.text}"
+    r = s.post(f"{API}/auth/otp/send", json={"phone_e164": phone, "role": role}, timeout=10)
+    assert r.status_code == 200, f"otp/send failed: {r.status_code} {r.text}"
     r = s.post(
-        f"{API}/auth/verify-otp",
+        f"{API}/auth/otp/verify",
         json={
             "phone_e164": phone,
             "code": "123456",
@@ -30,7 +30,7 @@ def _login(phone: str, role: str) -> dict:
         },
         timeout=10,
     )
-    assert r.status_code == 200, f"verify-otp failed: {r.status_code} {r.text}"
+    assert r.status_code == 200, f"otp/verify failed: {r.status_code} {r.text}"
     return r.json()
 
 

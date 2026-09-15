@@ -1,7 +1,7 @@
 """Visit lifecycle: check-in, check-out, vitals, medications, checklist, rating, care notes."""
 import random
 from datetime import datetime, timezone
-from typing import List
+from typing import List, Optional
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -17,6 +17,7 @@ from app.core.deps import (
     get_worker_profile,
     is_admin,
 )
+from app.core.config import settings
 from app.core.redis_client import redis_client
 from app.integrations.providers import msg91_client
 from app.models.enums import (
@@ -24,6 +25,7 @@ from app.models.enums import (
     ConsentType,
     EscalationLevel,
     EscalationStatus,
+    NotificationChannel,
     UserRole,
     VisitStatus,
 )
@@ -220,7 +222,12 @@ async def _ensure_visit_start_otp(db: AsyncSession, booking: Booking) -> dict:
     sms_sent = False
     if phone:
         try:
-            resp = await msg91_client.send_otp(phone, otp_code)
+            resp = await msg91_client.send_otp(
+                phone,
+                otp_code,
+                template_id=getattr(settings, "MSG91_VISIT_OTP_TEMPLATE_ID", None) or None,
+                purpose="visit_start",
+            )
             sms_sent = resp.get("type") == "success"
         except Exception:
             # SMS failure must not block — the code is still shown in-app below.
@@ -349,10 +356,9 @@ async def verify_visit_start_otp(
             },
         )
 
-    # OTP verified — delete keys immediately
-    await redis_client.delete(_otp_key(booking_id))
-    await redis_client.delete(_attempts_key(booking_id))
-
+    # OTP matches — but don't consume it yet. If a downstream check (consent,
+    # already-checked-in) fails, the nurse/consumer shouldn't have to
+    # generate a brand new code for something unrelated to the code itself.
     vres = await db.execute(select(VisitRecord).where(VisitRecord.booking_id == booking_id))
     visit = vres.scalar_one_or_none()
     if visit and visit.check_in_at:
@@ -371,6 +377,12 @@ async def verify_visit_start_otp(
             status_code=403,
             detail={"code": ce.code, "message": ce.message, "consent_type": ce.consent_type.value},
         ) from None
+
+    # All checks passed — the code is now spent, whether or not the rest of
+    # the check-in succeeds (matches the original all-or-nothing behavior
+    # for genuine check-in failures past this point).
+    await redis_client.delete(_otp_key(booking_id))
+    await redis_client.delete(_attempts_key(booking_id))
 
     if not visit:
         visit = VisitRecord(
@@ -421,10 +433,23 @@ async def checkout(
     if visit.check_out_at:
         raise HTTPException(status_code=400, detail="Already checked out")
 
+    # Stage whatever the nurse submitted with this request onto the visit
+    # record BEFORE validating. The baseline report gate in
+    # validate_documentation_completion reads the persisted VisitRecord, so
+    # without this a report supplied in the checkout payload itself would be
+    # invisible to the gate and a legitimate checkout would be rejected.
+    # Nothing is committed until the gate passes.
+    if payload.care_notes and payload.care_notes.strip():
+        visit.care_notes = payload.care_notes.strip()
+    if getattr(payload, "family_summary", None) and payload.family_summary.strip():
+        visit.family_summary = payload.family_summary.strip()
+    await db.flush()
+
     # Patch 4 — dynamic, template-driven completion validation. Replaces the
     # previous hardcoded "checklist + vitals + family_summary + care_notes"
     # gate. All requirements are now derived from the booking's resolved
-    # checklist + documentation templates (package > service > fallback).
+    # checklist + documentation templates (package > service > fallback),
+    # plus a baseline report floor when no template governs the booking.
     try:
         status = await validate_documentation_completion(booking_id, visit.id, db)
     except WorkflowError as we:
@@ -440,13 +465,22 @@ async def checkout(
         )
     if not status["can_checkout"]:
         from starlette.responses import JSONResponse
+        await db.rollback()
+        blocking = status["blocking_items"] or status["missing_items"]
+        report_only = bool(blocking) and all(i.get("type") == "report" for i in blocking)
         return JSONResponse(
             status_code=422,
             content={
                 "success": False,
-                "code": "MANDATORY_DOCUMENTATION_INCOMPLETE",
-                "message": "Mandatory documentation is incomplete.",
-                "missing_items": status["blocking_items"] or status["missing_items"],
+                # Distinct code so the app can route the nurse straight to the
+                # visit report form rather than to a generic documentation
+                # screen that may not exist for this booking.
+                "code": "VISIT_REPORT_REQUIRED" if report_only
+                else "MANDATORY_DOCUMENTATION_INCOMPLETE",
+                "message": "Fill in and submit your visit report before completing this visit."
+                if report_only
+                else "Mandatory documentation is incomplete.",
+                "missing_items": blocking,
             },
         )
 
@@ -488,6 +522,84 @@ async def checkout(
         coverage_summary = None
 
     await audit(db, profile.user_id, "worker", "visit.checkout", "visit", visit.id, {"duration_min": visit.actual_duration_minutes, "coverage": coverage_summary})
+
+    # Bug fix: the family/consumer was never actually notified that the
+    # visit report was ready — checkout only broadcast over the live
+    # websocket (booking_topic), which only reaches a client that happens to
+    # be connected at that exact moment, and persisted nothing to the
+    # notification center. Send a real notification (in-app + push, so it
+    # survives even if the family isn't looking at the app right now) with
+    # the family summary itself, not just a "something happened" ping.
+    try:
+        await notify_parties(
+            db,
+            ["family"],
+            {"booking_id": str(booking_id), "visit_id": str(visit.id)},
+            "visit.completed.report_ready",
+            "Visit report is ready",
+            family_summary,
+        )
+    except Exception as exc:  # noqa: BLE001
+        # Never block checkout on a notification-delivery glitch — the
+        # report itself is already saved on the visit record and viewable
+        # in-app either way. Just don't let it silently vanish from logs.
+        import logging as _logging
+        _logging.getLogger(__name__).warning(
+            "family notification failed for booking %s: %s", booking.id, exc
+        )
+
+    # WhatsApp feedback request — fired the moment the visit is checked out,
+    # separate from the in-app/push "report ready" notification above so it
+    # reaches the family even if they never open the app. Uses the Interakt
+    # WhatsApp provider (see app/integrations/providers.py). Delivery/read
+    # status for this message comes back asynchronously on
+    # POST /api/webhooks/whatsapp/interakt and updates the NotificationLog
+    # row by provider_message_id.
+    try:
+        feedback_link = f"{settings.FEEDBACK_LINK_BASE_URL}/{booking_id}"
+        await notify_parties(
+            db,
+            ["family"],
+            {"booking_id": str(booking_id), "visit_id": str(visit.id), "feedback_link": feedback_link},
+            settings.INTERAKT_FEEDBACK_TEMPLATE,
+            "How was the visit?",
+            f"The visit is complete. We'd love to hear how it went — please share your feedback: {feedback_link}",
+            channels=[NotificationChannel.whatsapp],
+        )
+    except Exception as exc:  # noqa: BLE001
+        # Never block checkout on a WhatsApp delivery glitch — the visit is
+        # already saved and the family can still be reached via the in-app
+        # notification sent above.
+        import logging as _logging
+        _logging.getLogger(__name__).warning(
+            "whatsapp feedback request failed for booking %s: %s", booking.id, exc
+        )
+
+    # Generate the nurse's payout for this completed visit. Idempotent, so a
+    # retried/replayed checkout never pays twice. A payout glitch must never
+    # block the nurse from completing the visit, so it's best-effort and logged.
+    try:
+        from app.services.payout_service import create_payout_for_booking
+        await create_payout_for_booking(db, booking)
+
+        # First-ever completed booking -> Stage 2 (e-stamp Master Agreement)
+        # just unlocked. Nudge the nurse immediately rather than waiting for
+        # her to happen to open the app and notice.
+        if profile.completed_visits_count == 1:
+            await notify_parties(
+                db,
+                ["worker"],
+                {"booking_id": str(booking_id)},
+                "contract.stage2.unlocked",
+                "Complete your Partner Agreement",
+                "Congrats on your first booking! Please e-sign your Master Agreement to unlock future bookings.",
+            )
+    except Exception as exc:  # noqa: BLE001
+        import logging as _logging
+        _logging.getLogger(__name__).warning(
+            "payout generation failed for booking %s: %s", booking.id, exc
+        )
+
     await db.commit()
     await db.refresh(visit)
     await manager.broadcast(booking_topic(booking_id), {"type": "visit.completed", "booking_id": str(booking_id), "coverage": coverage_summary})
@@ -898,3 +1010,153 @@ async def list_care_notes(patient_id: UUID, current: CurrentUser = Depends(get_c
             continue
         out.append(n)
     return [CareNoteOut.model_validate(n) for n in out]
+
+# ===========================================================================
+# Visit report  (nurse app items 2 & 10, patient/family app item 14)
+# ===========================================================================
+# Before this, a visit report had no dedicated surface at all: the nurse
+# could only pass `care_notes` / `family_summary` inside the checkout call,
+# there was no way to draft or revise a report, and no way for the family to
+# read one back. These three endpoints give the report its own lifecycle --
+# fetch what's outstanding, save it (repeatedly, before or after checkout),
+# and let the patient side read the finished version.
+
+
+class VisitReportUpdate(BaseModel):
+    """A nurse's visit report. Both fields are optional per-request so the
+    form can autosave a partial draft; completeness is judged by the
+    checkout gate, not here."""
+    care_notes: Optional[str] = None
+    family_summary: Optional[str] = None
+
+
+def _report_payload(visit: VisitRecord, status: dict | None = None) -> dict:
+    out = {
+        "booking_id": str(visit.booking_id),
+        "visit_id": str(visit.id),
+        "care_notes": visit.care_notes,
+        "family_summary": visit.family_summary,
+        "documentation_complete": visit.documentation_complete,
+        "check_in_at": visit.check_in_at.isoformat() if visit.check_in_at else None,
+        "check_out_at": visit.check_out_at.isoformat() if visit.check_out_at else None,
+        "actual_duration_minutes": visit.actual_duration_minutes,
+        "status": visit.status.value,
+    }
+    if status is not None:
+        out["can_complete_visit"] = status["can_checkout"]
+        out["missing_items"] = status["blocking_items"] or status["missing_items"]
+    return out
+
+
+@router.get("/{booking_id}/report")
+async def get_visit_report_for_worker(
+    booking_id: UUID,
+    profile: WorkerProfile = Depends(get_worker_profile),
+    db: AsyncSession = Depends(get_db),
+):
+    """The nurse's own report for a visit, plus what's still outstanding.
+
+    Works both before checkout (to drive the report form and show what is
+    blocking completion) and after (so the report stays reachable from the
+    Visits list rather than disappearing the moment the visit completes --
+    which was the specific gap in item 10).
+    """
+    _booking, visit = await _get_visit_for_worker(db, booking_id, profile.id)
+    try:
+        status = await validate_documentation_completion(booking_id, visit.id, db)
+    except WorkflowError:
+        status = None
+    return _report_payload(visit, status)
+
+
+@router.put("/{booking_id}/report")
+async def save_visit_report(
+    booking_id: UUID,
+    payload: VisitReportUpdate,
+    profile: WorkerProfile = Depends(get_worker_profile),
+    db: AsyncSession = Depends(get_db),
+):
+    """Save (or re-save) the nurse's visit report.
+
+    Deliberately permitted after checkout as well: a nurse correcting a
+    typo in a report an hour later is normal, and refusing it would push
+    people into raising support tickets to fix their own notes. Every save
+    is audited, so an after-the-fact edit is traceable.
+    """
+    _booking, visit = await _get_visit_for_worker(db, booking_id, profile.id)
+
+    if payload.care_notes is not None:
+        visit.care_notes = payload.care_notes.strip() or None
+    if payload.family_summary is not None:
+        visit.family_summary = payload.family_summary.strip() or None
+
+    await audit(
+        db,
+        profile.user_id,
+        "worker",
+        "visit.report_saved",
+        "visit",
+        visit.id,
+        {"after_checkout": bool(visit.check_out_at)},
+    )
+    await db.commit()
+    await db.refresh(visit)
+
+    try:
+        status = await validate_documentation_completion(booking_id, visit.id, db)
+    except WorkflowError:
+        status = None
+    return _report_payload(visit, status)
+
+
+@router.get("/{booking_id}/report/consumer")
+async def get_visit_report_for_consumer(
+    booking_id: UUID,
+    profile: ConsumerProfile = Depends(get_consumer_profile),
+    db: AsyncSession = Depends(get_db),
+):
+    """The family-facing visit report (item 14).
+
+    Returns the family summary rather than the nurse's raw clinical notes:
+    `care_notes` is the nurse's own working record and is not part of what
+    the patient side is shown here.
+    """
+    bres = await db.execute(
+        select(Booking).where(
+            Booking.id == booking_id,
+            Booking.consumer_id == profile.id,
+        )
+    )
+    booking = bres.scalar_one_or_none()
+    if not booking:
+        raise HTTPException(status_code=404, detail="Booking not found")
+
+    vres = await db.execute(select(VisitRecord).where(VisitRecord.booking_id == booking_id))
+    visit = vres.scalar_one_or_none()
+    if not visit:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "code": "NO_VISIT_YET",
+                "message": "This visit hasn't started yet, so there's no report.",
+            },
+        )
+    if not visit.check_out_at:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "VISIT_IN_PROGRESS",
+                "message": "The nurse is still with the patient. The report will appear here once the visit is complete.",
+            },
+        )
+
+    return {
+        "booking_id": str(booking_id),
+        "visit_id": str(visit.id),
+        "family_summary": visit.family_summary,
+        "check_in_at": visit.check_in_at.isoformat() if visit.check_in_at else None,
+        "check_out_at": visit.check_out_at.isoformat() if visit.check_out_at else None,
+        "actual_duration_minutes": visit.actual_duration_minutes,
+        "photo_urls": list(visit.photo_urls or []),
+        "rating_by_consumer": visit.rating_by_consumer,
+    }
