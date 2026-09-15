@@ -393,7 +393,9 @@ class Msg91Client:
         verification in otp_verify()).
         """
         if self.mock:
-            logger.info("MOCK MSG91 send_otp phone=%s code=%s", phone_e164, otp)
+            logger.info(
+                "MOCK MSG91 send_otp phone=%s code=%s purpose=%s", phone_e164, otp, purpose
+            )
             return {"type": "success", "request_id": f"msg91_mock_{uuid.uuid4().hex[:10]}"}
         import httpx
         payload = {

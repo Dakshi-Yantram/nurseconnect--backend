@@ -78,6 +78,20 @@ def _validate_signup_role(role: UserRole) -> None:
         raise HTTPException(status_code=400, detail="Only consumer and worker accounts can self-register")
 
 
+# Wording for the wrong-portal refusal on /auth/login. Keyed on the role the
+# CLIENT expected, because that's the screen the user is looking at.
+_ROLE_MISMATCH_MESSAGES = {
+    UserRole.worker: "This account is not registered as a care professional.",
+    UserRole.consumer: "This account is not registered as a patient or family member.",
+}
+
+
+def _role_mismatch_message(expected: UserRole) -> str:
+    return _ROLE_MISMATCH_MESSAGES.get(
+        expected, "This account is not registered for this sign-in."
+    )
+
+
 def _validate_password(password: str) -> None:
     if (
         len(password) < 8
@@ -546,6 +560,21 @@ async def otp_send(payload: OtpSendRequest, request: Request, db: AsyncSession =
         else f"{secrets.randbelow(1000000):06d}"
     )
     expires_at = datetime.now(timezone.utc) + timedelta(minutes=settings.OTP_EXPIRE_MINUTES)
+
+    # Retire any still-live code for this number/purpose. /otp/verify reads
+    # "the most recent unconsumed code", so leaving the old ones open served
+    # no purpose and widened the guessing surface every time a code was
+    # resent.
+    await db.execute(
+        update(OtpCode)
+        .where(
+            OtpCode.phone_e164 == phone,
+            OtpCode.purpose == payload.purpose,
+            OtpCode.consumed.is_(False),
+        )
+        .values(consumed=True)
+    )
+
     db.add(
         OtpCode(
             phone_e164=phone,

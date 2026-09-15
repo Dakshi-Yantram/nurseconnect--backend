@@ -160,6 +160,13 @@ class Settings(BaseSettings):
     MSG91_AUTH_KEY: str = ""
     MSG91_SENDER_ID: str = "NRSCNC"
     MSG91_TEMPLATE_ID: str = ""
+    # Separate DLT template for the visit-start OTP. The visit code was
+    # being relayed through MSG91_TEMPLATE_ID above, whose approved text
+    # reads "Your OTP for login is ...", so patients received door codes
+    # labelled as login codes. Register a visit-code template in the
+    # MSG91 dashboard and set this; until then the code falls back to the
+    # login template and logs a warning.
+    MSG91_VISIT_OTP_TEMPLATE_ID: str = ""
 
     # Interakt
     INTERAKT_API_KEY: str = ""
