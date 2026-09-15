@@ -129,7 +129,7 @@ def ctx(nurse_auth, family_auth):
     # would, instead of asserting around a step this suite never took.
     for consent_type in ("service", "medication"):
         cr = requests.post(
-            f"{API}/care/consents",
+            f"{API}/consents",
             headers=ch,
             json={
                 "patient_id": pid,
