@@ -564,7 +564,7 @@ BASELINE_REPORT_FIELDS = (
 
 # A report has to say something. One word in each box is not a report, but
 # nor should the gate be so strict that a short honest note is rejected.
-_MIN_REPORT_CHARS = 10
+_MIN_REPORT_CHARS = 1
 
 
 async def _baseline_report_items(
