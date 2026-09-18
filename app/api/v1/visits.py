@@ -1160,3 +1160,70 @@ async def get_visit_report_for_consumer(
         "photo_urls": list(visit.photo_urls or []),
         "rating_by_consumer": visit.rating_by_consumer,
     }
+
+
+# ---------------------------------------------------------------------------
+# Visit report — PDF
+# ---------------------------------------------------------------------------
+# Two views of the same document, mirroring the family_summary /
+# care_notes split already enforced above: the nurse's copy carries her
+# clinical notes, the family's copy never does. Which fields are visible is
+# decided here, at the API boundary, by which endpoint (and therefore which
+# auth dependency) was called — `visit_report_service` itself has no notion
+# of "who is asking".
+
+
+@router.get("/{booking_id}/report/pdf")
+async def get_visit_report_pdf_for_worker(
+    booking_id: UUID,
+    profile: WorkerProfile = Depends(get_worker_profile),
+    db: AsyncSession = Depends(get_db),
+):
+    """The nurse's own downloadable copy of her visit report, clinical notes included."""
+    booking, visit = await _get_visit_for_worker(db, booking_id, profile.id)
+    if not visit.check_out_at:
+        raise HTTPException(
+            status_code=409,
+            detail="The report becomes downloadable once the visit is checked out.",
+        )
+    from app.services.visit_report_service import generate_visit_report_pdf_url
+
+    pdf_url = await generate_visit_report_pdf_url(
+        db, visit, booking.booking_ref, include_clinical_notes=True
+    )
+    if not pdf_url:
+        raise HTTPException(status_code=502, detail="Could not generate the report PDF. Please try again.")
+    return {"pdf_url": pdf_url}
+
+
+@router.get("/{booking_id}/report/consumer/pdf")
+async def get_visit_report_pdf_for_consumer(
+    booking_id: UUID,
+    profile: ConsumerProfile = Depends(get_consumer_profile),
+    db: AsyncSession = Depends(get_db),
+):
+    """The family's downloadable copy of the visit report — family summary only,
+    never the nurse's internal clinical notes."""
+    bres = await db.execute(
+        select(Booking).where(Booking.id == booking_id, Booking.consumer_id == profile.id)
+    )
+    booking = bres.scalar_one_or_none()
+    if not booking:
+        raise HTTPException(status_code=404, detail="Booking not found")
+
+    vres = await db.execute(select(VisitRecord).where(VisitRecord.booking_id == booking_id))
+    visit = vres.scalar_one_or_none()
+    if not visit or not visit.check_out_at:
+        raise HTTPException(
+            status_code=409,
+            detail="The report becomes downloadable once the visit is complete.",
+        )
+
+    from app.services.visit_report_service import generate_visit_report_pdf_url
+
+    pdf_url = await generate_visit_report_pdf_url(
+        db, visit, booking.booking_ref, include_clinical_notes=False
+    )
+    if not pdf_url:
+        raise HTTPException(status_code=502, detail="Could not generate the report PDF. Please try again.")
+    return {"pdf_url": pdf_url}
