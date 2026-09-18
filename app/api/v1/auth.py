@@ -586,11 +586,38 @@ async def otp_send(payload: OtpSendRequest, request: Request, db: AsyncSession =
     await db.commit()
 
     if not settings.otp_dev_mode:
-        try:
-            from app.integrations.providers import msg91_client
-            await msg91_client.send_otp(phone, code)
-        except Exception:
-            logger.exception("MSG91 OTP dispatch failed for %s", phone)
+        from app.integrations.providers import mask_phone_for_log, msg91_client, sms_delivered
+        result = await msg91_client.send_otp(phone, code, purpose=f"auth_{payload.purpose}")
+        if not sms_delivered(result):
+            # Previously: failure was logged and the API still answered
+            # {"sent": true}, so the app sat on "Enter OTP" for a code that
+            # was never going to arrive. Now: retire the undelivered code,
+            # refund the per-phone send budget, and tell the client.
+            logger.error("OTP not delivered phone=%s reason=%s",
+                         mask_phone_for_log(phone), result.get("reason"))
+            await db.execute(
+                update(OtpCode)
+                .where(OtpCode.phone_e164 == phone, OtpCode.purpose == payload.purpose,
+                       OtpCode.consumed.is_(False))
+                .values(consumed=True)
+            )
+            await db.commit()
+            from app.core.rate_limit import release_rate_limit
+            await release_rate_limit("otp_send:phone", phone)
+            raise HTTPException(
+                status_code=502 if result.get("retryable", True) else 503,
+                detail={
+                    "code": "OTP_SEND_FAILED",
+                    "message": (
+                        "We couldn't send the code to this number right now. "
+                        "Please try again in a minute."
+                        if result.get("retryable", True)
+                        else "SMS codes are temporarily unavailable. Please use email login "
+                             "or contact support."
+                    ),
+                    "retryable": bool(result.get("retryable", True)),
+                },
+            )
 
     return OtpSendResponse(
         sent=True,

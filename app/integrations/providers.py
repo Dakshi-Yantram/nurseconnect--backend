@@ -367,72 +367,172 @@ class CloudinaryClient:
 # ============================================================================
 # SMS (MSG91)
 # ============================================================================
+def mask_phone_for_log(phone: Optional[str]) -> str:
+    """Never log full phone numbers: '+919876543210' -> '+91******3210'."""
+    if not phone:
+        return "<none>"
+    p = str(phone)
+    return (p[:3] + "******" + p[-4:]) if len(p) > 7 else "****"
+
+
+def sms_delivered(resp: Optional[Dict[str, Any]]) -> bool:
+    """True only when MSG91 accepted the message.
+
+    NOTE: "accepted" is the best a synchronous API can tell us — DLT/operator
+    rejection after acceptance only shows in MSG91's delivery reports.
+    """
+    return bool(resp) and resp.get("type") == "success"
+
+
 class Msg91Client:
+    """MSG91 Flow API client.
+
+    Contract: send_otp() NEVER raises. It returns
+      {"type": "success", "request_id": ...}                 accepted by MSG91
+      {"type": "error", "reason": <code>, "retryable": bool}  not sent
+    so every caller can tell the user the truth instead of "code sent".
+
+    Why OTPs were silently not arriving before this rewrite:
+      1. Visit-start OTP: visits.py called send_otp(..., template_id=...,
+         purpose=...) but the method accepted neither keyword -> TypeError on
+         EVERY call, swallowed by the caller's bare `except`. That SMS has
+         never been sent.
+      2. Mock branch referenced an undefined `purpose` -> NameError.
+      3. MOCK_EXTERNAL_PROVIDERS defaults to True, and a missing
+         MSG91_AUTH_KEY also enabled mock mode — in production that meant
+         "success" was returned while no SMS was sent at all.
+      4. A non-JSON MSG91 reply (HTML 5xx page, gateway error) made
+         resp.json() raise; timeouts raised too; no retry for either.
+      5. A {"type": "error"} reply was logged and returned, but the login
+         caller ignored the return value and told the user "OTP sent".
+    """
+
+    _URL = "https://control.msg91.com/api/v5/flow/"
+    _ATTEMPTS = 2
+    _BACKOFF_SECONDS = 1.0
+
     def __init__(self) -> None:
         self.mock = settings.MOCK_EXTERNAL_PROVIDERS or not settings.MSG91_AUTH_KEY or settings.MSG91_AUTH_KEY == "placeholder"
         self.auth_key = settings.MSG91_AUTH_KEY
         self.sender_id = settings.MSG91_SENDER_ID
         self.template_id = settings.MSG91_TEMPLATE_ID
 
-    async def send_otp(self, phone_e164: str, otp: str) -> Dict[str, Any]:
-        """Send an already-generated OTP via MSG91's Flow API.
+    async def send_otp(
+        self,
+        phone_e164: str,
+        otp: str,
+        *,
+        template_id: Optional[str] = None,
+        purpose: str = "login",
+    ) -> Dict[str, Any]:
+        """Send an already-generated code via a DLT-approved Flow template.
 
-        Our template lives under SMS > Templates in the MSG91 dashboard
-        (created/verified there, and "Test DLT" from that page sends fine).
-        That's MSG91's *Flow* template pool — a totally separate pool from
-        the dedicated "OTP" product's SendOTP templates. Calling
-        /api/v5/otp with a Flow template_id reliably comes back
-        "Template ID Missing or Invalid Template" even though the ID is
-        right there in the request — MSG91 is looking it up in the wrong
-        pool. /api/v5/flow/ is the correct endpoint for a Flow template.
-        The template content is "Your OTP for login is ##number##...", so
-        the variable name the Flow API expects is "number".
-        ``otp`` here is OUR own generated code (see auth.py); we pass
-        it through so MSG91 just relays it inside the DLT-approved template
-        rather than generating its own (which would break our own hash-based
-        verification in otp_verify()).
+        The Flow template lives under SMS > Templates in the MSG91 dashboard
+        (a different pool from the SendOTP product), hence /api/v5/flow/ and
+        the "number" variable. `otp` is OUR code; MSG91 only relays it.
         """
+        masked = mask_phone_for_log(phone_e164)
         if self.mock:
-            logger.info(
-                "MOCK MSG91 send_otp phone=%s code=%s purpose=%s", phone_e164, otp, purpose
-            )
+            if settings.is_production:
+                # Never pretend an SMS went out in production.
+                logger.error("MSG91 not configured in production (mock mode); OTP NOT sent purpose=%s phone=%s",
+                             purpose, masked)
+                return {"type": "error", "reason": "sms_not_configured", "retryable": False}
+            # Dev only: code in the log so local testing works without credits.
+            logger.info("MOCK MSG91 send_otp phone=%s code=%s purpose=%s", masked, otp, purpose)
             return {"type": "success", "request_id": f"msg91_mock_{uuid.uuid4().hex[:10]}"}
+
+        tpl = template_id or self.template_id
+        if not tpl:
+            logger.error("MSG91 template id missing; OTP NOT sent purpose=%s phone=%s", purpose, masked)
+            return {"type": "error", "reason": "template_not_configured", "retryable": False}
+        if not phone_e164 or not phone_e164.lstrip("+").isdigit():
+            return {"type": "error", "reason": "invalid_phone", "retryable": False}
+
+        import asyncio
+
         import httpx
-        payload = {
-            "template_id": self.template_id,
+
+        payload: Dict[str, Any] = {
+            "template_id": tpl,
             "short_url": "0",
-            "recipients": [
-                {
-                    "mobiles": phone_e164.lstrip("+"),
-                    "number": otp,
-                }
-            ],
+            "recipients": [{"mobiles": phone_e164.lstrip("+"), "number": otp}],
         }
         if self.sender_id:
             payload["sender"] = self.sender_id
-        async with httpx.AsyncClient() as client:
-            resp = await client.post(
-                "https://control.msg91.com/api/v5/flow/",
-                json=payload,
-                headers={"authkey": self.auth_key, "content-type": "application/json"},
-                timeout=10,
-            )
-            data = resp.json()
-            if data.get("type") != "success":
-                logger.error("MSG91 send_otp failed phone=%s response=%s", phone_e164, data)
-            return data
+
+        last: Dict[str, Any] = {"type": "error", "reason": "unknown", "retryable": True}
+        for attempt in range(1, self._ATTEMPTS + 1):
+            try:
+                async with httpx.AsyncClient(timeout=httpx.Timeout(8.0, connect=4.0)) as client:
+                    resp = await client.post(
+                        self._URL,
+                        json=payload,
+                        headers={"authkey": self.auth_key, "content-type": "application/json"},
+                    )
+            except httpx.TimeoutException:
+                last = {"type": "error", "reason": "timeout", "retryable": True}
+            except httpx.RequestError as exc:
+                last = {"type": "error", "reason": f"network:{type(exc).__name__}", "retryable": True}
+            else:
+                try:
+                    data = resp.json()
+                except ValueError:
+                    data = None
+                if resp.status_code < 400 and isinstance(data, dict) and data.get("type") == "success":
+                    rid = data.get("request_id") or data.get("message")
+                    if attempt > 1:
+                        logger.info("MSG91 send_otp succeeded on retry purpose=%s phone=%s", purpose, masked)
+                    return {"type": "success", "request_id": rid}
+                # 5xx / non-JSON = transient; 4xx or {"type":"error"} = config/DLT
+                # problem (bad template, auth key, blocked number) — retrying
+                # the same request won't help.
+                retryable = resp.status_code >= 500 or data is None
+                msg = (data or {}).get("message") if isinstance(data, dict) else None
+                last = {
+                    "type": "error",
+                    "reason": f"http_{resp.status_code}",
+                    "provider_message": str(msg)[:200] if msg else None,
+                    "retryable": retryable,
+                }
+            logger.warning("MSG91 send_otp attempt %d/%d failed purpose=%s phone=%s reason=%s msg=%s",
+                           attempt, self._ATTEMPTS, purpose, masked, last.get("reason"),
+                           last.get("provider_message"))
+            if not last.get("retryable") or attempt == self._ATTEMPTS:
+                break
+            await asyncio.sleep(self._BACKOFF_SECONDS)
+
+        logger.error("MSG91 send_otp FAILED purpose=%s phone=%s reason=%s", purpose, masked, last.get("reason"))
+        return last
 
     async def send_sms(self, phone_e164: str, message: str) -> Dict[str, Any]:
-        if self.mock:
-            logger.info("MOCK MSG91 send_sms phone=%s msg=%s", phone_e164, message[:80])
+        """Free-text SMS. NOT IMPLEMENTED for real delivery: Indian DLT rules
+        require a pre-approved template per message, so free text cannot be
+        sent. Use send_otp() with a dedicated template instead."""
+        if self.mock and not settings.is_production:
+            logger.info("MOCK MSG91 send_sms phone=%s", mask_phone_for_log(phone_e164))
             return {"type": "success", "request_id": f"msg91_mock_{uuid.uuid4().hex[:10]}"}
-        # Real impl
-        return {"type": "skipped"}
+        logger.warning("MSG91 send_sms skipped (free-text SMS unsupported under DLT) phone=%s",
+                       mask_phone_for_log(phone_e164))
+        return {"type": "skipped", "reason": "free_text_sms_unsupported"}
 
 
 # ============================================================================
 # WhatsApp (Interakt)
 # ============================================================================
+def _interakt_local_number(phone_e164: str) -> str:
+    """'+919876543210' -> '9876543210'.
+
+    The old code used phone.lstrip("+91"), which strips any leading run of
+    the CHARACTERS '+', '9' and '1' — so '+919876543210' became '876543210'
+    and every number starting with 9 or 1 was mangled.
+    """
+    p = (phone_e164 or "").strip()
+    if p.startswith("+91"):
+        return p[3:]
+    return p.lstrip("+")
+
+
 class InteraktClient:
     def __init__(self) -> None:
         self.mock = settings.MOCK_EXTERNAL_PROVIDERS or not settings.INTERAKT_API_KEY or settings.INTERAKT_API_KEY == "placeholder"
@@ -448,7 +548,7 @@ class InteraktClient:
             resp = await client.post(
                 f"{self.base_url}/v1/public/message/",
                 headers={"Authorization": f"Basic {self.api_key}"},
-                json={"countryCode": "+91", "phoneNumber": phone_e164.lstrip("+91"), "type": "Template", "template": {"name": template_name, "languageCode": "en", "bodyValues": list(variables.values())}},
+                json={"countryCode": "+91", "phoneNumber": _interakt_local_number(phone_e164), "type": "Template", "template": {"name": template_name, "languageCode": "en", "bodyValues": list(variables.values())}},
                 timeout=10,
             )
             return resp.json()

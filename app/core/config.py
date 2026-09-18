@@ -128,6 +128,12 @@ class Settings(BaseSettings):
     # App URL used to build the public e-prescription verification link
     # embedded in the Rx PDF's QR code (e.g. https://app.nurseconnect.in).
     PUBLIC_APP_URL: str = "https://app.nurseconnect.in"
+    # Public base URL of THIS API (e.g. the CloudFront domain). Used to build
+    # absolute, short-lived visit-report download links for the mobile apps.
+    # When unset, it is derived from X-Forwarded-Proto/Host on the request.
+    PUBLIC_API_URL: str = ""
+    # Lifetime of a one-time visit-report PDF download link.
+    REPORT_DOWNLOAD_TOKEN_TTL_SECONDS: int = 60
 
     # RazorpayX (payouts) — separate product from Razorpay payments above.
     # Leave blank to keep payouts manual (admin marks them paid after an
@@ -167,6 +173,10 @@ class Settings(BaseSettings):
     # MSG91 dashboard and set this; until then the code falls back to the
     # login template and logs a warning.
     MSG91_VISIT_OTP_TEMPLATE_ID: str = ""
+    # DLT template for password-reset codes. MSG91 (India/DLT) will not
+    # deliver free-text SMS, so the old send_sms() path silently dropped
+    # every reset code. Falls back to MSG91_TEMPLATE_ID when unset.
+    MSG91_PASSWORD_RESET_TEMPLATE_ID: str = ""
 
     # Interakt
     INTERAKT_API_KEY: str = ""
@@ -331,7 +341,23 @@ class Settings(BaseSettings):
             if self.MOCK_EXTERNAL_PROVIDERS:
                 problems.append(
                     "MOCK_EXTERNAL_PROVIDERS is on in a production environment — "
-                    "payments and SMS are being faked."
+                    "payments are being faked and SMS OTPs will be reported as "
+                    "FAILED (never silently 'sent')."
+                )
+            if not (self.MSG91_AUTH_KEY and self.MSG91_TEMPLATE_ID):
+                problems.append(
+                    "MSG91_AUTH_KEY/MSG91_TEMPLATE_ID are not both set — OTP SMS "
+                    "cannot be delivered."
+                )
+            if self.APP_DEBUG:
+                problems.append(
+                    "APP_DEBUG is on in a production environment — ignoring it "
+                    "(tracebacks are never returned to clients in production)."
+                )
+            if not self.PUBLIC_API_URL:
+                problems.append(
+                    "PUBLIC_API_URL is not set — visit-report download links for "
+                    "the mobile apps will be derived from proxy headers."
                 )
         return problems
 

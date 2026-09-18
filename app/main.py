@@ -97,8 +97,43 @@ app = FastAPI(
     version="2.0.0",
     description="NurseConnect backend — production-grade healthcare marketplace platform",
     lifespan=lifespan,
-    debug=True,
+    # Was hard-coded True: in Starlette's debug mode an unhandled exception
+    # returns an HTML traceback (source lines, paths) to the caller and
+    # bypasses the JSON handler below.
+    debug=bool(settings.APP_DEBUG) and not settings.is_production,
 )
+
+
+def _internal_error_response(request: Request) -> JSONResponse:
+    rid = getattr(request.state, "request_id", None)
+    return JSONResponse(
+        status_code=500,
+        content={"detail": {
+            "code": "INTERNAL_ERROR",
+            "message": "Something went wrong on our side. Please try again.",
+            "request_id": rid,
+        }},
+        headers={"Cache-Control": "no-store"},
+    )
+
+
+@app.middleware("http")
+async def unhandled_exception_middleware(request: Request, call_next):
+    """Registered BEFORE CORSMiddleware, so it sits INSIDE it.
+
+    Starlette's ServerErrorMiddleware is the outermost layer — its 500s carry
+    no CORS headers, so a cross-origin frontend (Cloudflare -> CloudFront)
+    saw every server crash as an opaque "Failed to fetch"/network error and
+    could never show the real message. Catching here keeps the response on
+    the CORS path. The body is generic: exception text can contain SQL,
+    column values or PHI and must not be returned to the client.
+    """
+    try:
+        return await call_next(request)
+    except Exception:  # noqa: BLE001
+        logger.exception("UNHANDLED ERROR on %s %s rid=%s", request.method, request.url.path,
+                         getattr(request.state, "request_id", None))
+        return _internal_error_response(request)
 
 app.add_middleware(
     CORSMiddleware,
@@ -115,8 +150,10 @@ import traceback
 
 @app.exception_handler(Exception)
 async def debug_exception_handler(request: Request, exc: Exception):
+    # Fallback only (the middleware above normally catches first). Used to
+    # return str(exc) — internal error text — straight to the client.
     logger.exception("UNHANDLED ERROR on %s %s", request.method, request.url.path)
-    return JSONResponse(status_code=500, content={"detail": str(exc)})
+    return _internal_error_response(request)
 
 
 @app.middleware("http")

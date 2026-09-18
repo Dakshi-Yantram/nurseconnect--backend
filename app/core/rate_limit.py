@@ -135,3 +135,18 @@ async def clear_failures(scope: str, identifier: str) -> None:
         await redis_client.delete(_key(f"{scope}:fail", identifier))
     except Exception:  # noqa: BLE001
         pass
+
+
+async def release_rate_limit(scope: str, identifier: str) -> None:
+    """Give back one unit of budget — used when the action we charged for
+    never actually happened (e.g. the SMS provider was down), so a provider
+    outage doesn't also lock the user out of retrying."""
+    if _throttling_disabled():
+        return
+    try:
+        key = _key(scope, identifier)
+        remaining = await redis_client.decr(key)
+        if remaining is not None and int(remaining) <= 0:
+            await redis_client.delete(key)
+    except Exception:  # noqa: BLE001
+        logger.warning("rate limiter release failed for scope=%s", scope)
