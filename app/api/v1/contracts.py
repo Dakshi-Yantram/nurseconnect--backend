@@ -192,7 +192,13 @@ async def send_stage1_otp(
                               message="Too many codes requested. Wait a few minutes and try again.")
     await enforce_rate_limit("otp_send:ip", client_ip(request), 15, 60 * 60)
 
-    code = settings.OTP_DEV_FIXED_CODE if settings.OTP_DEV_MODE else f"{secrets.randbelow(1000000):06d}"
+    # Was `settings.OTP_DEV_MODE` (the raw flag, default True) instead of the
+    # production-guarded `settings.otp_dev_mode` property: in production the
+    # e-sign OTP was the fixed dev code, never SMSed, and echoed back in the
+    # response — i.e. anyone logged in as the worker could "sign" without the
+    # phone.
+    dev_mode = settings.otp_dev_mode
+    code = settings.OTP_DEV_FIXED_CODE if dev_mode else f"{secrets.randbelow(1000000):06d}"
     from datetime import timedelta
     db.add(OtpCode(
         phone_e164=phone,
@@ -202,14 +208,22 @@ async def send_stage1_otp(
     ))
     await db.commit()
 
-    if not settings.OTP_DEV_MODE:
-        try:
-            from app.integrations.providers import msg91_client
-            await msg91_client.send_otp(phone, code)
-        except Exception:
-            pass
+    if not dev_mode:
+        from app.integrations.providers import msg91_client, sms_delivered
+        result = await msg91_client.send_otp(phone, code, purpose="contract_stage1")
+        if not sms_delivered(result):
+            from app.core.rate_limit import release_rate_limit
+            await release_rate_limit("otp_send:phone", phone)
+            raise HTTPException(
+                status_code=502,
+                detail={
+                    "code": "OTP_SEND_FAILED",
+                    "message": "We couldn't send the verification code to your phone. Please try again in a minute.",
+                    "retryable": bool(result.get("retryable", True)),
+                },
+            )
 
-    return {"sent": True, "dev_otp": code if settings.OTP_DEV_MODE else None}
+    return {"sent": True, "dev_otp": code if dev_mode else None}
 
 
 @router.post("/me/stage1/accept", response_model=ContractPreviewOut)

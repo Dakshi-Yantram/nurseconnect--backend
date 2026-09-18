@@ -1,11 +1,16 @@
 """Visit lifecycle: check-in, check-out, vitals, medications, checklist, rating, care notes."""
-import random
+import html
+import logging
+import re
+import secrets
 from datetime import datetime, timezone
 from typing import List, Optional
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
+from fastapi.concurrency import run_in_threadpool
+from fastapi.responses import HTMLResponse, JSONResponse
+from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -31,6 +36,7 @@ from app.models.enums import (
 )
 from app.models.models import (
     Booking,
+    User,
     CareNote,
     ClinicalRuleSet,
     ConsentRecord,
@@ -75,6 +81,7 @@ from app.services.insurance_service import create_or_update_assessment
 from app.websockets.manager import booking_topic, manager
 
 router = APIRouter(prefix="/visits", tags=["visits"])
+logger = logging.getLogger(__name__)
 
 
 async def _get_visit_for_worker(db: AsyncSession, booking_id: UUID, worker_id: UUID) -> tuple[Booking, VisitRecord]:
@@ -205,7 +212,7 @@ async def _ensure_visit_start_otp(db: AsyncSession, booking: Booking) -> dict:
             "otp": otp_code,
         }
 
-    otp_code = str(random.randint(1000, 9999))
+    otp_code = f"{secrets.randbelow(9000) + 1000}"
     await redis_client.setex(_otp_key(booking.id), _OTP_TTL_SECONDS, otp_code)
     await redis_client.delete(_attempts_key(booking.id))
 
@@ -971,7 +978,14 @@ async def get_visit(booking_id: UUID, db: AsyncSession = Depends(get_db), curren
     visit = res.scalar_one_or_none()
     if not visit:
         raise HTTPException(status_code=404, detail="Visit not found")
-    return VisitRecordOut.model_validate(visit)
+    out = VisitRecordOut.model_validate(visit)
+    if current.role == UserRole.consumer:
+        # `care_notes` is the nurse's internal working record. The dedicated
+        # family endpoint (/report/consumer) already excluded it, but this
+        # generic endpoint returned it to the family verbatim — and the web
+        # family page rendered it under "Nurse's notes".
+        out = out.model_copy(update={"care_notes": None})
+    return out
 
 
 # ----- CARE NOTES -----
@@ -980,6 +994,9 @@ notes_router = APIRouter(prefix="/care-notes", tags=["care-notes"])
 
 @notes_router.post("/", response_model=CareNoteOut)
 async def add_care_note(payload: CareNoteCreate, current: CurrentUser = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
+    # Previously any authenticated user could attach a note to ANY patient.
+    from app.security.access_control import assert_user_can_access_patient
+    await assert_user_can_access_patient(db, current, payload.patient_id)
     n = CareNote(
         patient_id=payload.patient_id,
         booking_id=payload.booking_id,
@@ -999,6 +1016,10 @@ async def add_care_note(payload: CareNoteCreate, current: CurrentUser = Depends(
 
 @notes_router.get("/patient/{patient_id}", response_model=List[CareNoteOut])
 async def list_care_notes(patient_id: UUID, current: CurrentUser = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
+    # Previously there was NO ownership check: any logged-in consumer/worker
+    # could read any patient's notes just by knowing (or guessing) its id.
+    from app.security.access_control import assert_user_can_access_patient
+    await assert_user_can_access_patient(db, current, patient_id)
     res = await db.execute(select(CareNote).where(CareNote.patient_id == patient_id).order_by(CareNote.created_at.desc()))
     items = res.scalars().all()
     # Filter visibility
@@ -1051,6 +1072,8 @@ def _report_payload(visit: VisitRecord, status: dict | None = None) -> dict:
 @router.get("/{booking_id}/report")
 async def get_visit_report_for_worker(
     booking_id: UUID,
+    request: Request,
+    response: Response,
     profile: WorkerProfile = Depends(get_worker_profile),
     db: AsyncSession = Depends(get_db),
 ):
@@ -1066,7 +1089,20 @@ async def get_visit_report_for_worker(
         status = await validate_documentation_completion(booking_id, visit.id, db)
     except WorkflowError:
         status = None
-    return _report_payload(visit, status)
+    payload = _report_payload(visit, status)
+    response.headers["Cache-Control"] = "no-store, private"
+    if visit.check_out_at:
+        # Only the finished care summary is audited as a "view"; loading the
+        # draft form mid-visit is not a view of a report. (Also: committing
+        # before checkout would persist the placeholder VisitRecord that
+        # _get_visit_for_worker creates for not-yet-started visits.)
+        from app.services.report_access import ACTION_VIEWED, audit_report_event
+        await audit_report_event(
+            db, actor_id=profile.user_id, actor_type="worker", action=ACTION_VIEWED,
+            booking_id=booking_id, request=request, details={"view": "worker"},
+        )
+        await db.commit()
+    return payload
 
 
 @router.put("/{booking_id}/report")
@@ -1112,6 +1148,8 @@ async def save_visit_report(
 @router.get("/{booking_id}/report/consumer")
 async def get_visit_report_for_consumer(
     booking_id: UUID,
+    request: Request,
+    response: Response,
     profile: ConsumerProfile = Depends(get_consumer_profile),
     db: AsyncSession = Depends(get_db),
 ):
@@ -1129,7 +1167,10 @@ async def get_visit_report_for_consumer(
     )
     booking = bres.scalar_one_or_none()
     if not booking:
-        raise HTTPException(status_code=404, detail="Booking not found")
+        raise HTTPException(
+            status_code=404,
+            detail={"code": "BOOKING_NOT_FOUND", "message": "This booking could not be found on your account."},
+        )
 
     vres = await db.execute(select(VisitRecord).where(VisitRecord.booking_id == booking_id))
     visit = vres.scalar_one_or_none()
@@ -1150,7 +1191,10 @@ async def get_visit_report_for_consumer(
             },
         )
 
-    return {
+    from app.services.report_access import ACTION_VIEWED, audit_report_event
+    from app.services.visit_report_service import latest_vitals
+
+    payload = {
         "booking_id": str(booking_id),
         "visit_id": str(visit.id),
         "family_summary": visit.family_summary,
@@ -1159,71 +1203,289 @@ async def get_visit_report_for_consumer(
         "actual_duration_minutes": visit.actual_duration_minutes,
         "photo_urls": list(visit.photo_urls or []),
         "rating_by_consumer": visit.rating_by_consumer,
+        # Added so the family's care-summary screen is ONE audited call
+        # instead of GET /visits/{id} (which leaked care_notes) + /vitals.
+        # Booleans only — the raw checklist/documentation payloads stay out.
+        "latest_vitals": await latest_vitals(db, booking_id),
+        "has_checklist": bool(visit.checklist_responses),
+        "has_documentation": bool(visit.documentation_responses),
     }
+    await audit_report_event(
+        db, actor_id=profile.user_id, actor_type="consumer", action=ACTION_VIEWED,
+        booking_id=booking_id, request=request, details={"view": "consumer"},
+    )
+    await db.commit()
+    response.headers["Cache-Control"] = "no-store, private"
+    return payload
 
 
 # ---------------------------------------------------------------------------
 # Visit report — PDF
 # ---------------------------------------------------------------------------
-# Two views of the same document, mirroring the family_summary /
-# care_notes split already enforced above: the nurse's copy carries her
-# clinical notes, the family's copy never does. Which fields are visible is
-# decided here, at the API boundary, by which endpoint (and therefore which
-# auth dependency) was called — `visit_report_service` itself has no notion
-# of "who is asking".
+# Two views of the same document, mirroring the family_summary / care_notes
+# split enforced above: the nurse's copy carries her clinical notes, the
+# family's copy never does. Which fields are visible is decided here, at the
+# API boundary, by which endpoint (and therefore which auth dependency) was
+# called.
+#
+# Flow (replaces "upload to a public Cloudinary URL"):
+#   1. GET /{id}/report/pdf | /{id}/report/consumer/pdf   (bearer auth)
+#        -> {"pdf_url", "download_path", "expires_in_seconds"}
+#      `pdf_url` keeps the old response contract for the mobile apps, but it
+#      is now a ~60-second, single-use, user-bound link — not a public file.
+#   2. GET /{id}/report/download?token=...
+#        -> re-checks access, writes the audit row, renders a PDF watermarked
+#           with the viewer's identity + that audit row's id, streams it.
+#      Nothing is stored; nothing is cached (Cache-Control: no-store).
+
+_REPORT_PDF_RATE = (20, 10 * 60)  # per user: 20 links / 10 min
+
+
+def _checkout_required(message: str) -> HTTPException:
+    return HTTPException(status_code=409, detail={"code": "VISIT_NOT_CHECKED_OUT", "message": message})
+
+
+async def _issue_report_link(
+    request: Request, response: Response, current: CurrentUser, booking_id: UUID, view: str
+) -> dict:
+    from app.core.rate_limit import enforce_rate_limit
+    from app.services.report_access import issue_download_token, public_api_base
+
+    await enforce_rate_limit(
+        "report_pdf", str(current.id), *_REPORT_PDF_RATE,
+        message="You've downloaded this report many times in a short period. Please wait a few minutes.",
+    )
+    token = issue_download_token(current, booking_id, view)
+    path = f"/api/visits/{booking_id}/report/download?token={token}"
+    response.headers["Cache-Control"] = "no-store, private"
+    return {
+        "pdf_url": f"{public_api_base(request)}{path}",
+        "download_path": path,
+        "expires_in_seconds": settings.REPORT_DOWNLOAD_TOKEN_TTL_SECONDS,
+    }
 
 
 @router.get("/{booking_id}/report/pdf")
 async def get_visit_report_pdf_for_worker(
     booking_id: UUID,
+    request: Request,
+    response: Response,
     profile: WorkerProfile = Depends(get_worker_profile),
+    current: CurrentUser = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """The nurse's own downloadable copy of her visit report, clinical notes included."""
-    booking, visit = await _get_visit_for_worker(db, booking_id, profile.id)
+    """One-time link to the nurse's own copy (clinical notes included)."""
+    _booking, visit = await _get_visit_for_worker(db, booking_id, profile.id)
     if not visit.check_out_at:
-        raise HTTPException(
-            status_code=409,
-            detail="The report becomes downloadable once the visit is checked out.",
-        )
-    from app.services.visit_report_service import generate_visit_report_pdf_url
-
-    pdf_url = await generate_visit_report_pdf_url(
-        db, visit, booking.booking_ref, include_clinical_notes=True
-    )
-    if not pdf_url:
-        raise HTTPException(status_code=502, detail="Could not generate the report PDF. Please try again.")
-    return {"pdf_url": pdf_url}
+        raise _checkout_required("The report becomes downloadable once the visit is checked out.")
+    return await _issue_report_link(request, response, current, booking_id, "worker")
 
 
 @router.get("/{booking_id}/report/consumer/pdf")
 async def get_visit_report_pdf_for_consumer(
     booking_id: UUID,
+    request: Request,
+    response: Response,
     profile: ConsumerProfile = Depends(get_consumer_profile),
+    current: CurrentUser = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """The family's downloadable copy of the visit report — family summary only,
-    never the nurse's internal clinical notes."""
+    """One-time link to the family's copy — never the internal clinical notes."""
     bres = await db.execute(
         select(Booking).where(Booking.id == booking_id, Booking.consumer_id == profile.id)
     )
-    booking = bres.scalar_one_or_none()
-    if not booking:
-        raise HTTPException(status_code=404, detail="Booking not found")
-
+    if not bres.scalar_one_or_none():
+        raise HTTPException(
+            status_code=404,
+            detail={"code": "BOOKING_NOT_FOUND", "message": "This booking could not be found on your account."},
+        )
     vres = await db.execute(select(VisitRecord).where(VisitRecord.booking_id == booking_id))
     visit = vres.scalar_one_or_none()
     if not visit or not visit.check_out_at:
-        raise HTTPException(
-            status_code=409,
-            detail="The report becomes downloadable once the visit is complete.",
+        raise _checkout_required("The report becomes downloadable once the visit is complete.")
+    return await _issue_report_link(request, response, current, booking_id, "consumer")
+
+
+def _download_error(request: Request, status: int, code: str, message: str) -> Response:
+    """JSON for the web app (fetch), a tiny HTML page for the mobile apps,
+    which open `pdf_url` in a browser/webview and would otherwise show raw JSON."""
+    headers = {"Cache-Control": "no-store, private", "Referrer-Policy": "no-referrer"}
+    if "text/html" in (request.headers.get("accept") or ""):
+        body = (
+            "<!doctype html><meta charset=utf-8><meta name=viewport content='width=device-width'>"
+            "<title>Report unavailable</title><body style='font-family:system-ui;padding:24px'>"
+            f"<h3>Report unavailable</h3><p>{html.escape(message)}</p>"
+            "<p>Return to the NurseConnect app and tap <b>Download report</b> again.</p></body>"
         )
+        return HTMLResponse(body, status_code=status, headers=headers)
+    return JSONResponse({"detail": {"code": code, "message": message}}, status_code=status, headers=headers)
 
-    from app.services.visit_report_service import generate_visit_report_pdf_url
 
-    pdf_url = await generate_visit_report_pdf_url(
-        db, visit, booking.booking_ref, include_clinical_notes=False
+@router.get("/{booking_id}/report/download", include_in_schema=False)
+async def download_visit_report_pdf(
+    booking_id: UUID,
+    request: Request,
+    token: str = Query(..., max_length=4096),
+    db: AsyncSession = Depends(get_db),
+):
+    """Redeem a one-time link: re-authorize, audit, watermark, stream.
+
+    No bearer header here (a browser/webview navigation can't send one) —
+    the signed, 60-second, single-use, user+booking-bound token IS the
+    credential, and access is re-checked against the DB at redemption so a
+    link issued just before a nurse was unassigned stops working.
+    """
+    from app.services import report_access as ra
+    from app.services.visit_report_pdf import PdfWatermark
+    from app.services.visit_report_service import (
+        load_visit_report_pdf_inputs, render_visit_report, role_label, watermark_identity,
     )
-    if not pdf_url:
-        raise HTTPException(status_code=502, detail="Could not generate the report PDF. Please try again.")
-    return {"pdf_url": pdf_url}
+
+    async def deny(status: int, code: str, message: str, reason: str, actor_id=None, actor_type="anonymous"):
+        await ra.audit_report_event(
+            db, actor_id=actor_id, actor_type=actor_type, action=ra.ACTION_PDF_DENIED,
+            booking_id=booking_id, request=request, details={"reason": reason},
+        )
+        await db.commit()
+        return _download_error(request, status, code, message)
+
+    # This endpoint takes no bearer token, so throttle by IP before doing any
+    # work (and before writing "denied" audit rows an attacker could flood).
+    from app.core.rate_limit import client_ip, enforce_rate_limit
+    await enforce_rate_limit("report_download:ip", client_ip(request), 60, 10 * 60)
+
+    try:
+        claims = ra.decode_download_token(token, booking_id)
+    except ra.DownloadTokenError as e:
+        return await deny(e.status, e.code, e.message, e.reason)
+
+    user_id = UUID(claims["sub"])
+    ures = await db.execute(select(User).where(User.id == user_id))
+    user = ures.scalar_one_or_none()
+    from app.models.enums import UserStatus
+    # Same rule as get_current_user: blocked if suspended/deactivated/unverified.
+    if user is None or user.status in (
+        UserStatus.suspended, UserStatus.deactivated, UserStatus.pending_verification,
+    ):
+        return await deny(403, "ACCOUNT_NOT_ACTIVE",
+                          "Your account can't download reports right now. Please sign in again.",
+                          "user_inactive", actor_id=user.id if user else None)
+
+    view = claims["view"]
+    bres = await db.execute(select(Booking).where(Booking.id == booking_id))
+    booking = bres.scalar_one_or_none()
+    allowed = False
+    if booking is not None:
+        if view == ra.VIEW_WORKER and user.role == UserRole.worker:
+            wres = await db.execute(select(WorkerProfile).where(WorkerProfile.user_id == user.id))
+            wp = wres.scalar_one_or_none()
+            allowed = wp is not None and booking.worker_id == wp.id
+        elif view == ra.VIEW_CONSUMER and user.role == UserRole.consumer:
+            cres = await db.execute(select(ConsumerProfile).where(ConsumerProfile.user_id == user.id))
+            cp = cres.scalar_one_or_none()
+            allowed = cp is not None and booking.consumer_id == cp.id
+    if not allowed:
+        return await deny(403, "NOT_AUTHORIZED",
+                          "You no longer have access to this visit report.",
+                          "access_revoked_or_role_mismatch", actor_id=user.id, actor_type=user.role.value)
+
+    # Consume only after the checks above so a rejected attempt doesn't burn
+    # a still-valid link for its rightful owner.
+    try:
+        await ra.consume_download_token(claims)
+    except ra.DownloadTokenError as e:
+        return await deny(e.status, e.code, e.message, e.reason, actor_id=user.id, actor_type=user.role.value)
+
+    vres = await db.execute(select(VisitRecord).where(VisitRecord.booking_id == booking_id))
+    visit = vres.scalar_one_or_none()
+    if visit is None or not visit.check_out_at:
+        return await deny(409, "VISIT_NOT_CHECKED_OUT",
+                          "The report becomes downloadable once the visit is complete.",
+                          "not_checked_out", actor_id=user.id, actor_type=user.role.value)
+
+    include_notes = view == ra.VIEW_WORKER
+    generated_at = datetime.now(timezone.utc)
+    # The audit row is written first so its id can be printed on the PDF as
+    # the traceability "Ref": leaked copy -> ref -> who / when / IP.
+    entry = await ra.audit_report_event(
+        db, actor_id=user.id, actor_type=user.role.value, action=ra.ACTION_PDF_DOWNLOADED,
+        booking_id=booking_id, request=request,
+        details={"view": view, "includes_clinical_notes": include_notes},
+    )
+    ref = entry.id.hex[:12].upper()
+    name, hint = watermark_identity(user)
+    try:
+        inputs = await load_visit_report_pdf_inputs(
+            db, visit, booking.booking_ref, include_clinical_notes=include_notes,
+        )
+        pdf_bytes = await run_in_threadpool(
+            render_visit_report, inputs,
+            PdfWatermark(viewer_name=name, viewer_role=role_label(user.role),
+                         generated_at=generated_at, ref=ref, viewer_hint=hint),
+        )
+    except Exception as exc:  # noqa: BLE001
+        # Log the exception type only — never the rendered content.
+        logger.error("visit report PDF render failed booking=%s ref=%s err=%s",
+                     booking_id, ref, type(exc).__name__)
+        await db.rollback()
+        await ra.audit_report_event(
+            db, actor_id=user.id, actor_type=user.role.value, action=ra.ACTION_PDF_FAILED,
+            booking_id=booking_id, request=request, details={"view": view, "error": type(exc).__name__},
+        )
+        await db.commit()
+        return _download_error(request, 500, "PDF_GENERATION_FAILED",
+                               "We couldn't generate the report PDF. Please try again in a moment.")
+
+    # Commit the audit row BEFORE handing out the file: no untraceable copies.
+    entry.changes = {**(entry.changes or {}), "ref": ref, "bytes": len(pdf_bytes)}
+    await db.commit()
+
+    safe_ref = re.sub(r"[^A-Za-z0-9_-]", "", booking.booking_ref or "")[:40] or "visit"
+    return Response(
+        content=pdf_bytes,
+        media_type="application/pdf",
+        headers={
+            "Content-Disposition": f'attachment; filename="care-summary-{safe_ref}.pdf"',
+            "Cache-Control": "no-store, private, max-age=0",
+            "Pragma": "no-cache",
+            "X-Content-Type-Options": "nosniff",
+            "Referrer-Policy": "no-referrer",
+            "X-Report-Ref": ref,
+        },
+    )
+
+
+class ReportClientEvent(BaseModel):
+    event: str = Field(..., max_length=40)
+    surface: str = Field("care_summary", max_length=40)
+
+
+@router.post("/{booking_id}/report/client-events", status_code=204)
+async def record_report_client_event(
+    booking_id: UUID,
+    payload: ReportClientEvent,
+    request: Request,
+    current: CurrentUser = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Browser-reported print/copy/screenshot-key attempts on the care summary.
+
+    DETECTION ONLY, and client-reported: a user who strips the JS never sends
+    these. Useful as a signal ("this account kept trying to print"), not as
+    proof. Same access rule as the report itself.
+    """
+    from app.core.rate_limit import enforce_rate_limit
+    from app.security.access_control import assert_user_can_access_booking
+    from app.services.report_access import ACTION_CLIENT_EVENT, CLIENT_EVENTS, audit_report_event
+
+    if payload.event not in CLIENT_EVENTS:
+        raise HTTPException(status_code=422, detail={"code": "UNKNOWN_EVENT", "message": "Unknown event."})
+    await assert_user_can_access_booking(db, current, booking_id)
+    await enforce_rate_limit("report_client_event", str(current.id), 30, 10 * 60)
+    await audit_report_event(
+        db, actor_id=current.id, actor_type=current.role.value, action=ACTION_CLIENT_EVENT,
+        booking_id=booking_id, request=request,
+        details={"event": payload.event, "surface": payload.surface[:40]},
+    )
+    await db.commit()
+    return Response(status_code=204)

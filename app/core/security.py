@@ -59,3 +59,17 @@ def decode_token(token: str) -> Dict[str, Any]:
         return jwt.decode(token, settings.JWT_SECRET_KEY, algorithms=[settings.JWT_ALGORITHM])
     except JWTError as e:
         raise ValueError(f"Invalid token: {e}") from e
+
+
+def create_scoped_token(
+    subject: str,
+    token_type: str,
+    ttl_seconds: int,
+    claims: Optional[Dict[str, Any]] = None,
+) -> str:
+    """Short-lived, single-purpose token (e.g. a one-time PDF download link).
+
+    `token_type` is checked on redemption, so a scoped token can never be
+    replayed as an access token (get_current_user requires type == "access").
+    """
+    return _create_token(subject, timedelta(seconds=ttl_seconds), token_type, claims)
