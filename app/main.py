@@ -19,9 +19,14 @@ from app.api.v1 import (
     admin,
     auth,
     bookings,
+    calls,
     care,
     care_workflow,
     catalog,
+    forms,
+    composite_care,
+    contracts,
+    eprescriptions,
     escalations,
     insurance_review,
     messaging,
@@ -29,10 +34,12 @@ from app.api.v1 import (
     offline_sync,
     payments,
     support,
+    teleconsult,
     tracking,
     training,
     users,
     visits,
+    whatsapp_webhooks,
     workers,
 )
 from app.api.v1.training import assessments_router as training_assessments_router
@@ -67,6 +74,13 @@ def _ensure_infra_running() -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Config problems that silently break user-facing flows (dev-mode OTP
+    # left on in production, no mail provider, missing Razorpay secrets).
+    # Logged loudly at boot so they're caught on deploy rather than by a
+    # customer who never receives a code or whose payment won't verify.
+    for problem in settings.startup_warnings():
+        logger.error("CONFIG: %s", problem)
+
     _ensure_infra_running()
     # Run seed (creates tables + initial config)
     from app.seed import main as seed
@@ -83,8 +97,43 @@ app = FastAPI(
     version="2.0.0",
     description="NurseConnect backend — production-grade healthcare marketplace platform",
     lifespan=lifespan,
-    debug=True,
+    # Was hard-coded True: in Starlette's debug mode an unhandled exception
+    # returns an HTML traceback (source lines, paths) to the caller and
+    # bypasses the JSON handler below.
+    debug=bool(settings.APP_DEBUG) and not settings.is_production,
 )
+
+
+def _internal_error_response(request: Request) -> JSONResponse:
+    rid = getattr(request.state, "request_id", None)
+    return JSONResponse(
+        status_code=500,
+        content={"detail": {
+            "code": "INTERNAL_ERROR",
+            "message": "Something went wrong on our side. Please try again.",
+            "request_id": rid,
+        }},
+        headers={"Cache-Control": "no-store"},
+    )
+
+
+@app.middleware("http")
+async def unhandled_exception_middleware(request: Request, call_next):
+    """Registered BEFORE CORSMiddleware, so it sits INSIDE it.
+
+    Starlette's ServerErrorMiddleware is the outermost layer — its 500s carry
+    no CORS headers, so a cross-origin frontend (Cloudflare -> CloudFront)
+    saw every server crash as an opaque "Failed to fetch"/network error and
+    could never show the real message. Catching here keeps the response on
+    the CORS path. The body is generic: exception text can contain SQL,
+    column values or PHI and must not be returned to the client.
+    """
+    try:
+        return await call_next(request)
+    except Exception:  # noqa: BLE001
+        logger.exception("UNHANDLED ERROR on %s %s rid=%s", request.method, request.url.path,
+                         getattr(request.state, "request_id", None))
+        return _internal_error_response(request)
 
 app.add_middleware(
     CORSMiddleware,
@@ -101,8 +150,10 @@ import traceback
 
 @app.exception_handler(Exception)
 async def debug_exception_handler(request: Request, exc: Exception):
+    # Fallback only (the middleware above normally catches first). Used to
+    # return str(exc) — internal error text — straight to the client.
     logger.exception("UNHANDLED ERROR on %s %s", request.method, request.url.path)
-    return JSONResponse(status_code=500, content={"detail": str(exc)})
+    return _internal_error_response(request)
 
 
 @app.middleware("http")
@@ -131,7 +182,13 @@ async def health():
         redis_ok = bool(pong)
     except Exception as e:
         logger.warning("Redis health check failed: %s", e)
-    overall = "ok" if (db_ok and redis_ok) else "degraded"
+    from app.integrations import cloudinary_client
+    storage_mock = cloudinary_client.mock
+    # Mock storage in production means uploads "succeed" but nothing is
+    # actually stored — that's a degraded state worth surfacing here, not
+    # just in logs.
+    is_prod = settings.APP_ENV.lower() in ("production", "prod")
+    overall = "ok" if (db_ok and redis_ok and not (storage_mock and is_prod)) else "degraded"
     return JSONResponse(
         status_code=200 if overall == "ok" else 503,
         content={
@@ -139,7 +196,11 @@ async def health():
             "app": settings.APP_NAME,
             "env": settings.APP_ENV,
             "version": app.version,
-            "checks": {"database": db_ok, "redis": redis_ok},
+            "checks": {
+                "database": db_ok,
+                "redis": redis_ok,
+                "document_storage_configured": not storage_mock,
+            },
         },
     )
 
@@ -159,11 +220,16 @@ for r in [
     auth_password_reset.router,
     review_tickets.router,
     catalog.router,
+    forms.router,
     bookings.router,
     visits.router,
     visits.notes_router,
     care.router,
     care_workflow.router,
+    composite_care.router,
+    contracts.router,
+    eprescriptions.router,
+    teleconsult.router,
     escalations.router,
     payments.router,
     tracking.router,
@@ -175,6 +241,9 @@ for r in [
     admin.router,
     support.router,
     messaging.router,
+    calls.router,
+    calls.push_router,
+    whatsapp_webhooks.router,
 ]:
     app.include_router(r, prefix=_API_PREFIX)
 

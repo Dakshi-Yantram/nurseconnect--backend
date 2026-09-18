@@ -32,7 +32,6 @@ async def get_current_user(
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Missing bearer token")
     try:
         claims = decode_token(credentials.credentials)
-        print("DEBUG claims:", claims)
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail=str(e))
     if claims.get("type") != "access":

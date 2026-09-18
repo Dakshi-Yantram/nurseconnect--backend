@@ -44,6 +44,21 @@ SUPPORTED_QUESTION_TYPES = {
     "vitals_entry",
     "medication_entry",
     "consent_confirmation",
+    # Packaging Integrity Check — nurse confirms + photo-verifies that every
+    # patient-provided consumable is sealed and within its expiry date before
+    # starting an invasive procedure (injection, catheter change, etc).
+    # Field definition carries a static `consumables: [str]` list authored by
+    # the clinical trainer; the nurse's answer reports per-item seal/expiry
+    # status plus one confirmation photo of the laid-out packaging.
+    "packaging_integrity_check",
+    # Material Availability Check — nurse confirms whether the patient/family
+    # already has the consumables required for the procedure on hand. Field
+    # definition carries a static `required_materials: [{name, qty}]` list
+    # that the frontend renders as an auto-generated shopping list whenever
+    # the nurse marks materials as unavailable. In that case the nurse must
+    # also capture a photo of the doctor's prescription so ops/family can act
+    # on it.
+    "material_check",
 }
 
 # Risk levels at which a missing template must hard-block the workflow.
@@ -223,8 +238,10 @@ def _coerce_answer(qtype: str, raw: Any) -> Any:
             return {"file_url": raw.get("file_url") or raw.get("url"), **{k: v for k, v in raw.items() if k not in ("file_url", "url")}}
         raise ValueError("expected file_url or {file_url}")
     if qtype == "vitals_entry":
+        if isinstance(raw, str):
+            return {"notes": raw.strip()}
         if not isinstance(raw, dict):
-            raise ValueError("expected vitals object")
+            raise ValueError("expected vitals object or text")
         return raw
     if qtype == "medication_entry":
         if not isinstance(raw, dict):
@@ -234,6 +251,36 @@ def _coerce_answer(qtype: str, raw: Any) -> Any:
         if not isinstance(raw, dict) or "consented" not in raw:
             raise ValueError("expected {consented: bool, ...}")
         return {"consented": bool(raw.get("consented")), **{k: v for k, v in raw.items() if k != "consented"}}
+    if qtype == "packaging_integrity_check":
+        if not isinstance(raw, dict) or not isinstance(raw.get("items"), list) or not raw.get("items"):
+            raise ValueError("expected {items: [{name, sealed, not_expired, expiry_date?}], photo_file_url}")
+        items: List[Dict[str, Any]] = []
+        for it in raw["items"]:
+            if not isinstance(it, dict) or "name" not in it:
+                raise ValueError("each packaging item requires a 'name'")
+            items.append({
+                "name": str(it.get("name")),
+                "sealed": bool(it.get("sealed")),
+                "not_expired": bool(it.get("not_expired")),
+                "expiry_date": it.get("expiry_date"),
+            })
+        photo_file_url = raw.get("photo_file_url") or raw.get("file_url")
+        # The nurse-submitted `all_verified` flag is never trusted — the
+        # server derives it from the per-item seal/expiry answers so a nurse
+        # (or a buggy client) can't mark checkout-ready without actually
+        # confirming every item.
+        all_verified = all(it["sealed"] and it["not_expired"] for it in items)
+        return {"items": items, "photo_file_url": photo_file_url, "all_verified": all_verified}
+    if qtype == "material_check":
+        if not isinstance(raw, dict) or "available" not in raw:
+            raise ValueError("expected {available: bool, missing_items?: [...], prescription_file_url?: str}")
+        available = bool(raw.get("available"))
+        missing_items = raw.get("missing_items") if isinstance(raw.get("missing_items"), list) else []
+        result: Dict[str, Any] = {"available": available, "missing_items": [str(m) for m in missing_items]}
+        rx = raw.get("prescription_file_url") or raw.get("file_url")
+        if rx:
+            result["prescription_file_url"] = rx
+        return result
     raise ValueError(f"unsupported question type: {qtype}")
 
 
@@ -259,6 +306,26 @@ def _is_question_complete(qtype: str, answer: Any) -> bool:
         return isinstance(answer, dict) and len(answer) > 0
     if qtype == "consent_confirmation":
         return isinstance(answer, dict) and bool(answer.get("consented"))
+    if qtype == "packaging_integrity_check":
+        # Complete only once every listed consumable is confirmed sealed +
+        # within expiry AND a verification photo has been captured. A partial
+        # check (e.g. photo but one item still unsealed) is intentionally
+        # left incomplete so it keeps blocking checkout on high-risk visits.
+        return (
+            isinstance(answer, dict)
+            and bool(answer.get("all_verified"))
+            and bool(answer.get("photo_file_url"))
+        )
+    if qtype == "material_check":
+        # If materials are on hand, the check is done. If not, it's only
+        # "complete" (i.e. no longer needs nurse attention) once a
+        # prescription photo has been captured for ops/family follow-up —
+        # this is what unlocks the auto-generated shopping list flow.
+        if not isinstance(answer, dict):
+            return False
+        if answer.get("available"):
+            return True
+        return bool(answer.get("prescription_file_url"))
     return False
 
 
@@ -449,6 +516,26 @@ async def validate_documentation_completion(
                 if item["blocks_checkout"]:
                     blocking.append(item)
 
+    # ---------------------------------------------------------------- BASELINE
+    # Completion gate fix (nurse app items 2 & 10).
+    #
+    # Everything above is template-driven. When a booking's package/service
+    # has no checklist template AND no documentation template seeded -- which
+    # is the case for most catalogue entries today -- `blocking` came out
+    # empty and `can_checkout` was True, so a nurse could mark a visit
+    # Complete having filled in nothing at all. The gate silently degraded
+    # into no gate.
+    #
+    # So: every visit needs a report, template or not. When no template
+    # governs the booking we fall back to a minimum report -- what was done
+    # (care notes) and what the family is told (family summary) -- read off
+    # the VisitRecord. A template, when one exists, still fully defines the
+    # requirements and this baseline stays out of the way.
+    if not wf.checklist_template and not wf.documentation_template:
+        for item in await _baseline_report_items(db, visit_record_id):
+            missing.append(item)
+            blocking.append(item)
+
     can_checkout = len(blocking) == 0
     return {
         "can_checkout": can_checkout,
@@ -459,6 +546,66 @@ async def validate_documentation_completion(
         "checklist_template": _template_summary(wf.checklist_template) if wf.checklist_template else None,
         "documentation_template": _doc_template_summary(wf.documentation_template) if wf.documentation_template else None,
     }
+
+
+# Minimum fields that constitute a visit report when no documentation
+# template governs the booking. Kept deliberately small: this is the floor
+# below which a visit cannot be called complete, not a clinical form.
+BASELINE_REPORT_FIELDS = (
+    (
+        "care_notes",
+        "What you did during this visit",
+        "textarea",
+    ),
+    (
+        "family_summary",
+        "Summary for the patient's family",
+        "textarea",
+    ),
+)
+
+# A report has to say something. One word in each box is not a report, but
+# nor should the gate be so strict that a short honest note is rejected.
+_MIN_REPORT_CHARS = 1
+
+
+async def _baseline_report_items(
+    db: AsyncSession,
+    visit_record_id: Optional[UUID],
+) -> List[Dict[str, Any]]:
+    """Outstanding baseline report fields for a visit, or [] when complete."""
+    from app.models.models import VisitRecord
+
+    if visit_record_id is None:
+        # No visit record yet means nothing has been recorded at all.
+        return [
+            {
+                "type": "report",
+                "id": fid,
+                "label": label,
+                "kind": kind,
+                "blocks_checkout": True,
+            }
+            for fid, label, kind in BASELINE_REPORT_FIELDS
+        ]
+
+    vres = await db.execute(select(VisitRecord).where(VisitRecord.id == visit_record_id))
+    visit = vres.scalar_one_or_none()
+
+    out: List[Dict[str, Any]] = []
+    for fid, label, kind in BASELINE_REPORT_FIELDS:
+        value = (getattr(visit, fid, None) or "").strip() if visit else ""
+        if len(value) < _MIN_REPORT_CHARS:
+            out.append(
+                {
+                    "type": "report",
+                    "id": fid,
+                    "label": label,
+                    "kind": kind,
+                    "blocks_checkout": True,
+                }
+            )
+    return out
 
 
 def _template_summary(t: ChecklistTemplate) -> Dict[str, Any]:
