@@ -1,4 +1,4 @@
-name: Deploy to EC2
+﻿name: Deploy to EC2
 
 on:
   push:
@@ -6,7 +6,119 @@ on:
       - main
 
 jobs:
+  # ---------------------------------------------------------------------
+  # Runs the existing pytest suite against a throwaway Postgres + Redis
+  # before anything is allowed to reach production. Tests run in
+  # OTP_DEV_MODE / MOCK_EXTERNAL_PROVIDERS mode, so no real MSG91 credits,
+  # RealtimeKit calls, Razorpay, or Cloudinary calls are made — this is a
+  # pure code-correctness gate, not a live-integration check.
+  # ---------------------------------------------------------------------
+  test:
+    runs-on: ubuntu-latest
+
+    services:
+      # NOTE: credentials here are "nurseconnect/nurseconnect/nurseconnect" on
+      # purpose — tests/test_phase3_nurse_flow.py hardcodes exactly this DSN
+      # (host=127.0.0.1 user=nurseconnect password=nurseconnect
+      # dbname=nurseconnect) with no env override. Changing these values
+      # will break that test file's direct-SQL fixtures.
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: nurseconnect
+          POSTGRES_PASSWORD: nurseconnect
+          POSTGRES_DB: nurseconnect
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U nurseconnect"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+      redis:
+        image: redis:7
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      APP_ENV: test
+      APP_DEBUG: "true"
+      DATABASE_URL: postgresql+asyncpg://nurseconnect:nurseconnect@localhost:5432/nurseconnect
+      DATABASE_URL_SYNC: postgresql://nurseconnect:nurseconnect@localhost:5432/nurseconnect
+      PG_TEST_DSN: postgresql://nurseconnect:nurseconnect@127.0.0.1:5432/nurseconnect
+      REDIS_URL: redis://localhost:6379/0
+      CELERY_BROKER_URL: redis://localhost:6379/1
+      CELERY_RESULT_BACKEND: redis://localhost:6379/2
+      JWT_SECRET_KEY: ci-test-secret-do-not-use-in-prod
+      OTP_DEV_MODE: "true"
+      OTP_DEV_FIXED_CODE: "123456"
+      EMAIL_DEV_MODE: "true"
+      MOCK_EXTERNAL_PROVIDERS: "true"
+      CORS_ORIGINS: "*"
+      EXPO_PUBLIC_BACKEND_URL: http://localhost:8001
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          # tests/*.py import `psycopg` (v3) for direct-SQL fixtures, but
+          # only psycopg2-binary is listed in requirements.txt. Installing
+          # it here rather than adding it to requirements.txt keeps this a
+          # test-only dependency, not a production one.
+          pip install "psycopg[binary]==3.2.3"
+
+      - name: Create database tables
+        run: python3 -m app.api.v1.create_tables
+
+      - name: Seed reference data
+        run: python3 -m app.seed
+        continue-on-error: true # seed data is a nice-to-have for tests, not a hard requirement
+
+      - name: Start API server
+        run: |
+          nohup gunicorn -k uvicorn.workers.UvicornWorker server:app \
+            --bind 0.0.0.0:8001 --workers 2 > server.log 2>&1 &
+          echo "Waiting for /api/health..."
+          for i in $(seq 1 30); do
+            if curl -sf http://localhost:8001/api/health > /dev/null; then
+              echo "Server is up."
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "Server did not become healthy in time. Logs:"
+          cat server.log
+          exit 1
+
+      - name: Run test suite
+        run: pytest tests/ -v
+
+      - name: Show server logs on failure
+        if: failure()
+        run: cat server.log || true
+
+  # ---------------------------------------------------------------------
+  # Only deploys if the test job above passed. This is the actual fix:
+  # previously this workflow deployed on every push to main with zero
+  # verification that the code even boots, let alone that existing tests
+  # pass.
+  # ---------------------------------------------------------------------
   deploy:
+    needs: test
     runs-on: ubuntu-latest
     steps:
       - name: Deploy via SSH
@@ -16,5 +128,8 @@ jobs:
           username: ${{ secrets.EC2_USER }}
           key: ${{ secrets.EC2_SSH_KEY }}
           script: |
-            bash ~/nurseconnect--backend/deploy.sh
-
+            cd ~/nurseconnect--backend
+            git fetch origin
+            git reset --hard origin/main
+            git clean -fd
+            bash deploy.sh
