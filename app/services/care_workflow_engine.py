@@ -223,8 +223,10 @@ def _coerce_answer(qtype: str, raw: Any) -> Any:
             return {"file_url": raw.get("file_url") or raw.get("url"), **{k: v for k, v in raw.items() if k not in ("file_url", "url")}}
         raise ValueError("expected file_url or {file_url}")
     if qtype == "vitals_entry":
+        if isinstance(raw, str):
+            return {"notes": raw.strip()}
         if not isinstance(raw, dict):
-            raise ValueError("expected vitals object")
+            raise ValueError("expected vitals object or text")
         return raw
     if qtype == "medication_entry":
         if not isinstance(raw, dict):
