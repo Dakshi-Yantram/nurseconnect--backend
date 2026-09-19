@@ -75,6 +75,7 @@ async def notify_nearby_workers(db: AsyncSession, booking: Booking) -> int:
     caller's transaction path (payment confirmation must not fail on notify).
     """
     from app.services.common_services import send_notification
+    from app.core.provider_types import is_physical_capable, is_tele_capable
     from app.services.proximity import (
         effective_origin_for_worker,
         haversine_km,
@@ -117,13 +118,21 @@ async def notify_nearby_workers(db: AsyncSession, booking: Booking) -> int:
         # Free at the scheduled time?
         if await worker_has_schedule_conflict(db, w.id, booking):
             continue
-        # In range? Prefer geo distance; fall back to city match.
-        origin = effective_origin_for_worker(w)
-        if b_lat is not None and b_lng is not None and origin is not None:
-            if haversine_km(origin[0], origin[1], b_lat, b_lng) > radius_km:
+        # In range? Prefer geo distance; fall back to city match. Skipped
+        # entirely for tele-only providers (Tele-Doctor) — the same reason
+        # as new_requests() in bookings.py: a remote video consultation has
+        # no meaningful "distance", and without this bypass a Tele-Doctor
+        # would never be notified of the one kind of booking they exist to
+        # take, which would also falsely trigger the zero-workers-notified
+        # escalation in payments.py for every tele booking.
+        worker_is_tele_only = is_tele_capable(w.worker_type) and not is_physical_capable(w.worker_type)
+        if not worker_is_tele_only:
+            origin = effective_origin_for_worker(w)
+            if b_lat is not None and b_lng is not None and origin is not None:
+                if haversine_km(origin[0], origin[1], b_lat, b_lng) > radius_km:
+                    continue
+            elif w.base_city and addr_city and w.base_city != addr_city:
                 continue
-        elif w.base_city and addr_city and w.base_city != addr_city:
-            continue
 
         ures = await db.execute(select(User).where(User.id == w.user_id))
         wuser = ures.scalar_one_or_none()

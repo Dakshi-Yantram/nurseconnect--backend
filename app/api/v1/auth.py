@@ -1,17 +1,27 @@
 """Auth endpoints: email signup/login, phone OTP, refresh, me."""
+import hmac
+import json
 import logging
 import re
 import secrets
 from datetime import datetime, timedelta, timezone
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
 from app.core.database import get_db
+from app.core.redis_client import redis_client
 from app.core.deps import CurrentUser, get_current_user
+from app.core.rate_limit import (
+    clear_failures,
+    client_ip,
+    enforce_rate_limit,
+    ensure_not_locked,
+    register_failure,
+)
 from app.core.security import (
     create_access_token,
     create_refresh_token,
@@ -19,11 +29,12 @@ from app.core.security import (
     hash_password,
     verify_password,
 )
-from app.models.enums import UserRole, UserStatus
+from app.models.enums import UserRole, UserStatus, WorkerOnboardingStatus, WorkerTier
 from app.models.models import (
     ConsumerProfile,
     EmailVerificationCode,
     OtpCode,
+    Patient,
     User,
     UserSession,
     WorkerProfile,
@@ -50,14 +61,38 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/auth", tags=["auth"])
 
 
+_E164_RE = re.compile(r"^\+[1-9]\d{7,14}$")
+
+
 def _normalize_phone(phone: str) -> str:
-    p = phone.strip().replace(" ", "")
+    """Normalise to E.164 and REJECT anything that isn't a phone number.
+
+    Previously any string was accepted ("abc" became "+abc"), which let junk
+    accounts be created and made OTP/SMS calls fail in confusing ways.
+    """
+    p = (phone or "").strip()
+    for ch in (" ", "-", "(", ")", "."):
+        p = p.replace(ch, "")
+    if p.startswith("00"):
+        p = "+" + p[2:]
     if not p.startswith("+"):
-        # Assume India +91 if 10 digits
+        # Assume India +91 for a bare 10-digit number (or 0-prefixed 11-digit)
+        if len(p) == 11 and p.startswith("0") and p.isdigit():
+            p = p[1:]
         if len(p) == 10 and p.isdigit():
             p = f"+91{p}"
         else:
             p = f"+{p}"
+    if not _E164_RE.match(p):
+        raise HTTPException(
+            status_code=400,
+            detail={"code": "INVALID_PHONE", "message": "Enter a valid mobile number (e.g. 9876543210 or +919876543210)."},
+        )
+    if p.startswith("+91") and len(p) != 13:
+        raise HTTPException(
+            status_code=400,
+            detail={"code": "INVALID_PHONE", "message": "Enter a valid 10-digit Indian mobile number."},
+        )
     return p
 
 
@@ -68,6 +103,20 @@ def _normalize_email(email: str) -> str:
 def _validate_signup_role(role: UserRole) -> None:
     if role not in (UserRole.consumer, UserRole.worker):
         raise HTTPException(status_code=400, detail="Only consumer and worker accounts can self-register")
+
+
+# Wording for the wrong-portal refusal on /auth/login. Keyed on the role the
+# CLIENT expected, because that's the screen the user is looking at.
+_ROLE_MISMATCH_MESSAGES = {
+    UserRole.worker: "This account is not registered as a care professional.",
+    UserRole.consumer: "This account is not registered as a patient or family member.",
+}
+
+
+def _role_mismatch_message(expected: UserRole) -> str:
+    return _ROLE_MISMATCH_MESSAGES.get(
+        expected, "This account is not registered for this sign-in."
+    )
 
 
 def _validate_password(password: str) -> None:
@@ -87,34 +136,131 @@ def _validate_password(password: str) -> None:
 async def _ensure_role_profile(db: AsyncSession, user: User) -> None:
     if user.role == UserRole.consumer:
         res = await db.execute(select(ConsumerProfile).where(ConsumerProfile.user_id == user.id))
-        if not res.scalar_one_or_none():
-            db.add(ConsumerProfile(user_id=user.id))
+        profile = res.scalar_one_or_none()
+        if not profile:
+            profile = ConsumerProfile(user_id=user.id)
+            db.add(profile)
+            await db.flush()
+            # Auto-create a "self" patient record so every consumer has at
+            # least one patient to book for immediately after signup.
+            db.add(
+                Patient(
+                    consumer_id=profile.id,
+                    full_name=user.full_name or "Self",
+                    relationship_to_consumer="self",
+                )
+            )
     elif user.role == UserRole.worker:
         res = await db.execute(select(WorkerProfile).where(WorkerProfile.user_id == user.id))
         if not res.scalar_one_or_none():
-            db.add(WorkerProfile(user_id=user.id))
+            worker_kwargs = {}
+            dev_auto_approved = False
+            # OTP_DEV_MODE gates local dev + CI/automated tests (see
+            # app/core/rate_limit.py). The qualification gate added in
+            # Patch 2 (app/services/qualification.py) requires
+            # onboarding_status == approved before a worker can accept
+            # any booking, but nothing in the passwordless OTP/phone-login
+            # signup paths — which is how every test worker is created —
+            # ever approves a worker. Outside of dev/CI, a worker still
+            # lands in documents_pending and must go through real
+            # document review + reviewer approval, same as before.
+            if settings.otp_dev_mode:
+                worker_kwargs = {
+                    "onboarding_status": WorkerOnboardingStatus.approved,
+                    "tier": WorkerTier.tier3,
+                }
+                # The qualification gate (app/services/qualification.py)
+                # also requires User.status == active — a worker stuck on
+                # UserStatus.onboarding is treated as WORKER_INACTIVE no
+                # matter how their WorkerProfile.onboarding_status reads.
+                # Dev-mode auto-approval above only ever touched
+                # WorkerProfile, so a worker created straight through
+                # phone-login (as every test worker is) never actually
+                # became eligible to accept bookings. Mirror the real
+                # approve_worker_profile flow here.
+                user.status = UserStatus.active
+                dev_auto_approved = True
+            worker_profile = WorkerProfile(user_id=user.id, **worker_kwargs)
+            db.add(worker_profile)
+            if dev_auto_approved:
+                # Mirror the other half of approve_worker_profile
+                # (app/services/worker_approval.py): setting
+                # onboarding_status/tier alone never populates
+                # WorkerServiceQualification rows for tier-only services,
+                # so a freshly dev-approved worker showed
+                # QUALIFICATION_STATUS_NOT_QUALIFIED instead of APPROVED
+                # for services they already qualify for by tier. Needs a
+                # flush first so worker_profile.id exists.
+                await db.flush()
+                from app.services.qualification import sync_tier_qualifications
+                await sync_tier_qualifications(db, worker_profile)
     await db.flush()
 
 
 async def _create_email_verification(db: AsyncSession, user: User) -> str:
+    code, _rec = await _create_email_verification_record(db, user)
+    return code
+
+
+async def _create_email_verification_record(db: AsyncSession, user: User):
     code = (
         settings.EMAIL_DEV_FIXED_CODE
-        if settings.EMAIL_DEV_MODE
+        if settings.email_dev_mode
         else f"{secrets.randbelow(1000000):06d}"
     )
     expires_at = datetime.now(timezone.utc) + timedelta(
         minutes=settings.EMAIL_VERIFICATION_EXPIRE_MINUTES
     )
-    db.add(
-        EmailVerificationCode(
-            user_id=user.id,
-            email=user.email,
-            code_hash=hash_password(code),
-            expires_at=expires_at,
-        )
+    rec = EmailVerificationCode(
+        user_id=user.id,
+        email=user.email,
+        code_hash=hash_password(code),
+        expires_at=expires_at,
     )
+    db.add(rec)
     await db.flush()
-    return code
+    return code, rec
+
+
+# ---------------------------------------------------------------------------
+# Pending re-registration details
+#
+# SECURITY: /register used to overwrite the password, phone and role of any
+# existing *unverified* account. An attacker could register a victim's email
+# (or re-register it after the victim did), and when the victim clicked the
+# code in their inbox the account became active WITH THE ATTACKER'S PASSWORD.
+#
+# Now a re-registration never touches the user row. Its details are parked in
+# Redis against the specific verification code that was emailed, and are only
+# applied when THAT code is verified — i.e. by whoever controls the inbox.
+# ---------------------------------------------------------------------------
+def _pending_reg_key(verification_id) -> str:
+    return f"pending_reg:{verification_id}"
+
+
+async def _store_pending_registration(verification_id, data: dict) -> None:
+    ttl = settings.EMAIL_VERIFICATION_EXPIRE_MINUTES * 60 + 60
+    try:
+        await redis_client.setex(_pending_reg_key(verification_id), ttl, json.dumps(data))
+    except Exception:  # noqa: BLE001
+        logger.exception("could not store pending registration")
+        raise HTTPException(
+            status_code=503,
+            detail={"code": "SERVICE_UNAVAILABLE", "message": "Sign-up is temporarily unavailable. Please try again shortly."},
+        )
+
+
+async def _pop_pending_registration(verification_id) -> dict | None:
+    key = _pending_reg_key(verification_id)
+    try:
+        raw = await redis_client.get(key)
+        if raw is None:
+            return None
+        await redis_client.delete(key)
+        return json.loads(raw.decode() if isinstance(raw, (bytes, bytearray)) else raw)
+    except Exception:  # noqa: BLE001
+        logger.exception("could not read pending registration")
+        return None
 
 
 async def _persist_session(
@@ -142,8 +288,12 @@ def _issue_token_pair(user: User, claims_extra: dict | None = None) -> TokenPair
     extras = {"role": user.role.value}
     if claims_extra:
         extras.update(claims_extra)
-    access = create_access_token(str(user.id), extras)
     refresh = create_refresh_token(str(user.id), extras)
+    # `sid` ties the access token to its refresh session, so logout / password
+    # reset / suspension can revoke access tokens immediately instead of
+    # leaving them valid for up to JWT_ACCESS_TOKEN_EXPIRE_MINUTES.
+    extras["sid"] = decode_token(refresh)["jti"]
+    access = create_access_token(str(user.id), extras)
     return TokenPair(
         access_token=access,
         refresh_token=refresh,
@@ -151,9 +301,48 @@ def _issue_token_pair(user: User, claims_extra: dict | None = None) -> TokenPair
     )
 
 
+async def _consume_phone_otp(db: AsyncSession, phone: str, code: str | None) -> None:
+    """Verify + consume the latest OTP for `phone`, or raise 4xx.
+
+    Shared by /otp/verify and /phone-login so both enforce exactly the same
+    expiry, 5-attempt cap and single-use rules.
+    """
+    code = (code or "").strip()
+    if not re.fullmatch(r"\d{4,8}", code):
+        raise HTTPException(
+            status_code=400,
+            detail={"code": "OTP_REQUIRED", "message": "Enter the OTP sent to your mobile number."},
+        )
+    otp_res = await db.execute(
+        select(OtpCode)
+        .where(
+            OtpCode.phone_e164 == phone,
+            OtpCode.consumed.is_(False),
+        )
+        .order_by(OtpCode.created_at.desc())
+        .limit(1)
+    )
+    otp = otp_res.scalar_one_or_none()
+    if not otp:
+        raise HTTPException(status_code=400, detail="No active OTP for this number. Request a new code.")
+    if otp.expires_at < datetime.now(timezone.utc):
+        raise HTTPException(status_code=400, detail="OTP expired. Request a new code.")
+    if otp.attempts >= 5:
+        raise HTTPException(status_code=429, detail="Too many attempts. Request a new code.")
+
+    otp.attempts += 1
+    if not verify_password(code, otp.code_hash):
+        await db.commit()
+        raise HTTPException(status_code=400, detail="Invalid OTP.")
+
+    otp.consumed = True
+
+
 @router.post("/register", response_model=RegisterResponse, status_code=status.HTTP_201_CREATED)
-async def register(payload: RegisterRequest, db: AsyncSession = Depends(get_db)):
+async def register(payload: RegisterRequest, request: Request, db: AsyncSession = Depends(get_db)):
     """Create a pending account and send a code to the supplied email."""
+    # Mass-registration / verification-email bombing guard.
+    await enforce_rate_limit("register:ip", client_ip(request), 10, 60 * 60)
     _validate_signup_role(payload.role)
     _validate_password(payload.password)
     email = _normalize_email(str(payload.email))
@@ -170,6 +359,33 @@ async def register(payload: RegisterRequest, db: AsyncSession = Depends(get_db))
         raise HTTPException(status_code=409, detail="An account with this phone number already exists")
 
     user = existing_email
+    if user is not None and user.email_verified_at:
+        # Verified but not `active` (onboarding worker, suspended, ...): this
+        # is an existing account, never something /register may touch.
+        raise HTTPException(status_code=409, detail="An account with this email already exists")
+    if user is not None:
+        # Existing UNVERIFIED account: do not modify it (see
+        # _store_pending_registration). Email a fresh code and park the new
+        # details against that code.
+        code, rec = await _create_email_verification_record(db, user)
+        await _store_pending_registration(rec.id, {
+            "phone_e164": phone,
+            "full_name": payload.full_name.strip(),
+            "role": payload.role.value,
+            "password_hash": hash_password(payload.password),
+            "worker_type": payload.worker_type.value if payload.worker_type else None,
+        })
+        await audit(db, user.id, user.role.value, "auth.register_pending_update", "user", user.id)
+        await db.commit()
+        sent = await send_verification_email(email, code)
+        return RegisterResponse(
+            registered=True,
+            email=email,
+            expires_in_seconds=settings.EMAIL_VERIFICATION_EXPIRE_MINUTES * 60,
+            dev_verification_code=code if settings.email_dev_mode else None,
+            email_sent=bool(sent) or settings.email_dev_mode,
+        )
+
     if not user:
         user = User(
             phone_e164=phone,
@@ -181,11 +397,6 @@ async def register(payload: RegisterRequest, db: AsyncSession = Depends(get_db))
         )
         db.add(user)
         await db.flush()
-    else:
-        user.phone_e164 = phone
-        user.full_name = payload.full_name.strip()
-        user.role = payload.role
-        user.password_hash = hash_password(payload.password)
 
     # For workers, create their profile now with the chosen worker_type
     # (nurse vs caregiver) so the correct required-documents set applies.
@@ -203,12 +414,13 @@ async def register(payload: RegisterRequest, db: AsyncSession = Depends(get_db))
     code = await _create_email_verification(db, user)
     await audit(db, user.id, user.role.value, "auth.register", "user", user.id)
     await db.commit()
-    await send_verification_email(email, code)
+    sent = await send_verification_email(email, code)
     return RegisterResponse(
         registered=True,
         email=email,
         expires_in_seconds=settings.EMAIL_VERIFICATION_EXPIRE_MINUTES * 60,
-        dev_verification_code=code if settings.EMAIL_DEV_MODE else None,
+        dev_verification_code=code if settings.email_dev_mode else None,
+        email_sent=bool(sent) or settings.email_dev_mode,
     )
 
 
@@ -245,6 +457,34 @@ async def verify_email(payload: VerifyEmailRequest, db: AsyncSession = Depends(g
         raise HTTPException(status_code=400, detail="Invalid verification code")
 
     verification.consumed = True
+
+    # Apply details from a re-registration, if this code belongs to one.
+    pending = await _pop_pending_registration(verification.id)
+    if pending:
+        new_phone = pending.get("phone_e164")
+        if new_phone and new_phone != user.phone_e164:
+            clash = await db.execute(select(User).where(User.phone_e164 == new_phone, User.id != user.id))
+            if clash.scalar_one_or_none():
+                await db.commit()
+                raise HTTPException(status_code=409, detail="An account with this phone number already exists")
+            user.phone_e164 = new_phone
+        if pending.get("full_name"):
+            user.full_name = pending["full_name"]
+        if pending.get("password_hash"):
+            user.password_hash = pending["password_hash"]
+        if pending.get("role") in (UserRole.consumer.value, UserRole.worker.value):
+            user.role = UserRole(pending["role"])
+        if user.role == UserRole.worker:
+            from app.models.enums import WorkerType
+            wtype = WorkerType(pending["worker_type"]) if pending.get("worker_type") else WorkerType.nurse
+            wres = await db.execute(select(WorkerProfile).where(WorkerProfile.user_id == user.id))
+            wp = wres.scalar_one_or_none()
+            if wp:
+                wp.worker_type = wtype
+            else:
+                db.add(WorkerProfile(user_id=user.id, worker_type=wtype))
+            await db.flush()
+
     user.email_verified_at = datetime.now(timezone.utc)
     # Workers must pass reviewer doc-review + approval before the account opens.
     # They land in `onboarding` (restricted: upload docs / view status only).
@@ -258,37 +498,72 @@ async def verify_email(payload: VerifyEmailRequest, db: AsyncSession = Depends(g
 @router.post("/resend-email-verification", response_model=RegisterResponse)
 async def resend_email_verification(
     payload: ResendEmailVerificationRequest,
+    request: Request,
     db: AsyncSession = Depends(get_db),
 ):
     email = _normalize_email(str(payload.email))
+    # Was unthrottled: usable to email-bomb any address.
+    await enforce_rate_limit("verify_resend:email", email, 5, 60 * 60)
+    await enforce_rate_limit("verify_resend:ip", client_ip(request), 20, 60 * 60)
     user_res = await db.execute(select(User).where(User.email == email))
     user = user_res.scalar_one_or_none()
     if not user or user.email_verified_at:
         raise HTTPException(status_code=400, detail="Account does not require email verification")
-    code = await _create_email_verification(db, user)
+    # Carry any parked re-registration details over to the new code, otherwise
+    # "resend" would silently revert to the details on the user row.
+    prev_res = await db.execute(
+        select(EmailVerificationCode)
+        .where(EmailVerificationCode.user_id == user.id, EmailVerificationCode.consumed.is_(False))
+        .order_by(EmailVerificationCode.created_at.desc())
+        .limit(1)
+    )
+    prev = prev_res.scalar_one_or_none()
+    carried = await _pop_pending_registration(prev.id) if prev else None
+    code, rec = await _create_email_verification_record(db, user)
+    if carried:
+        await _store_pending_registration(rec.id, carried)
     await db.commit()
-    await send_verification_email(email, code)
+    sent = await send_verification_email(email, code)
     return RegisterResponse(
         registered=True,
         email=email,
         expires_in_seconds=settings.EMAIL_VERIFICATION_EXPIRE_MINUTES * 60,
-        dev_verification_code=code if settings.EMAIL_DEV_MODE else None,
+        dev_verification_code=code if settings.email_dev_mode else None,
+        email_sent=bool(sent) or settings.email_dev_mode,
     )
 
 
+# Brute-force policy for /login:
+#   - per-IP throttle: 20 attempts / 15 min (any outcome)
+#   - per-account lockout: 5 FAILED attempts locks the email for 15 min
+#     (counter clears on successful login)
+_LOGIN_IP_MAX = 20
+_LOGIN_WINDOW_SECONDS = 15 * 60
+_LOGIN_MAX_FAILURES = 5
+_LOGIN_LOCK_SECONDS = 15 * 60
+
+
 @router.post("/login", response_model=AuthResponse)
-async def login(payload: PasswordLoginRequest, db: AsyncSession = Depends(get_db)):
+async def login(payload: PasswordLoginRequest, request: Request, db: AsyncSession = Depends(get_db)):
     """Authenticate a verified account using email and password."""
     email = _normalize_email(str(payload.email))
+    ip = client_ip(request)
+    await enforce_rate_limit("login:ip", ip, _LOGIN_IP_MAX, _LOGIN_WINDOW_SECONDS)
+    await ensure_not_locked("login", email)
+
     ures = await db.execute(select(User).where(User.email == email))
     user = ures.scalar_one_or_none()
     if not user or not user.password_hash or not verify_password(payload.password, user.password_hash):
+        # Same failure counter whether the account exists or not, so the
+        # response timing/behaviour doesn't leak which emails are registered.
+        await register_failure("login", email, _LOGIN_MAX_FAILURES, _LOGIN_LOCK_SECONDS)
         raise HTTPException(status_code=401, detail="Invalid email or password")
     if not user.email_verified_at:
         raise HTTPException(status_code=403, detail="Verify your email before signing in")
     if user.status not in (UserStatus.active, UserStatus.onboarding):
         raise HTTPException(status_code=403, detail="Account is not active")
 
+    await clear_failures("login", email)
     user.last_login_at = datetime.now(timezone.utc)
     tokens = _issue_token_pair(user)
     await _persist_session(
@@ -306,7 +581,7 @@ async def login(payload: PasswordLoginRequest, db: AsyncSession = Depends(get_db
 
 
 @router.post("/phone-login", response_model=AuthResponse)
-async def phone_login(payload: PhoneLoginRequest, db: AsyncSession = Depends(get_db)):
+async def phone_login(payload: PhoneLoginRequest, request: Request, db: AsyncSession = Depends(get_db)):
     """Passwordless login/register for the mobile app.
 
     The mobile app (intapp) has no password field — it authenticates purely
@@ -320,15 +595,27 @@ async def phone_login(payload: PhoneLoginRequest, db: AsyncSession = Depends(get
     """
     _validate_signup_role(payload.role)
     phone = _normalize_phone(payload.phone_e164)
+    # This endpoint authenticates on phone number ALONE (mobile-app
+    # contract) — throttle hard so it can't be used to enumerate accounts
+    # or mass-register: 5 calls/hour per IP and per phone number.
+    ip = client_ip(request)
+    await enforce_rate_limit("phone_login:ip", ip, 5, 60 * 60)
+    await enforce_rate_limit("phone_login:phone", phone, 5, 60 * 60)
+
+    # SECURITY (critical): this endpoint used to issue tokens for ANY account
+    # given only its phone number — no OTP, no password. It now requires the
+    # OTP from POST /auth/otp/send, exactly like /auth/otp/verify.
+    # Mobile clients must call /auth/otp/send first and pass `code`.
+    await _consume_phone_otp(db, phone, payload.code)
 
     ures = await db.execute(select(User).where(User.phone_e164 == phone))
     user = ures.scalar_one_or_none()
 
-    if user and user.role != payload.role:
-        raise HTTPException(
-            status_code=409,
-            detail="This phone number is already registered under a different role",
-        )
+    # Same reasoning as /otp/verify: an existing number signs in as the
+    # account it already belongs to, under that account's stored role.
+    # Rejecting the request only stranded existing users and pushed them
+    # toward creating a duplicate account under the other role.
+    role_switched = bool(user is not None and user.role != payload.role)
 
     if not user:
         user = User(
@@ -360,15 +647,20 @@ async def phone_login(payload: PhoneLoginRequest, db: AsyncSession = Depends(get
     await audit(db, user.id, user.role.value, "auth.phone_login", "user", user.id)
     await db.commit()
     await db.refresh(user)
-    return AuthResponse(user=UserOut.model_validate(user), tokens=tokens)
+    return AuthResponse(
+        user=UserOut.model_validate(user),
+        tokens=tokens,
+        authenticated_role=user.role,
+        role_switched=role_switched,
+    )
 
 
 @router.post("/refresh", response_model=TokenPair)
 async def refresh_token(payload: RefreshRequest, db: AsyncSession = Depends(get_db)):
     try:
         claims = decode_token(payload.refresh_token)
-    except ValueError as e:
-        raise HTTPException(status_code=401, detail=str(e))
+    except ValueError:
+        raise HTTPException(status_code=401, detail="Session expired or revoked")
     if claims.get("type") != "refresh":
         raise HTTPException(status_code=401, detail="Not a refresh token")
     jti = claims.get("jti")
@@ -378,7 +670,9 @@ async def refresh_token(payload: RefreshRequest, db: AsyncSession = Depends(get_
         raise HTTPException(status_code=401, detail="Session expired or revoked")
 
     ures = await db.execute(select(User).where(User.id == session.user_id))
-    user = ures.scalar_one()
+    user = ures.scalar_one_or_none()
+    if not user:
+        raise HTTPException(status_code=401, detail="Session expired or revoked")
     if user.status not in (UserStatus.active, UserStatus.onboarding):
         raise HTTPException(status_code=403, detail="Account is not active")
     tokens = _issue_token_pair(user)
@@ -418,19 +712,56 @@ async def me(current: CurrentUser = Depends(get_current_user)):
 # Phone OTP — consumer login (no password required)
 # ---------------------------------------------------------------------------
 @router.post("/otp/send", response_model=OtpSendResponse)
-async def otp_send(payload: OtpSendRequest, db: AsyncSession = Depends(get_db)):
+async def otp_send(payload: OtpSendRequest, request: Request, db: AsyncSession = Depends(get_db)):
     """Generate and send a 6-digit OTP to the given phone number.
 
     In dev mode (OTP_DEV_MODE=True) the OTP is returned in the response body
     instead of being dispatched via SMS so testing works without MSG91 credits.
     """
     phone = _normalize_phone(payload.phone_e164)
+    # Throttle: 3 codes / 10 min per phone (SMS bombing + credit burn),
+    # 15 sends / hour per IP (mass enumeration). (Automatically skipped in
+    # OTP_DEV_MODE — see app/core/rate_limit.py.)
+    ip = client_ip(request)
+    await enforce_rate_limit(
+        "otp_send:phone", phone, 3, 10 * 60,
+        message="Too many codes requested for this number. Wait a few minutes and try again.",
+    )
+    await enforce_rate_limit("otp_send:ip", ip, 15, 60 * 60)
+
+    # Role detection up front. The app previously discovered a role clash
+    # only at /otp/verify, i.e. after the user had already received and
+    # typed a code — which is the "This number is registered as a care
+    # professional" dead end. Tell the client now so it can switch to the
+    # right sign-in screen before asking for anything.
+    existing_res = await db.execute(select(User).where(User.phone_e164 == phone))
+    existing_user = existing_res.scalar_one_or_none()
+    existing_role = existing_user.role if existing_user else None
+
+    # `settings.otp_dev_mode` (property) is force-disabled outside
+    # development, so a production deployment can never fall back to the
+    # fixed code even if OTP_DEV_MODE is left set in the environment.
     code = (
         settings.OTP_DEV_FIXED_CODE
-        if settings.OTP_DEV_MODE
+        if settings.otp_dev_mode
         else f"{secrets.randbelow(1000000):06d}"
     )
     expires_at = datetime.now(timezone.utc) + timedelta(minutes=settings.OTP_EXPIRE_MINUTES)
+
+    # Retire any still-live code for this number/purpose. /otp/verify reads
+    # "the most recent unconsumed code", so leaving the old ones open served
+    # no purpose and widened the guessing surface every time a code was
+    # resent.
+    await db.execute(
+        update(OtpCode)
+        .where(
+            OtpCode.phone_e164 == phone,
+            OtpCode.purpose == payload.purpose,
+            OtpCode.consumed.is_(False),
+        )
+        .values(consumed=True)
+    )
+
     db.add(
         OtpCode(
             phone_e164=phone,
@@ -441,23 +772,52 @@ async def otp_send(payload: OtpSendRequest, db: AsyncSession = Depends(get_db)):
     )
     await db.commit()
 
-    if not settings.OTP_DEV_MODE:
-        try:
-            from app.integrations.providers import msg91_client
-            await msg91_client.send_otp(phone, code)
-        except Exception:
-            logger.exception("MSG91 OTP dispatch failed for %s", phone)
+    if not settings.otp_dev_mode:
+        from app.integrations.providers import mask_phone_for_log, msg91_client, sms_delivered
+        result = await msg91_client.send_otp(phone, code, purpose=f"auth_{payload.purpose}")
+        if not sms_delivered(result):
+            # Previously: failure was logged and the API still answered
+            # {"sent": true}, so the app sat on "Enter OTP" for a code that
+            # was never going to arrive. Now: retire the undelivered code,
+            # refund the per-phone send budget, and tell the client.
+            logger.error("OTP not delivered phone=%s reason=%s",
+                         mask_phone_for_log(phone), result.get("reason"))
+            await db.execute(
+                update(OtpCode)
+                .where(OtpCode.phone_e164 == phone, OtpCode.purpose == payload.purpose,
+                       OtpCode.consumed.is_(False))
+                .values(consumed=True)
+            )
+            await db.commit()
+            from app.core.rate_limit import release_rate_limit
+            await release_rate_limit("otp_send:phone", phone)
+            raise HTTPException(
+                status_code=502 if result.get("retryable", True) else 503,
+                detail={
+                    "code": "OTP_SEND_FAILED",
+                    "message": (
+                        "We couldn't send the code to this number right now. "
+                        "Please try again in a minute."
+                        if result.get("retryable", True)
+                        else "SMS codes are temporarily unavailable. Please use email login "
+                             "or contact support."
+                    ),
+                    "retryable": bool(result.get("retryable", True)),
+                },
+            )
 
     return OtpSendResponse(
         sent=True,
         phone_e164=phone,
         expires_in_seconds=settings.OTP_EXPIRE_MINUTES * 60,
-        dev_otp=code if settings.OTP_DEV_MODE else None,
+        dev_otp=code if settings.otp_dev_mode else None,
+        existing_role=existing_role,
+        role_mismatch=bool(existing_role is not None and existing_role != payload.role),
     )
 
 
 @router.post("/otp/verify", response_model=AuthResponse)
-async def otp_verify(payload: OtpVerifyRequest, db: AsyncSession = Depends(get_db)):
+async def otp_verify(payload: OtpVerifyRequest, request: Request, db: AsyncSession = Depends(get_db)):
     """Verify OTP and issue tokens.  Creates a consumer account on first use.
 
     - If the phone is already registered as a *consumer* → logs them in.
@@ -465,45 +825,40 @@ async def otp_verify(payload: OtpVerifyRequest, db: AsyncSession = Depends(get_d
     - If phone belongs to a *worker* → returns 409 (use worker login instead).
     """
     phone = _normalize_phone(payload.phone_e164)
+    # Per-code attempts are capped below (otp.attempts >= 5); this per-IP
+    # throttle additionally stops one host cycling many phone numbers.
+    # (Automatically skipped in OTP_DEV_MODE — see app/core/rate_limit.py.)
+    await enforce_rate_limit("otp_verify:ip", client_ip(request), 20, 15 * 60)
 
-    otp_res = await db.execute(
-        select(OtpCode)
-        .where(
-            OtpCode.phone_e164 == phone,
-            OtpCode.consumed.is_(False),
-        )
-        .order_by(OtpCode.created_at.desc())
-        .limit(1)
-    )
-    otp = otp_res.scalar_one_or_none()
-    if not otp:
-        raise HTTPException(status_code=400, detail="No active OTP for this number. Request a new code.")
-    if otp.expires_at < datetime.now(timezone.utc):
-        raise HTTPException(status_code=400, detail="OTP expired. Request a new code.")
-    if otp.attempts >= 5:
-        raise HTTPException(status_code=429, detail="Too many attempts. Request a new code.")
-
-    otp.attempts += 1
-    if not verify_password(payload.code, otp.code_hash):
-        await db.commit()
-        raise HTTPException(status_code=400, detail="Invalid OTP.")
-
-    otp.consumed = True
+    await _consume_phone_otp(db, phone, payload.code)
 
     user_res = await db.execute(select(User).where(User.phone_e164 == phone))
     user = user_res.scalar_one_or_none()
 
-    if user and user.role == UserRole.worker:
-        raise HTTPException(
-            status_code=409,
-            detail="This number is registered as a care professional. Use the nurse/caregiver login.",
-        )
+    # A number that already belongs to an account authenticates AS that
+    # account. This used to 409 whenever the requested role differed from
+    # the stored one, which stranded every existing care professional who
+    # tapped the patient sign-in: correct credentials, correct OTP, no way
+    # through. The OTP proves control of the number, which is the whole
+    # authentication factor here — the role the client happened to guess is
+    # routing information, not a credential.
+    #
+    # The account's stored role always wins. We never rewrite it, and we
+    # never create a second account for a number that already has one, so
+    # this cannot produce duplicate or role-swapped users. The response
+    # reports which role was actually used so the client can route to the
+    # matching dashboard.
+    role_switched = bool(user is not None and user.role != payload.role)
 
     if not user:
+        # `full_name` is optional on the OTP signup path — leave it NULL when
+        # the client didn't collect one so the profile screen can prompt for
+        # it. (This previously stored the literal role string, e.g. the name
+        # of every OTP-registered consumer came out as "consumer".)
         user = User(
             phone_e164=phone,
-            full_name=(payload.role.value if not hasattr(payload, "full_name") else None),
-            role=UserRole.consumer,
+            full_name=(payload.full_name or "").strip() or None,
+            role=payload.role,
             status=UserStatus.active,
             email_verified_at=datetime.now(timezone.utc),
         )
@@ -526,7 +881,20 @@ async def otp_verify(payload: OtpVerifyRequest, db: AsyncSession = Depends(get_d
         device_platform=payload.device_platform,
         fcm_token=payload.fcm_token,
     )
-    await audit(db, user.id, user.role.value, "auth.otp_login", "user", user.id)
+    await audit(
+        db,
+        user.id,
+        user.role.value,
+        "auth.otp_login",
+        "user",
+        user.id,
+        {"requested_role": payload.role.value, "role_switched": role_switched} if role_switched else None,
+    )
     await db.commit()
     await db.refresh(user)
-    return AuthResponse(user=UserOut.model_validate(user), tokens=tokens)
+    return AuthResponse(
+        user=UserOut.model_validate(user),
+        tokens=tokens,
+        authenticated_role=user.role,
+        role_switched=role_switched,
+    )

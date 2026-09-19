@@ -257,6 +257,14 @@ async def is_worker_qualified_for_service(
     if worker.onboarding_status != WorkerOnboardingStatus.approved:
         return False, "WORKER_NOT_VERIFIED"
 
+    # Provider Type check — the first gate: an unlisted provider type is
+    # never eligible for this service/package, full stop, regardless of
+    # training/assessment/tier. NULL/empty allowed_provider_types = no
+    # restriction (back-compat with every existing row).
+    allowed_types = list(getattr(service, "allowed_provider_types", None) or [])
+    if allowed_types and worker.worker_type.value not in allowed_types:
+        return False, "PROVIDER_TYPE_NOT_ALLOWED"
+
     qual = await _get_qualification_row(db, worker.id, service)
 
     # Tier check (unless explicit override row exists)
@@ -296,16 +304,50 @@ async def is_worker_qualified_for_service(
         if not practical_ok:
             return False, "PRACTICAL_SIGNOFF_REQUIRED"
 
-    # Admin approval requirement
+    # Admin approval requirement. Distinguish "nobody has even started the
+    # review" from "review is in progress": no qualification row at all
+    # means the worker never requested (or was never granted) this
+    # admin-gated target — surface that as QUALIFICATION_RECORD_MISSING so
+    # the UI can point them at the "request access" flow
+    # (POST /workers/me/service-qualification-requests) rather than
+    # implying a review is already underway.
     requires_admin = bool(getattr(service, "requires_admin_skill_approval", False))
     if requires_admin:
-        if not qual or not qual.admin_approved_at:
+        if not qual:
+            return False, "QUALIFICATION_RECORD_MISSING"
+        if not qual.admin_approved_at:
             return False, "ADMIN_APPROVAL_REQUIRED"
 
-    # Qualification record must be APPROVED and not expired
+    # Qualification record must be APPROVED and not expired.
+    #
+    # EXCEPTION — requirement-free targets: when the service/package has no
+    # configured requirements at all (no training modules, no certificates,
+    # no assessments, gate is credential_only, no admin skill approval) the
+    # tier + onboarding checks above are the entire bar. Requiring a
+    # WorkerServiceQualification row on top of that dead-ends dispatch:
+    # nothing in the product ever creates that row for such targets unless
+    # an admin re-approves the worker AFTER the target was created
+    # (sync_tier_qualifications only runs on approve/tier-change), so every
+    # nurse silently failed QUALIFICATION_RECORD_MISSING for care packages
+    # added later — which is why paid bookings never reached any nurse.
+    has_configured_requirements = bool(
+        required_codes
+        or cert_codes
+        or assessment_codes
+        or requires_admin
+        or getattr(service, "gate", None) == QualificationGate.practical_verified
+    )
     if not qual:
+        if not has_configured_requirements:
+            return True, None
         return False, "QUALIFICATION_RECORD_MISSING"
     if qual.qualification_status != WorkerQualificationStatus.APPROVED:
+        if not has_configured_requirements:
+            # Row exists but was parked in a non-approved state (e.g. created
+            # as QUALIFIED_PENDING_APPROVAL by the request-qualification
+            # endpoint's chicken-and-egg check) even though nothing is
+            # actually required — same dead-end, same exception.
+            return True, None
         return False, f"QUALIFICATION_STATUS_{qual.qualification_status.value}"
     now = datetime.now(timezone.utc)
     if qual.valid_until and qual.valid_until < now:
@@ -316,9 +358,16 @@ async def is_worker_qualified_for_service(
 async def is_worker_opted_in_for_service(
     worker: WorkerProfile, service: ServiceLike, db: AsyncSession
 ) -> bool:
+    """A worker with no preference row on file is treated as opted-in.
+
+    Explicit OPT_OUT / PAUSED rows are always respected. Defaulting the
+    absent row to opted-out meant a booking was invisible to every nurse
+    who had simply never visited the preferences screen — dispatch must
+    reach willing workers by default, with opt-out as the exception.
+    """
     pref = await _get_preference_row(db, worker.id, service)
     if not pref:
-        return False
+        return True
     return (
         pref.preference_status == WorkerPreferenceStatus.OPTED_IN
         and bool(pref.willing_to_accept)
@@ -450,15 +499,22 @@ async def sync_tier_qualifications(
       status for the training/assessment bridge to manage; only touches the
       row here if it doesn't exist yet (so `can_opt_in` shows the right
       locked_reason instead of QUALIFICATION_RECORD_MISSING).
+
+    Services only — deliberately does NOT touch CarePackage rows. Packages
+    are a stricter, explicitly-reviewed grant: a worker must go through
+    POST /workers/me/service-qualification-requests (or an admin action)
+    before a WorkerServiceQualification row for a package exists at all, so
+    that admin-gated / no-configured-requirement packages correctly read as
+    QUALIFICATION_RECORD_MISSING until requested, instead of this tier
+    bridge silently pre-creating (and for admin-gated ones, silently
+    pending-approving) a row nobody asked for.
     """
     updated: list[WorkerServiceQualification] = []
 
     sres = await db.execute(select(ServiceCatalogue).where(ServiceCatalogue.is_active.is_(True)))
     services = list(sres.scalars().all())
-    pres = await db.execute(select(CarePackage).where(CarePackage.is_active.is_(True)))
-    packages = list(pres.scalars().all())
 
-    for target in services + packages:
+    for target in services:
         tier_ok = _tier_value(worker.tier) >= _tier_value(target.min_tier)
 
         training_codes = list(getattr(target, "required_training_module_codes", None) or [])
@@ -495,12 +551,20 @@ async def sync_tier_qualifications(
 
         if not tier_ok:
             qual.qualification_status = WorkerQualificationStatus.NOT_QUALIFIED
-        elif not (training_ok and cert_ok and assess_ok and practical_ok):
-            # Tier is fine but something else is still outstanding — leave
-            # status as-is (defaults to NOT_QUALIFIED for a brand new row) so
-            # the eligibility endpoint reports the *real* locked_reason
-            # (TRAINING_REQUIRED / CERTIFICATE_REQUIRED / ASSESSMENT_REQUIRED)
-            # rather than QUALIFICATION_RECORD_MISSING.
+        elif not training_ok:
+            # Tier is fine but training is the specific outstanding gate —
+            # WorkerQualificationStatus has a dedicated TRAINING_REQUIRED
+            # value for exactly this case, so the stored row (not just the
+            # live locked_reason computed in is_worker_qualified_for_service)
+            # reflects it.
+            qual.qualification_status = WorkerQualificationStatus.TRAINING_REQUIRED
+        elif not (cert_ok and assess_ok and practical_ok):
+            # Tier and training are fine but something else (certificate /
+            # assessment / practical sign-off) is still outstanding — no
+            # dedicated status value for those, so leave as NOT_QUALIFIED
+            # and let the eligibility endpoint's live locked_reason
+            # (CERTIFICATE_REQUIRED / ASSESSMENT_REQUIRED /
+            # PRACTICAL_SIGNOFF_REQUIRED) carry the specific reason.
             if qual.qualification_status is None:
                 qual.qualification_status = WorkerQualificationStatus.NOT_QUALIFIED
         elif requires_admin and not qual.admin_approved_at:
