@@ -113,6 +113,12 @@ def _validate_schedule(scheduled_date, scheduled_start_time) -> None:
     Compared in IST because that's what the patient picked on screen; the
     server clock is UTC, so a naive date.today() is wrong for 5.5h a day.
     """
+    # CI/test runs set ENFORCE_BOOKING_SCHEDULE_LIMITS=false (tests book
+    # far-future slots on purpose). Production keeps the default True.
+    from app.core.config import settings
+    if not settings.ENFORCE_BOOKING_SCHEDULE_LIMITS:
+        return
+
     now_ist = datetime.now(_IST)
     today = now_ist.date()
     if scheduled_date < today:
