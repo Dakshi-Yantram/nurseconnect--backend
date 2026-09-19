@@ -43,6 +43,9 @@ WORKER2_PHONE = "+919999000007"
 
 # --------- helpers ---------
 def _login(phone: str, role: str) -> dict:
+    # /auth/phone-login now requires a real OTP: request one first (in
+    # OTP_DEV_MODE the code is the fixed OTP_DEV_FIXED_CODE, "123456").
+    requests.post(f"{API}/auth/otp/send", json={"phone_e164": phone, "role": role}, timeout=15)
     r = requests.post(
         f"{API}/auth/phone-login",
         json={"phone_e164": phone, "code": "123456", "role": role},

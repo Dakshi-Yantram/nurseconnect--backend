@@ -7,6 +7,22 @@ Usage:
     python set_all_prices_to_1.py            # apply the change
     python set_all_prices_to_1.py --dry-run  # just show what would change
 """
+
+# --- SAFETY GUARD (added): destructive/test-only script -------------------
+# Refuses to run against a production environment unless explicitly forced.
+import os as _os, sys as _sys
+try:
+    from dotenv import load_dotenv as _ld
+    _ld()
+except Exception:  # noqa: BLE001
+    pass
+if (_os.environ.get("APP_ENV", "").strip().lower() in {"production", "prod", "staging", "stage", "uat"}
+        and "--i-know-this-is-production" not in _sys.argv):
+    _sys.exit("Refusing to run: APP_ENV is production. Re-run with --i-know-this-is-production if you are certain.")
+if "--i-know-this-is-production" in _sys.argv:
+    _sys.argv.remove("--i-know-this-is-production")
+# ---------------------------------------------------------------------------
+
 import asyncio
 import os
 import sys

@@ -7,7 +7,6 @@ import uuid
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
-from fastapi.staticfiles import StaticFiles
 from sqlalchemy import text
 from starlette.middleware.cors import CORSMiddleware
 from starlette.responses import JSONResponse
@@ -80,15 +79,24 @@ async def lifespan(app: FastAPI):
     # customer who never receives a code or whose payment won't verify.
     for problem in settings.startup_warnings():
         logger.error("CONFIG: %s", problem)
+    # Unsafe production configuration is fatal, not a log line: e.g. mock
+    # payment verification accepts any signature and unsigned webhooks.
+    fatal = settings.fatal_config_errors()
+    if fatal:
+        for problem in fatal:
+            logger.critical("FATAL CONFIG: %s", problem)
+        raise RuntimeError("Refusing to start with unsafe production configuration: " + " | ".join(fatal))
 
-    _ensure_infra_running()
-    # Run seed (creates tables + initial config)
-    from app.seed import main as seed
-    try:
-        await seed()
-        logger.info("Seed completed")
-    except Exception as e:
-        logger.exception("Seed failed: %s", e)
+    if not settings.is_production:
+        _ensure_infra_running()  # dev-container convenience only
+    if settings.run_seed_on_startup:
+        # Run seed (creates tables + initial config)
+        from app.seed import main as seed
+        try:
+            await seed()
+            logger.info("Seed completed")
+        except Exception as e:
+            logger.exception("Seed failed: %s", e)
     yield
 
 
@@ -101,6 +109,10 @@ app = FastAPI(
     # returns an HTML traceback (source lines, paths) to the caller and
     # bypasses the JSON handler below.
     debug=bool(settings.APP_DEBUG) and not settings.is_production,
+    # Don't publish the full API map (every endpoint + schema) in production.
+    docs_url=None if settings.is_production else "/docs",
+    redoc_url=None if settings.is_production else "/redoc",
+    openapi_url=None if settings.is_production else "/openapi.json",
 )
 
 
@@ -137,13 +149,16 @@ async def unhandled_exception_middleware(request: Request, call_next):
 
 app.add_middleware(
     CORSMiddleware,
+    # SECURITY: explicit origins only. The old regex allowed ANY
+    # *.workers.dev site (anyone can deploy one) with credentials. List your
+    # real frontend origin(s) in CORS_ORIGINS / CORS_ORIGIN_REGEX instead.
     allow_origins=settings.cors_origin_list,
-    # Also allow the deployed Cloudflare Workers frontends (and localhost) so
-    # doc-upload POSTs from *.workers.dev aren't blocked by CORS.
-    allow_origin_regex=r"https://.*\.workers\.dev|http://localhost(:\d+)?",
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origin_regex=settings.cors_origin_regex,
+    # Auth is a Bearer header, not cookies, so credentials aren't needed.
+    allow_credentials=False,
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type", "X-Request-Id"],
+    expose_headers=["X-Request-Id", "Retry-After"],
 )
 
 import traceback
@@ -159,10 +174,19 @@ async def debug_exception_handler(request: Request, exc: Exception):
 @app.middleware("http")
 async def request_id_middleware(request: Request, call_next):
     """Attach a request id for tracing + audit."""
-    rid = request.headers.get("x-request-id") or uuid.uuid4().hex
+    # Only accept a client-supplied id if it looks like one (it is written to
+    # logs and the audit trail).
+    supplied = request.headers.get("x-request-id") or ""
+    rid = supplied if (0 < len(supplied) <= 64 and supplied.replace("-", "").isalnum()) else uuid.uuid4().hex
     request.state.request_id = rid
     response = await call_next(request)
     response.headers["x-request-id"] = rid
+    # Baseline security headers for every API response.
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("X-Frame-Options", "DENY")
+    response.headers.setdefault("Referrer-Policy", "no-referrer")
+    if settings.is_production:
+        response.headers.setdefault("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
     return response
 
 
@@ -207,7 +231,7 @@ async def health():
 
 @app.get("/api/")
 async def root():
-    return {"name": settings.APP_NAME, "version": app.version, "docs": "/docs"}
+    return {"name": settings.APP_NAME, "version": app.version}
 
 
 # Mount routers all under /api prefix
@@ -226,6 +250,7 @@ for r in [
     visits.notes_router,
     care.router,
     care_workflow.router,
+    care_workflow.uploads_router,
     composite_care.router,
     contracts.router,
     eprescriptions.router,
@@ -248,8 +273,8 @@ for r in [
     app.include_router(r, prefix=_API_PREFIX)
 
 
-# Patch 4 — serve uploaded documentation files locally. Public URL prefix
-# matches the urls returned by POST /care/workflow/{booking_id}/documentation/file.
-_UPLOAD_DIR = os.environ.get("UPLOAD_DIR", "./uploads")
-os.makedirs(_UPLOAD_DIR, exist_ok=True)
-app.mount("/api/uploads", StaticFiles(directory=_UPLOAD_DIR), name="uploads")
+# SECURITY: uploaded clinical photos used to be served by a public
+# StaticFiles mount at /api/uploads — anyone with (or guessing) a URL could
+# download patient photos with no login. They are now served only by the
+# authenticated route GET /api/uploads/documentation/{filename} in
+# app/api/v1/care_workflow.py, which checks booking access first.

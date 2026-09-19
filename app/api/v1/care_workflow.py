@@ -10,12 +10,14 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import uuid as _uuid
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
+from fastapi.responses import FileResponse
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.responses import JSONResponse
@@ -440,17 +442,80 @@ async def upload_documentation_file(
             status_code=403,
             detail={"code": ce.code, "message": ce.message, "consent_type": ce.consent_type.value},
         ) from None
-    safe_name = file.filename or "upload.bin"
-    ext = ""
-    if "." in safe_name:
-        ext = "." + safe_name.rsplit(".", 1)[-1].lower()[:10]
+    # SECURITY / edge cases: field_id went into the filename unsanitised,
+    # the extension came from the client, any file type was accepted (an
+    # uploaded .html would be served from the API origin = stored XSS), and
+    # the whole body was read into memory with no size cap.
+    if not _FIELD_ID_RE.fullmatch(field_id or ""):
+        raise HTTPException(
+            status_code=422,
+            detail={"code": "INVALID_FIELD_ID", "message": "Invalid documentation field."},
+        )
+    contents = await _read_limited(file)
+    if not contents:
+        raise HTTPException(status_code=422, detail={"code": "EMPTY_FILE", "message": "The selected file is empty."})
+    ext = _sniff_extension(contents)
+    if not ext:
+        raise HTTPException(
+            status_code=415,
+            detail={"code": "UNSUPPORTED_FILE_TYPE", "message": "Only JPG, PNG, WEBP, HEIC photos or PDF files can be uploaded."},
+        )
     fname = f"{booking_id}_{field_id}_{_uuid.uuid4().hex}{ext}"
     fpath = os.path.join(DOC_UPLOAD_DIR, fname)
-    contents = await file.read()
     with open(fpath, "wb") as fh:
         fh.write(contents)
     public_url = f"{_PUBLIC_URL_PREFIX}/{fname}"
+    await audit(db, current.id, current.role.value, "care.documentation_file_uploaded", "booking", booking_id,
+                {"field_id": field_id, "size_bytes": len(contents), "type": ext})
+    await db.commit()
     return {"file_url": public_url, "field_id": field_id, "size_bytes": len(contents)}
+
+
+# ---------------------------------------------------------------------------
+# Upload helpers
+# ---------------------------------------------------------------------------
+_FIELD_ID_RE = re.compile(r"[A-Za-z0-9_\-]{1,64}")
+# Deliberately looser than what new uploads produce, so files stored before
+# this fix (client-chosen extensions/field ids) remain downloadable.
+_STORED_NAME_RE = re.compile(r"(?P<booking>[0-9a-fA-F\-]{36})_[^/\\]{1,200}")
+_MEDIA_TYPES = {
+    ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png", ".webp": "image/webp",
+    ".heic": "image/heic", ".pdf": "application/pdf",
+}
+
+
+async def _read_limited(file: UploadFile) -> bytes:
+    from app.core.config import settings
+    limit = int(settings.MAX_UPLOAD_MB) * 1024 * 1024
+    chunks: list[bytes] = []
+    total = 0
+    while True:
+        chunk = await file.read(1024 * 1024)
+        if not chunk:
+            break
+        total += len(chunk)
+        if total > limit:
+            raise HTTPException(
+                status_code=413,
+                detail={"code": "FILE_TOO_LARGE", "message": f"File is too large. Maximum size is {settings.MAX_UPLOAD_MB} MB."},
+            )
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
+def _sniff_extension(data: bytes) -> str | None:
+    """Decide the type from the file's bytes, never from the client's name."""
+    if data[:3] == b"\xff\xd8\xff":
+        return ".jpg"
+    if data[:8] == b"\x89PNG\r\n\x1a\n":
+        return ".png"
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return ".webp"
+    if data[4:8] == b"ftyp" and data[8:12] in (b"heic", b"heix", b"hevc", b"heif", b"mif1", b"msf1"):
+        return ".heic"
+    if data[:5] == b"%PDF-":
+        return ".pdf"
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -470,3 +535,49 @@ async def get_completion_status(
     except WorkflowError as e:
         return _workflow_error_response(e)
     return status
+
+
+# ---------------------------------------------------------------------------
+# GET /api/uploads/documentation/{filename}  (authenticated)
+#
+# Replaces the public StaticFiles mount. Same URL shape, so file_url values
+# already stored in the database keep working — but the caller must now send
+# a Bearer token and have access to the booking the file belongs to.
+# ---------------------------------------------------------------------------
+uploads_router = APIRouter(tags=["care-workflow"])
+
+
+@uploads_router.get("/uploads/documentation/{filename}")
+async def download_documentation_file(
+    filename: str,
+    current: CurrentUser = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    from app.security.access_control import assert_can_view_booking_records
+
+    m = _STORED_NAME_RE.fullmatch(filename)
+    if not m:
+        raise HTTPException(status_code=404, detail="File not found")
+    try:
+        booking_id = UUID(m.group("booking"))
+    except ValueError:
+        raise HTTPException(status_code=404, detail="File not found")
+    await assert_can_view_booking_records(db, current, booking_id)
+
+    root = os.path.realpath(DOC_UPLOAD_DIR)
+    path = os.path.realpath(os.path.join(root, filename))
+    if not path.startswith(root + os.sep) or not os.path.isfile(path):
+        raise HTTPException(status_code=404, detail="File not found")
+    ext = os.path.splitext(filename)[1].lower()
+    media_type = _MEDIA_TYPES.get(ext)
+    return FileResponse(
+        path,
+        # Unknown/legacy types are forced to download, never rendered.
+        media_type=media_type or "application/octet-stream",
+        headers={
+            "Cache-Control": "private, no-store",
+            "X-Content-Type-Options": "nosniff",
+            "Content-Disposition": "inline" if media_type else "attachment",
+            "Content-Security-Policy": "default-src 'none'; sandbox",
+        },
+    )

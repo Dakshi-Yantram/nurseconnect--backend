@@ -10,7 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.database import get_db
 from app.core.security import decode_token
 from app.models.enums import UserRole, UserStatus
-from app.models.models import ConsumerProfile, User, WorkerProfile
+from app.models.models import ConsumerProfile, User, UserSession, WorkerProfile
 
 bearer_scheme = HTTPBearer(auto_error=False)
 
@@ -37,9 +37,24 @@ async def get_current_user(
     if claims.get("type") != "access":
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token type")
     user_id = claims.get("sub")
-    if not user_id:
+    try:
+        # A malformed `sub` used to raise ValueError -> 500. It's a bad token.
+        user_uuid = UUID(str(user_id))
+    except (TypeError, ValueError):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token subject")
-    res = await db.execute(select(User).where(User.id == UUID(user_id)))
+    # Session binding: access tokens carry `sid` (the refresh-session jti).
+    # Logout, password reset and refresh rotation revoke the session, which
+    # now invalidates the access token immediately. Tokens minted before this
+    # change have no `sid` and remain valid until their normal expiry.
+    sid = claims.get("sid")
+    if sid:
+        sres = await db.execute(
+            select(UserSession.revoked).where(UserSession.refresh_token_jti == sid)
+        )
+        revoked = sres.scalar_one_or_none()
+        if revoked is None or revoked:
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Session has ended. Please sign in again.")
+    res = await db.execute(select(User).where(User.id == user_uuid))
     user = res.scalar_one_or_none()
     if not user:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User not found")

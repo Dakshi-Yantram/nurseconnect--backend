@@ -1475,12 +1475,14 @@ async def record_report_client_event(
     proof. Same access rule as the report itself.
     """
     from app.core.rate_limit import enforce_rate_limit
-    from app.security.access_control import assert_user_can_access_booking
+    from app.security.access_control import assert_can_view_booking_records
     from app.services.report_access import ACTION_CLIENT_EVENT, CLIENT_EVENTS, audit_report_event
 
     if payload.event not in CLIENT_EVENTS:
         raise HTTPException(status_code=422, detail={"code": "UNKNOWN_EVENT", "message": "Unknown event."})
-    await assert_user_can_access_booking(db, current, booking_id)
+    # Staff (ops/support/clinical) also view protected summaries now, so their
+    # print/copy/screenshot attempts must be auditable too.
+    await assert_can_view_booking_records(db, current, booking_id)
     await enforce_rate_limit("report_client_event", str(current.id), 30, 10 * 60)
     await audit_report_event(
         db, actor_id=current.id, actor_type=current.role.value, action=ACTION_CLIENT_EVENT,

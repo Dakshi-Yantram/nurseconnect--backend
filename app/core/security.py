@@ -58,7 +58,9 @@ def decode_token(token: str) -> Dict[str, Any]:
     try:
         return jwt.decode(token, settings.JWT_SECRET_KEY, algorithms=[settings.JWT_ALGORITHM])
     except JWTError as e:
-        raise ValueError(f"Invalid token: {e}") from e
+        # Don't echo the library's reason ("Signature verification failed",
+        # "Signature has expired") back to clients; callers map this to 401.
+        raise ValueError("Invalid or expired token") from e
 
 
 def create_scoped_token(

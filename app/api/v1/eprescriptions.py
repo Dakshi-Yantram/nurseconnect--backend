@@ -266,6 +266,10 @@ async def list_for_booking(
     current: CurrentUser = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
+    # SECURITY: previously any authenticated user could list any booking's
+    # prescriptions (patient_issues, drugs_listed). Require booking access.
+    from app.security.access_control import assert_can_view_booking_records
+    await assert_can_view_booking_records(db, current, booking_id)
     res = await db.execute(
         select(Prescription).where(Prescription.booking_id == booking_id, Prescription.is_doctor_generated.is_(True))
         .order_by(Prescription.created_at.desc())
@@ -283,6 +287,19 @@ async def get_eprescription(
     prescription = res.scalar_one_or_none()
     if not prescription:
         raise HTTPException(status_code=404, detail="Not found")
+    # SECURITY: ownership check (was missing — any logged-in user could read
+    # any prescription by id). Allowed: the author, internal staff, or anyone
+    # with access to the booking / patient it belongs to.
+    from app.core.deps import is_staff
+    from app.security.access_control import (
+        assert_user_can_access_booking,
+        assert_user_can_access_patient,
+    )
+    if prescription.uploaded_by != current.id and not is_staff(current.role):
+        if prescription.booking_id:
+            await assert_user_can_access_booking(db, current, prescription.booking_id)
+        else:
+            await assert_user_can_access_patient(db, current, prescription.patient_id)
     return prescription
 
 
