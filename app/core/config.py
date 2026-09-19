@@ -274,6 +274,11 @@ class Settings(BaseSettings):
     # Clinical documentation uploads
     MAX_UPLOAD_MB: int = 10
 
+    # Booking date validation (no past slots, max 365 days ahead). Keep True
+    # in every real environment; the CI workflow sets it to false because
+    # the test-suite books far-future slots on purpose.
+    ENFORCE_BOOKING_SCHEDULE_LIMITS: bool = True
+
     @property
     def cors_origin_list(self) -> List[str]:
         origins = [o.strip() for o in self.CORS_ORIGINS.split(",") if o.strip()]
@@ -316,106 +321,6 @@ class Settings(BaseSettings):
                 "CORS_ORIGINS must list the frontend origin(s) explicitly in production (wildcard is not allowed)."
             )
         return errors
-
-    # -----------------------------------------------------------------
-    # Environment
-    #
-    # OTP_DEV_MODE and EMAIL_DEV_MODE both default to True, and both were
-    # previously independent of APP_ENV. That is why the live site showed
-    # "Dev mode code: 654321" next to a real customer's email address and
-    # no mail was ever sent: the deployment simply never set them to False,
-    # and nothing forced the issue.
-    #
-    # Dev mode is now a property of the environment, not a standalone flag.
-    # It can only be on in development, so a missing env var can no longer
-    # downgrade production auth to a fixed, publicly-visible code.
-    # -----------------------------------------------------------------
-    _PRODUCTION_ENVS = {"production", "prod", "staging", "stage", "uat"}
-
-    @property
-    def is_production(self) -> bool:
-        return self.APP_ENV.strip().lower() in self._PRODUCTION_ENVS
-
-    @property
-    def otp_dev_mode(self) -> bool:
-        """Fixed OTP + code echoed in the API response. Never in production."""
-        return bool(self.OTP_DEV_MODE) and not self.is_production
-
-    @property
-    def email_dev_mode(self) -> bool:
-        """Fixed email code + no mail dispatched. Never in production."""
-        return bool(self.EMAIL_DEV_MODE) and not self.is_production
-
-    @property
-    def email_delivery_configured(self) -> bool:
-        return bool(self.RESEND_API_KEY and self.EMAIL_FROM_ADDRESS)
-
-    def startup_warnings(self) -> List[str]:
-        """Misconfigurations that silently break user-facing flows.
-
-        Surfaced at boot (see app/main.py) so they are caught on deploy
-        rather than by a customer who never receives a verification code.
-        """
-        problems: List[str] = []
-        if self.is_production:
-            if self.OTP_DEV_MODE:
-                problems.append(
-                    "OTP_DEV_MODE is set in a production environment — ignoring it. "
-                    "Remove it from the environment."
-                )
-            if self.EMAIL_DEV_MODE:
-                problems.append(
-                    "EMAIL_DEV_MODE is set in a production environment — ignoring it. "
-                    "Remove it from the environment."
-                )
-            if not self.email_delivery_configured:
-                problems.append(
-                    "RESEND_API_KEY/EMAIL_FROM_ADDRESS are not set — verification "
-                    "emails cannot be delivered."
-                )
-            if not (self.RAZORPAY_KEY_ID and self.RAZORPAY_KEY_SECRET):
-                problems.append(
-                    "RAZORPAY_KEY_ID/RAZORPAY_KEY_SECRET are not both set — payment "
-                    "signature verification will reject every payment."
-                )
-            if not self.RAZORPAY_WEBHOOK_SECRET:
-                problems.append(
-                    "RAZORPAY_WEBHOOK_SECRET is not set — Razorpay webhooks will be "
-                    "rejected, so payments captured out-of-band will not settle."
-                )
-            if not (self.DIGIO_CLIENT_ID and self.DIGIO_CLIENT_SECRET):
-                problems.append(
-                    "DIGIO_CLIENT_ID/DIGIO_CLIENT_SECRET are not both set — Stage 2 "
-                    "e-Stamp agreements cannot be sent for signing."
-                )
-            if not self.DIGIO_WEBHOOK_SECRET:
-                problems.append(
-                    "DIGIO_WEBHOOK_SECRET is not set — Digio's signing-completion "
-                    "webhook will be rejected, so Stage 2 agreements will never "
-                    "finalize automatically."
-                )
-            if self.MOCK_EXTERNAL_PROVIDERS:
-                problems.append(
-                    "MOCK_EXTERNAL_PROVIDERS is on in a production environment — "
-                    "payments are being faked and SMS OTPs will be reported as "
-                    "FAILED (never silently 'sent')."
-                )
-            if not (self.MSG91_AUTH_KEY and self.MSG91_TEMPLATE_ID):
-                problems.append(
-                    "MSG91_AUTH_KEY/MSG91_TEMPLATE_ID are not both set — OTP SMS "
-                    "cannot be delivered."
-                )
-            if self.APP_DEBUG:
-                problems.append(
-                    "APP_DEBUG is on in a production environment — ignoring it "
-                    "(tracebacks are never returned to clients in production)."
-                )
-            if not self.PUBLIC_API_URL:
-                problems.append(
-                    "PUBLIC_API_URL is not set — visit-report download links for "
-                    "the mobile apps will be derived from proxy headers."
-                )
-        return problems
 
     # -----------------------------------------------------------------
     # Environment

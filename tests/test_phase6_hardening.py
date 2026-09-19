@@ -43,7 +43,7 @@ def _hdr(t):
 
 
 def _new_consumer_phone():
-    return f"+9199{str(uuid4().int)[-9:]}"
+    return f"+919{str(uuid4().int)[-9:]}"  # 10-digit Indian mobile (+91 9XXXXXXXXX)
 
 
 def _seed_paid_booking_or_order_only(*, pay=False):

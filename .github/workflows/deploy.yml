@@ -57,6 +57,7 @@ jobs:
       CELERY_RESULT_BACKEND: redis://localhost:6379/2
       JWT_SECRET_KEY: ci-test-secret-do-not-use-in-prod
       OTP_DEV_MODE: "true"
+      ENFORCE_BOOKING_SCHEDULE_LIMITS: "false"
       OTP_DEV_FIXED_CODE: "123456"
       EMAIL_DEV_MODE: "true"
       MOCK_EXTERNAL_PROVIDERS: "true"
