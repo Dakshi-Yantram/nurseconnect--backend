@@ -34,7 +34,7 @@ OTP = "123456"
 # ----------------------------- helpers -----------------------------
 def _unique_phone() -> str:
     """Fresh consumer phone per scenario to avoid stale-state collisions."""
-    return f"+9199{str(uuid4().int)[-9:]}"
+    return f"+919{str(uuid4().int)[-9:]}"  # 10-digit Indian mobile (+91 9XXXXXXXXX)
 
 
 def _login(phone: str, role: str) -> tuple[str, str]:
