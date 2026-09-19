@@ -824,6 +824,9 @@ async def get_safety_checklist_status(
     current: CurrentUser = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
+    # SECURITY: was readable by any authenticated user.
+    from app.security.access_control import assert_can_view_booking_records
+    await assert_can_view_booking_records(db, current, booking_id)
     booking, visit = await _get_booking_and_visit(db, booking_id)
     return await _safety_checklist_status(booking, visit)
 
@@ -1146,6 +1149,9 @@ async def get_invoice(
     db: AsyncSession = Depends(get_db),
 ):
     from app.models.models import Invoice
+    # SECURITY: was readable by any authenticated user.
+    from app.security.access_control import assert_can_view_booking_records
+    await assert_can_view_booking_records(db, current, booking_id)
     ires = await db.execute(select(Invoice).where(Invoice.booking_id == booking_id))
     invoice = ires.scalar_one_or_none()
     if not invoice:

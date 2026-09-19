@@ -15,7 +15,7 @@ from typing import List, Optional
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -31,7 +31,8 @@ _PACKAGE_TERMINAL = (PackageBookingStatus.completed, PackageBookingStatus.cancel
 
 
 class MessageSendRequest(BaseModel):
-    body: str
+    # Edge case: unbounded message bodies. 4000 chars is plenty for chat.
+    body: str = Field(min_length=1, max_length=4000)
 
 
 def _serialize_message(m: Message, sender_name: str) -> dict:

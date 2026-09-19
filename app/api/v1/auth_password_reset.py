@@ -15,11 +15,12 @@ from __future__ import annotations
 
 import logging
 
+import hmac
 import secrets
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, EmailStr
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
@@ -27,7 +28,7 @@ from app.core.rate_limit import client_ip, enforce_rate_limit
 from app.core.redis_client import redis_client
 from app.core.security import hash_password
 from app.integrations import msg91_client
-from app.models.models import User
+from app.models.models import User, UserSession
 
 router = APIRouter(tags=["auth"])
 
@@ -94,9 +95,11 @@ async def forgot_password(payload: ForgotPasswordRequest, request: Request, db: 
 
 
 @router.post("/auth/reset-password")
-async def reset_password(payload: ResetPasswordRequest, db: AsyncSession = Depends(get_db)):
-    if len(payload.new_password) < 8:
-        raise HTTPException(status_code=400, detail="Password must be at least 8 characters")
+async def reset_password(payload: ResetPasswordRequest, request: Request, db: AsyncSession = Depends(get_db)):
+    await enforce_rate_limit("pwreset_verify:ip", client_ip(request), 20, 15 * 60)
+    # Same password policy as sign-up (was only "8+ characters" here).
+    from app.api.v1.auth import _validate_password
+    _validate_password(payload.new_password)
 
     res = await db.execute(select(User).where(User.email == payload.email.lower()))
     user = res.scalar_one_or_none()
@@ -114,12 +117,17 @@ async def reset_password(payload: ResetPasswordRequest, db: AsyncSession = Depen
         raise HTTPException(status_code=400, detail="Code expired. Request a new one.")
 
     stored_code = stored.decode() if isinstance(stored, (bytes, bytearray)) else str(stored)
-    if payload.code.strip() != stored_code:
+    if not hmac.compare_digest(payload.code.strip().encode(), stored_code.encode()):
         await redis_client.setex(_attempts_key(user.id), _RESET_TTL_SECONDS, attempts + 1)
         raise HTTPException(status_code=400, detail="Invalid code")
 
     # Success — set the new password and clear the code.
     user.password_hash = hash_password(payload.new_password)
+    # Sign out every existing session: whoever had the old password (or a
+    # stolen token) must not stay logged in after a reset.
+    await db.execute(
+        update(UserSession).where(UserSession.user_id == user.id, UserSession.revoked.is_(False)).values(revoked=True)
+    )
     await db.commit()
     await redis_client.delete(_code_key(user.id))
     await redis_client.delete(_attempts_key(user.id))

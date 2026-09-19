@@ -17,3 +17,12 @@ venv/
 * 2
 *.local-bak
 test-env.ps1
+
+# SECURITY: never commit real environment files or secrets
+.env.*
+!.env.example
+*.env
+test-env.ps1
+*.pem
+*.p8
+service-account*.json

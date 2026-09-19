@@ -53,6 +53,7 @@ CLIENT_EVENTS = {
     "print_dialog",     # beforeprint fired (menu print / print-to-PDF)
     "copy_attempt",     # copy / cut / context-menu inside the section
     "screenshot_key",   # PrintScreen key seen (capture itself can't be stopped)
+    "screenshot_taken", # mobile: OS reported a screenshot (iOS; Android 14+)
 }
 
 _USED_JTI_PREFIX = "report_dl_used"

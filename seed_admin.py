@@ -8,7 +8,7 @@ USAGE (from the backend/ folder, same place you run run_seed.py):
 
 This creates ONE admin account:
     email:    admin@nurseconnect.in
-    password: Admin@1234
+    password: <from $ADMIN_PASSWORD or prompt>
     role:     admin
     status:   active (no email verification needed — created pre-verified)
 
@@ -26,8 +26,21 @@ from app.models.enums import UserRole, UserStatus
 from sqlalchemy import select
 
 
+def _prompt_password(env_var: str) -> str:
+    """Read the password from the environment or prompt for it. Never
+    hard-code credentials in the repo, and never print them."""
+    import getpass
+    import os
+    import re as _re
+    pw = os.environ.get(env_var) or getpass.getpass(f"New password ({env_var}): ")
+    if (len(pw) < 12 or not _re.search(r"[A-Z]", pw) or not _re.search(r"[a-z]", pw)
+            or not _re.search(r"\d", pw)):
+        raise SystemExit("Password must be 12+ chars with upper, lower and a digit.")
+    return pw
+
+
 ADMIN_EMAIL = "admin@nurseconnect.in"
-ADMIN_PASSWORD = "Admin@1234"
+ADMIN_PASSWORD = None  # set at runtime from $ADMIN_PASSWORD or an interactive prompt
 ADMIN_PHONE = "+919999000008"
 ADMIN_FULL_NAME = "Test Admin"
 ADMIN_ROLE = UserRole.admin
@@ -63,7 +76,7 @@ async def main():
                 full_name=ADMIN_FULL_NAME,
                 role=ADMIN_ROLE,
                 status=UserStatus.active,
-                password_hash=hash_password(ADMIN_PASSWORD),
+                password_hash=hash_password(_prompt_password("ADMIN_PASSWORD")),
                 email_verified_at=datetime.now(timezone.utc),
             )
             session.add(user)
@@ -73,7 +86,7 @@ async def main():
     print("\n" + "=" * 50)
     print("Done. You can now log in via POST /api/auth/login with:")
     print(f"  email:    {ADMIN_EMAIL}")
-    print(f"  password: {ADMIN_PASSWORD}")
+    print("  password: (the one you supplied)")
 
     await engine.dispose()
 

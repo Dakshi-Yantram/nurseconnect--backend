@@ -142,13 +142,14 @@ class PhoneLoginRequest(BaseModel):
     """Passwordless phone login/register used by the mobile app (intapp).
 
     Distinct from PasswordLoginRequest — the mobile app has no password
-    field and authenticates purely off phone number + role. If no account
-    exists yet for this phone+role, one is created (and activated)
-    immediately, same as `loginDirect` on the client expects.
+    field. SECURITY: `code` (the OTP from POST /auth/otp/send) is now
+    REQUIRED; the endpoint rejects requests without a valid, unused OTP.
+    If no account exists yet for this phone, one is created after the OTP
+    is verified.
     """
-    phone_e164: str
-    full_name: Optional[str] = None
-    code: Optional[str] = None  # reserved for a future real OTP step; unused for now
+    phone_e164: str = Field(min_length=8, max_length=20)
+    full_name: Optional[str] = Field(default=None, max_length=255)
+    code: Optional[str] = Field(default=None, max_length=8)  # required at runtime; Optional only to return a friendly 400
     role: UserRole = UserRole.consumer
     device_id: Optional[str] = None
     device_platform: Optional[str] = None
@@ -188,8 +189,8 @@ class ConsumerProfileUpdate(BaseModel):
     city: Optional[str] = None
     state: Optional[str] = None
     pincode: Optional[str] = None
-    latitude: Optional[Decimal] = None
-    longitude: Optional[Decimal] = None
+    latitude: Optional[Decimal] = Field(default=None, ge=-90, le=90)
+    longitude: Optional[Decimal] = Field(default=None, ge=-180, le=180)
     emergency_contact_name: Optional[str] = None
     emergency_contact_phone: Optional[str] = None
 
@@ -273,8 +274,8 @@ class WorkerProfileUpdate(BaseModel):
     qualification_name: Optional[str] = None
     base_city: Optional[str] = None
     service_radius_km: Optional[int] = None
-    home_latitude: Optional[Decimal] = None
-    home_longitude: Optional[Decimal] = None
+    home_latitude: Optional[Decimal] = Field(default=None, ge=-90, le=90)
+    home_longitude: Optional[Decimal] = Field(default=None, ge=-180, le=180)
 
 
 class WorkerProfileOut(ORMModel):
@@ -436,12 +437,12 @@ class CarePackageOut(ORMModel):
 
 # ----- BOOKINGS -----
 class AddressSnapshot(BaseModel):
-    line1: str
-    line2: Optional[str] = None
-    city: str
-    state: str
-    pincode: str
-    landmark: Optional[str] = None
+    line1: str = Field(min_length=1, max_length=255)
+    line2: Optional[str] = Field(default=None, max_length=255)
+    city: str = Field(min_length=1, max_length=100)
+    state: str = Field(min_length=1, max_length=100)
+    pincode: str = Field(pattern=r"^\d{6}$")
+    landmark: Optional[str] = Field(default=None, max_length=255)
 
 
 class BookingCreate(BaseModel):
@@ -455,9 +456,9 @@ class BookingCreate(BaseModel):
     # Either reference a saved address (preferred) OR pass inline address+coords.
     address_id: Optional[UUID] = None
     address: Optional[AddressSnapshot] = None
-    latitude: Optional[Decimal] = None
-    longitude: Optional[Decimal] = None
-    special_instructions: Optional[str] = None
+    latitude: Optional[Decimal] = Field(default=None, ge=-90, le=90)
+    longitude: Optional[Decimal] = Field(default=None, ge=-180, le=180)
+    special_instructions: Optional[str] = Field(default=None, max_length=2000)
     # Accepted for API compatibility but intentionally NOT used to assign the
     # booking — see the note in bookings.create_booking. Dispatch is always by
     # radius wave plus an explicit worker claim.
@@ -469,8 +470,8 @@ class BookingAddressUpdate(BaseModel):
     # before a booking is confirmed/dispatched.
     address_id: Optional[UUID] = None
     address: Optional[AddressSnapshot] = None
-    latitude: Optional[Decimal] = None
-    longitude: Optional[Decimal] = None
+    latitude: Optional[Decimal] = Field(default=None, ge=-90, le=90)
+    longitude: Optional[Decimal] = Field(default=None, ge=-180, le=180)
 
 
 class BookingOut(ORMModel):
@@ -761,7 +762,7 @@ class CompositeBookingCreate(BaseModel):
     address_snapshot: Dict[str, Any]
     latitude: Decimal
     longitude: Decimal
-    special_instructions: Optional[str] = None
+    special_instructions: Optional[str] = Field(default=None, max_length=2000)
     # Either pass an already-hosted URL+public_id, OR pass
     # prescription_base64 (data: URI or raw base64) and the endpoint will
     # upload it to Cloudinary itself.
@@ -792,7 +793,7 @@ class ServiceOnlyBookingCreate(BaseModel):
     address_snapshot: Dict[str, Any]
     latitude: Decimal
     longitude: Decimal
-    special_instructions: Optional[str] = None
+    special_instructions: Optional[str] = Field(default=None, max_length=2000)
     prescription_cloudinary_url: Optional[str] = None
     prescription_cloudinary_public_id: Optional[str] = None
     prescription_base64: Optional[str] = None

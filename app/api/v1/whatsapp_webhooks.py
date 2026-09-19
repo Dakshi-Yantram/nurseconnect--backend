@@ -15,6 +15,7 @@ came from Interakt and not a spoofed request.
 """
 from __future__ import annotations
 
+import hmac
 import logging
 from typing import Any, Dict, Optional
 
@@ -69,9 +70,15 @@ async def interakt_webhook(
     db: AsyncSession = Depends(get_db),
     x_webhook_secret: Optional[str] = Header(None, alias="X-Webhook-Secret"),
 ) -> Dict[str, Any]:
-    # Verify the call actually came from Interakt. Skipped only if no secret
-    # has been configured yet (dev / not-yet-onboarded environments).
-    if settings.INTERAKT_WEBHOOK_SECRET and x_webhook_secret != settings.INTERAKT_WEBHOOK_SECRET:
+    # Verify the call actually came from Interakt. SECURITY: this used to be
+    # skipped whenever the secret was unset, letting anyone forge delivery
+    # statuses. Now: fail closed in production; constant-time comparison.
+    expected = settings.INTERAKT_WEBHOOK_SECRET
+    if not expected:
+        if settings.is_production:
+            logger.error("INTERAKT_WEBHOOK_SECRET not configured — rejecting webhook")
+            raise HTTPException(status_code=401, detail="Invalid webhook secret")
+    elif not x_webhook_secret or not hmac.compare_digest(x_webhook_secret.encode(), expected.encode()):
         raise HTTPException(status_code=401, detail="Invalid webhook secret")
 
     try:

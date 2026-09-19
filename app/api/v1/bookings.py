@@ -103,6 +103,38 @@ async def _resolve_service_address(
     return resolved_snapshot, resolved_lat, resolved_lng
 
 
+_IST = timezone(timedelta(hours=5, minutes=30))
+_MAX_ADVANCE_DAYS = 365
+
+
+def _validate_schedule(scheduled_date, scheduled_start_time) -> None:
+    """Edge case: bookings in the past (or absurdly far ahead) were accepted.
+
+    Compared in IST because that's what the patient picked on screen; the
+    server clock is UTC, so a naive date.today() is wrong for 5.5h a day.
+    """
+    now_ist = datetime.now(_IST)
+    today = now_ist.date()
+    if scheduled_date < today:
+        raise HTTPException(
+            status_code=422,
+            detail={"code": "SCHEDULE_IN_PAST", "message": "Please choose today or a future date."},
+        )
+    if scheduled_date == today and scheduled_start_time is not None:
+        start = datetime.combine(scheduled_date, scheduled_start_time).replace(tzinfo=_IST)
+        # 5-minute grace for clock skew / slow form submission.
+        if start < now_ist - timedelta(minutes=5):
+            raise HTTPException(
+                status_code=422,
+                detail={"code": "SCHEDULE_IN_PAST", "message": "That time has already passed. Please pick a later slot."},
+            )
+    if scheduled_date > today + timedelta(days=_MAX_ADVANCE_DAYS):
+        raise HTTPException(
+            status_code=422,
+            detail={"code": "SCHEDULE_TOO_FAR", "message": f"Bookings can be made up to {_MAX_ADVANCE_DAYS} days in advance."},
+        )
+
+
 @router.post("/", response_model=BookingOut)
 async def create_booking(
     payload: BookingCreate,
@@ -111,6 +143,7 @@ async def create_booking(
 ):
     if not payload.service_id and not payload.package_id:
         raise HTTPException(status_code=400, detail="Either service_id or package_id required")
+    _validate_schedule(payload.scheduled_date, payload.scheduled_start_time)
 
     # Verify patient belongs to consumer
     pres = await db.execute(select(Patient).where(Patient.id == payload.patient_id, Patient.consumer_id == profile.id))

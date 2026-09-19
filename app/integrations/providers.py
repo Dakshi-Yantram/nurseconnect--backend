@@ -30,7 +30,16 @@ class ExternalProviderError(RuntimeError):
 # ============================================================================
 class RazorpayClient:
     def __init__(self) -> None:
-        self.mock = settings.MOCK_EXTERNAL_PROVIDERS or not settings.RAZORPAY_KEY_ID or settings.RAZORPAY_KEY_ID.endswith("_placeholder")
+        # SECURITY: mock mode accepts any payment signature and unsigned
+        # webhooks. It used to switch on silently whenever RAZORPAY_KEY_ID was
+        # missing. It can now never be on in production (missing keys there
+        # fail closed instead, and the app refuses to boot — see
+        # Settings.fatal_config_errors).
+        self.mock = (not settings.is_production) and (
+            settings.MOCK_EXTERNAL_PROVIDERS
+            or not settings.RAZORPAY_KEY_ID
+            or settings.RAZORPAY_KEY_ID.endswith("_placeholder")
+        )
         self.key_id = settings.RAZORPAY_KEY_ID
         self.key_secret = settings.RAZORPAY_KEY_SECRET
         self.webhook_secret = settings.RAZORPAY_WEBHOOK_SECRET
@@ -89,8 +98,8 @@ class RazorpayClient:
             logger.error("RAZORPAY_KEY_SECRET is not configured — cannot verify signatures")
             return False
         if self.mock:
-            # Accept any signature in dev for ease of testing
-            return signature.startswith("mock_") or signature == "mock_signature" or len(signature) >= 32
+            # Dev/test only (never production): accept explicit mock signatures.
+            return signature.startswith("mock_") or signature == "mock_signature"
         msg = f"{order_id}|{payment_id}".encode()
         expected = hmac.new(self.key_secret.encode(), msg, hashlib.sha256).hexdigest()
         return hmac.compare_digest(expected, signature)
@@ -98,6 +107,10 @@ class RazorpayClient:
     def verify_webhook_signature(self, body: bytes, signature: str) -> bool:
         if self.mock:
             return True
+        # Fail closed: an empty secret would make the HMAC computable by anyone.
+        if not self.webhook_secret or not signature:
+            logger.error("RAZORPAY_WEBHOOK_SECRET not configured or signature missing — rejecting webhook")
+            return False
         expected = hmac.new(self.webhook_secret.encode(), body, hashlib.sha256).hexdigest()
         return hmac.compare_digest(expected, signature)
 
@@ -977,7 +990,8 @@ class DigioClient:
         self.webhook_secret = settings.DIGIO_WEBHOOK_SECRET
         self.base_url = (settings.DIGIO_BASE_URL or "https://api.digio.in").rstrip("/")
         self.redirect_url = settings.DIGIO_REDIRECT_URL
-        self.mock = (
+        # Never mock e-sign verification in production (see RazorpayClient).
+        self.mock = (not settings.is_production) and (
             settings.MOCK_EXTERNAL_PROVIDERS
             or not self.client_id
             or not self.client_secret

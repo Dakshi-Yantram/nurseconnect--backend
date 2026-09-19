@@ -51,6 +51,9 @@ NEARBY_WORKER_LNG = 72.8235
 
 
 def _login(phone: str, role: str) -> dict:
+    # /auth/phone-login now requires a real OTP: request one first (in
+    # OTP_DEV_MODE the code is the fixed OTP_DEV_FIXED_CODE, "123456").
+    requests.post(f"{API}/auth/otp/send", json={"phone_e164": phone, "role": role}, timeout=15)
     # NOTE: /auth/login is email+password only (see app/api/v1/auth.py).
     # Phone-number login for the mobile-app contract is /auth/phone-login.
     r = requests.post(f"{API}/auth/phone-login", json={"phone_e164": phone, "code": "123456", "role": role}, timeout=15)

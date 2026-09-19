@@ -9,7 +9,7 @@ USAGE (from the backend/ folder):
 
 Creates ONE reviewer account:
     email:    reviewer@nurseconnect.in
-    password: Reviewer@1234
+    password: <from $REVIEWER_PASSWORD or prompt>
     role:     reviewer
     + a ReviewerProfile row (active, can_review_nurse_documents=True)
 """
@@ -22,8 +22,21 @@ from app.models.models import User, ReviewerProfile
 from app.models.enums import UserRole, UserStatus
 from sqlalchemy import select
 
+def _prompt_password(env_var: str) -> str:
+    """Read the password from the environment or prompt for it. Never
+    hard-code credentials in the repo, and never print them."""
+    import getpass
+    import os
+    import re as _re
+    pw = os.environ.get(env_var) or getpass.getpass(f"New password ({env_var}): ")
+    if (len(pw) < 12 or not _re.search(r"[A-Z]", pw) or not _re.search(r"[a-z]", pw)
+            or not _re.search(r"\d", pw)):
+        raise SystemExit("Password must be 12+ chars with upper, lower and a digit.")
+    return pw
+
+
 REVIEWER_EMAIL = "reviewer@nurseconnect.in"
-REVIEWER_PASSWORD = "Reviewer@1234"
+REVIEWER_PASSWORD = None  # set at runtime from $REVIEWER_PASSWORD or an interactive prompt
 REVIEWER_PHONE = "+919999000009"
 REVIEWER_FULL_NAME = "Test Reviewer"
 
@@ -40,7 +53,7 @@ async def main():
                 full_name=REVIEWER_FULL_NAME,
                 role=UserRole.reviewer,
                 status=UserStatus.active,
-                password_hash=hash_password(REVIEWER_PASSWORD),
+                password_hash=hash_password(_prompt_password("REVIEWER_PASSWORD")),
                 email_verified_at=datetime.now(timezone.utc),
             )
             session.add(user)
@@ -78,7 +91,7 @@ async def main():
 
     print("\nDone. Log in via POST /api/auth/login with:")
     print(f"  email:    {REVIEWER_EMAIL}")
-    print(f"  password: {REVIEWER_PASSWORD}")
+    print("  password: (the one you supplied)")
     await engine.dispose()
 
 

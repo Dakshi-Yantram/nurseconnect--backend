@@ -43,14 +43,32 @@ def _throttling_disabled() -> bool:
 
 
 def client_ip(request: Request) -> str:
-    """Best-effort client IP, honouring the proxy chain (CloudFront/ELB set
-    X-Forwarded-For; the first entry is the original client)."""
+    """Client IP for rate limiting, resistant to X-Forwarded-For spoofing.
+
+    SECURITY: this used to take the FIRST X-Forwarded-For entry, which is
+    whatever the client typed — so every request could claim a new IP and
+    all per-IP limits were bypassable. Each trusted proxy APPENDS the address
+    it received the connection from, so the real client is the entry
+    TRUSTED_PROXY_HOPS positions from the right.
+
+    TRUSTED_PROXY_HOPS = number of proxies in front of the app that append to
+    X-Forwarded-For (CloudFront -> app: 1; CloudFront -> ALB -> app: 2;
+    app exposed directly: 0).
+    """
+    hops = max(0, int(getattr(settings, "TRUSTED_PROXY_HOPS", 1) or 0))
+    direct = request.client.host if request.client else "unknown"
+    if hops == 0:
+        return direct
     fwd = request.headers.get("x-forwarded-for")
-    if fwd:
-        first = fwd.split(",")[0].strip()
-        if first:
-            return first
-    return request.client.host if request.client else "unknown"
+    if not fwd:
+        return direct
+    parts = [p.strip() for p in fwd.split(",") if p.strip()]
+    if not parts:
+        return direct
+    # With N trusted hops, the right-most N-1 entries were added by our own
+    # proxies; the one before them is the client as seen by the outermost.
+    idx = len(parts) - hops
+    return parts[idx] if idx >= 0 else parts[0]
 
 
 def _key(scope: str, identifier: str) -> str:

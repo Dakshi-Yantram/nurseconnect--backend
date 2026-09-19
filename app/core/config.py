@@ -1,6 +1,6 @@
 ﻿"""Application configuration."""
 from functools import lru_cache
-from typing import List
+from typing import List, Optional
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -253,13 +253,169 @@ class Settings(BaseSettings):
     MOCK_EXTERNAL_PROVIDERS: bool = True
 
     # CORS
+    # Comma-separated exact origins, e.g.
+    #   CORS_ORIGINS=https://app.nurseconnect.in,https://nurseconnect-web.<acct>.workers.dev
+    # "*" is only honoured outside production (see cors_origin_list).
     CORS_ORIGINS: str = "*"
+    # Optional regex for additional origins. Empty by default. Previously the
+    # app hard-coded r"https://.*\.workers\.dev" — i.e. ANY site anyone
+    # deploys on Cloudflare Workers — with allow_credentials=True.
+    CORS_ORIGIN_REGEX: str = ""
+
+    # Number of reverse proxies in front of the app that append to
+    # X-Forwarded-For (CloudFront -> app = 1). See app/core/rate_limit.client_ip.
+    TRUSTED_PROXY_HOPS: int = 1
+
+    # Run app.seed on every boot. Defaults to on outside production only.
+    # Set RUN_SEED_ON_STARTUP=true in production if you still rely on it to
+    # create tables / reference data.
+    RUN_SEED_ON_STARTUP: Optional[bool] = None
+
+    # Clinical documentation uploads
+    MAX_UPLOAD_MB: int = 10
 
     @property
     def cors_origin_list(self) -> List[str]:
-        if self.CORS_ORIGINS == "*":
-            return ["*"]
-        return [o.strip() for o in self.CORS_ORIGINS.split(",") if o.strip()]
+        origins = [o.strip() for o in self.CORS_ORIGINS.split(",") if o.strip()]
+        if "*" in origins:
+            # A wildcard is never acceptable in production.
+            return [] if self.is_production else ["*"]
+        return origins
+
+    @property
+    def cors_origin_regex(self) -> Optional[str]:
+        if self.CORS_ORIGIN_REGEX.strip():
+            return self.CORS_ORIGIN_REGEX.strip()
+        return None if self.is_production else r"http://localhost(:\d+)?|http://127\.0\.0\.1(:\d+)?"
+
+    @property
+    def run_seed_on_startup(self) -> bool:
+        if self.RUN_SEED_ON_STARTUP is not None:
+            return bool(self.RUN_SEED_ON_STARTUP)
+        return not self.is_production
+
+    def fatal_config_errors(self) -> List[str]:
+        """Misconfigurations that make production UNSAFE. The app refuses to
+        boot if any are present (startup_warnings() only logs)."""
+        errors: List[str] = []
+        if not self.is_production:
+            return errors
+        if self.MOCK_EXTERNAL_PROVIDERS:
+            errors.append(
+                "MOCK_EXTERNAL_PROVIDERS is true in production: payment signatures and "
+                "webhooks would be accepted without verification. Set MOCK_EXTERNAL_PROVIDERS=false."
+            )
+        if not self.JWT_SECRET_KEY or len(self.JWT_SECRET_KEY) < 32:
+            errors.append("JWT_SECRET_KEY is missing or shorter than 32 characters.")
+        if not (self.RAZORPAY_KEY_ID and self.RAZORPAY_KEY_SECRET and self.RAZORPAY_WEBHOOK_SECRET):
+            errors.append(
+                "RAZORPAY_KEY_ID / RAZORPAY_KEY_SECRET / RAZORPAY_WEBHOOK_SECRET must all be set in production."
+            )
+        if not self.cors_origin_list and not self.CORS_ORIGIN_REGEX.strip():
+            errors.append(
+                "CORS_ORIGINS must list the frontend origin(s) explicitly in production (wildcard is not allowed)."
+            )
+        return errors
+
+    # -----------------------------------------------------------------
+    # Environment
+    #
+    # OTP_DEV_MODE and EMAIL_DEV_MODE both default to True, and both were
+    # previously independent of APP_ENV. That is why the live site showed
+    # "Dev mode code: 654321" next to a real customer's email address and
+    # no mail was ever sent: the deployment simply never set them to False,
+    # and nothing forced the issue.
+    #
+    # Dev mode is now a property of the environment, not a standalone flag.
+    # It can only be on in development, so a missing env var can no longer
+    # downgrade production auth to a fixed, publicly-visible code.
+    # -----------------------------------------------------------------
+    _PRODUCTION_ENVS = {"production", "prod", "staging", "stage", "uat"}
+
+    @property
+    def is_production(self) -> bool:
+        return self.APP_ENV.strip().lower() in self._PRODUCTION_ENVS
+
+    @property
+    def otp_dev_mode(self) -> bool:
+        """Fixed OTP + code echoed in the API response. Never in production."""
+        return bool(self.OTP_DEV_MODE) and not self.is_production
+
+    @property
+    def email_dev_mode(self) -> bool:
+        """Fixed email code + no mail dispatched. Never in production."""
+        return bool(self.EMAIL_DEV_MODE) and not self.is_production
+
+    @property
+    def email_delivery_configured(self) -> bool:
+        return bool(self.RESEND_API_KEY and self.EMAIL_FROM_ADDRESS)
+
+    def startup_warnings(self) -> List[str]:
+        """Misconfigurations that silently break user-facing flows.
+
+        Surfaced at boot (see app/main.py) so they are caught on deploy
+        rather than by a customer who never receives a verification code.
+        """
+        problems: List[str] = []
+        if self.is_production:
+            if self.OTP_DEV_MODE:
+                problems.append(
+                    "OTP_DEV_MODE is set in a production environment — ignoring it. "
+                    "Remove it from the environment."
+                )
+            if self.EMAIL_DEV_MODE:
+                problems.append(
+                    "EMAIL_DEV_MODE is set in a production environment — ignoring it. "
+                    "Remove it from the environment."
+                )
+            if not self.email_delivery_configured:
+                problems.append(
+                    "RESEND_API_KEY/EMAIL_FROM_ADDRESS are not set — verification "
+                    "emails cannot be delivered."
+                )
+            if not (self.RAZORPAY_KEY_ID and self.RAZORPAY_KEY_SECRET):
+                problems.append(
+                    "RAZORPAY_KEY_ID/RAZORPAY_KEY_SECRET are not both set — payment "
+                    "signature verification will reject every payment."
+                )
+            if not self.RAZORPAY_WEBHOOK_SECRET:
+                problems.append(
+                    "RAZORPAY_WEBHOOK_SECRET is not set — Razorpay webhooks will be "
+                    "rejected, so payments captured out-of-band will not settle."
+                )
+            if not (self.DIGIO_CLIENT_ID and self.DIGIO_CLIENT_SECRET):
+                problems.append(
+                    "DIGIO_CLIENT_ID/DIGIO_CLIENT_SECRET are not both set — Stage 2 "
+                    "e-Stamp agreements cannot be sent for signing."
+                )
+            if not self.DIGIO_WEBHOOK_SECRET:
+                problems.append(
+                    "DIGIO_WEBHOOK_SECRET is not set — Digio's signing-completion "
+                    "webhook will be rejected, so Stage 2 agreements will never "
+                    "finalize automatically."
+                )
+            if self.MOCK_EXTERNAL_PROVIDERS:
+                problems.append(
+                    "MOCK_EXTERNAL_PROVIDERS is on in a production environment — "
+                    "payments are being faked and SMS OTPs will be reported as "
+                    "FAILED (never silently 'sent')."
+                )
+            if not (self.MSG91_AUTH_KEY and self.MSG91_TEMPLATE_ID):
+                problems.append(
+                    "MSG91_AUTH_KEY/MSG91_TEMPLATE_ID are not both set — OTP SMS "
+                    "cannot be delivered."
+                )
+            if self.APP_DEBUG:
+                problems.append(
+                    "APP_DEBUG is on in a production environment — ignoring it "
+                    "(tracebacks are never returned to clients in production)."
+                )
+            if not self.PUBLIC_API_URL:
+                problems.append(
+                    "PUBLIC_API_URL is not set — visit-report download links for "
+                    "the mobile apps will be derived from proxy headers."
+                )
+        return problems
 
     # -----------------------------------------------------------------
     # Environment
