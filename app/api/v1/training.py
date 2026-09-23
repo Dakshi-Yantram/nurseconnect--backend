@@ -362,6 +362,33 @@ async def list_modules(
     return out
 
 
+def _serialize_module_question(q: Dict[str, Any], i: int) -> Dict[str, Any]:
+    """Question payload for the adaptive MCQ flow (includes answer keys so the
+    UI can show instant feedback). Answer key depends on question type:
+      - single_select: correct_index
+      - multi_select:  correct_indices
+      - boolean:       correct_bool (also mapped to correct_index: 0=True, 1=False)
+    """
+    qtype = q.get("type", "single_select")
+    correct_index = q.get("correct_index")
+    if qtype == "boolean":
+        options = q.get("options") or ["True", "False"]
+        correct_index = 0 if q.get("correct_bool") else 1
+    else:
+        options = q.get("options", [])
+    return {
+        "id": q.get("id", str(i)),
+        "question": q.get("question"),
+        "options": options,
+        "type": qtype,
+        "correct_index": correct_index,
+        "correct_indices": q.get("correct_indices") or [],
+        "correct_bool": q.get("correct_bool"),
+        "explanation": q.get("explanation", ""),
+        "difficulty": q.get("difficulty", 2),
+    }
+
+
 @router.get("/modules/{module_id}")
 async def get_module(module_id: UUID, db: AsyncSession = Depends(get_db), _=Depends(get_worker_profile)):
     res = await db.execute(
@@ -384,18 +411,7 @@ async def get_module(module_id: UUID, db: AsyncSession = Depends(get_db), _=Depe
         "pass_percent": m.pass_percent,
         # Include full question data for adaptive MCQ; correct_index and explanation
         # are needed for immediate per-question feedback in the adaptive flow.
-        "assessment": [
-            {
-                "id": q.get("id", str(i)),
-                "question": q.get("question"),
-                "options": q.get("options", []),
-                "correct_index": q.get("correct_index"),
-                "explanation": q.get("explanation", ""),
-                "difficulty": q.get("difficulty", 2),
-                "type": q.get("type", "single_select"),
-            }
-            for i, q in enumerate(m.assessment or [])
-        ],
+        "assessment": [_serialize_module_question(q, i) for i, q in enumerate(m.assessment or [])],
     }
 
 
