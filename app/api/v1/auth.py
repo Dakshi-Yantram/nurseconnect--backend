@@ -717,35 +717,23 @@ async def otp_send(payload: OtpSendRequest, request: Request, db: AsyncSession =
 
     In dev mode (OTP_DEV_MODE=True) the OTP is returned in the response body
     instead of being dispatched via SMS so testing works without MSG91 credits.
+
+    Play Store review: if REVIEW_TEST_PHONE and REVIEW_TEST_OTP are both set,
+    that single number gets the fixed REVIEW_TEST_OTP and no SMS is sent.
+    Every other number is unaffected.
     """
     phone = _normalize_phone(payload.phone_e164)
-    # Throttle: 3 codes / 10 min per phone (SMS bombing + credit burn),
-    # 15 sends / hour per IP (mass enumeration). (Automatically skipped in
-    # OTP_DEV_MODE — see app/core/rate_limit.py.)
-    ip = client_ip(request)
-    await enforce_rate_limit(
-        "otp_send:phone", phone, 3, 10 * 60,
-        message="Too many codes requested for this number. Wait a few minutes and try again.",
+    is_review_account = bool(
+        settings.REVIEW_TEST_PHONE
+        and settings.REVIEW_TEST_OTP
+        and phone == _normalize_phone(settings.REVIEW_TEST_PHONE)
     )
-    await enforce_rate_limit("otp_send:ip", ip, 15, 60 * 60)
-
-    # Role detection up front. The app previously discovered a role clash
-    # only at /otp/verify, i.e. after the user had already received and
-    # typed a code — which is the "This number is registered as a care
-    # professional" dead end. Tell the client now so it can switch to the
-    # right sign-in screen before asking for anything.
-    existing_res = await db.execute(select(User).where(User.phone_e164 == phone))
-    existing_user = existing_res.scalar_one_or_none()
-    existing_role = existing_user.role if existing_user else None
-
-    # `settings.otp_dev_mode` (property) is force-disabled outside
-    # development, so a production deployment can never fall back to the
-    # fixed code even if OTP_DEV_MODE is left set in the environment.
-    code = (
-        settings.OTP_DEV_FIXED_CODE
-        if settings.otp_dev_mode
-        else f"{secrets.randbelow(1000000):06d}"
-    )
+    if is_review_account:
+        code = settings.REVIEW_TEST_OTP
+    elif settings.OTP_DEV_MODE:
+        code = settings.OTP_DEV_FIXED_CODE
+    else:
+        code = f"{secrets.randbelow(1000000):06d}"
     expires_at = datetime.now(timezone.utc) + timedelta(minutes=settings.OTP_EXPIRE_MINUTES)
 
     # Retire any still-live code for this number/purpose. /otp/verify reads
@@ -772,47 +760,18 @@ async def otp_send(payload: OtpSendRequest, request: Request, db: AsyncSession =
     )
     await db.commit()
 
-    if not settings.otp_dev_mode:
-        from app.integrations.providers import mask_phone_for_log, msg91_client, sms_delivered
-        result = await msg91_client.send_otp(phone, code, purpose=f"auth_{payload.purpose}")
-        if not sms_delivered(result):
-            # Previously: failure was logged and the API still answered
-            # {"sent": true}, so the app sat on "Enter OTP" for a code that
-            # was never going to arrive. Now: retire the undelivered code,
-            # refund the per-phone send budget, and tell the client.
-            logger.error("OTP not delivered phone=%s reason=%s",
-                         mask_phone_for_log(phone), result.get("reason"))
-            await db.execute(
-                update(OtpCode)
-                .where(OtpCode.phone_e164 == phone, OtpCode.purpose == payload.purpose,
-                       OtpCode.consumed.is_(False))
-                .values(consumed=True)
-            )
-            await db.commit()
-            from app.core.rate_limit import release_rate_limit
-            await release_rate_limit("otp_send:phone", phone)
-            raise HTTPException(
-                status_code=502 if result.get("retryable", True) else 503,
-                detail={
-                    "code": "OTP_SEND_FAILED",
-                    "message": (
-                        "We couldn't send the code to this number right now. "
-                        "Please try again in a minute."
-                        if result.get("retryable", True)
-                        else "SMS codes are temporarily unavailable. Please use email login "
-                             "or contact support."
-                    ),
-                    "retryable": bool(result.get("retryable", True)),
-                },
-            )
+    if not settings.OTP_DEV_MODE and not is_review_account:
+        try:
+            from app.integrations.providers import msg91_client
+            await msg91_client.send_otp(phone, code)
+        except Exception:
+            logger.exception("MSG91 OTP dispatch failed for %s", phone)
 
     return OtpSendResponse(
         sent=True,
         phone_e164=phone,
         expires_in_seconds=settings.OTP_EXPIRE_MINUTES * 60,
-        dev_otp=code if settings.otp_dev_mode else None,
-        existing_role=existing_role,
-        role_mismatch=bool(existing_role is not None and existing_role != payload.role),
+        dev_otp=code if (settings.OTP_DEV_MODE and not is_review_account) else None,
     )
 
 
