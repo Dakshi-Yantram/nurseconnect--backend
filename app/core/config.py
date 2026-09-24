@@ -1,4 +1,5 @@
-"""Application configuration."""
+﻿"""Application configuration."""
+import logging
 from functools import lru_cache
 from typing import List
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -34,6 +35,12 @@ class Settings(BaseSettings):
     OTP_DEV_MODE: bool = True
     OTP_DEV_FIXED_CODE: str = "123456"
     OTP_EXPIRE_MINUTES: int = 5
+
+    # Play Store reviewer access (family/consumer test number only).
+    # Leave both empty to disable. Set as environment variables on the server;
+    # never commit real values. Use a non-personal test number and a random OTP.
+    REVIEW_TEST_PHONE: str = ""
+    REVIEW_TEST_OTP: str = ""
 
     # Email verification
     EMAIL_VERIFICATION_EXPIRE_MINUTES: int = 15
@@ -102,3 +109,11 @@ def get_settings() -> Settings:
 
 
 settings = get_settings()
+
+# Safety net: dev shortcuts must never be active in production.
+# Warning only for now so a misconfigured deploy still boots; once the
+# production environment variables are confirmed, change this to raise.
+if settings.APP_ENV == "production" and (settings.OTP_DEV_MODE or settings.EMAIL_DEV_MODE):
+    logging.getLogger(__name__).warning(
+        "OTP_DEV_MODE/EMAIL_DEV_MODE is enabled in production. Disable it."
+    )

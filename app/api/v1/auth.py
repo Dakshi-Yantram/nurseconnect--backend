@@ -423,13 +423,23 @@ async def otp_send(payload: OtpSendRequest, db: AsyncSession = Depends(get_db)):
 
     In dev mode (OTP_DEV_MODE=True) the OTP is returned in the response body
     instead of being dispatched via SMS so testing works without MSG91 credits.
+
+    Play Store review: if REVIEW_TEST_PHONE and REVIEW_TEST_OTP are both set,
+    that single number gets the fixed REVIEW_TEST_OTP and no SMS is sent.
+    Every other number is unaffected.
     """
     phone = _normalize_phone(payload.phone_e164)
-    code = (
-        settings.OTP_DEV_FIXED_CODE
-        if settings.OTP_DEV_MODE
-        else f"{secrets.randbelow(1000000):06d}"
+    is_review_account = bool(
+        settings.REVIEW_TEST_PHONE
+        and settings.REVIEW_TEST_OTP
+        and phone == _normalize_phone(settings.REVIEW_TEST_PHONE)
     )
+    if is_review_account:
+        code = settings.REVIEW_TEST_OTP
+    elif settings.OTP_DEV_MODE:
+        code = settings.OTP_DEV_FIXED_CODE
+    else:
+        code = f"{secrets.randbelow(1000000):06d}"
     expires_at = datetime.now(timezone.utc) + timedelta(minutes=settings.OTP_EXPIRE_MINUTES)
     db.add(
         OtpCode(
@@ -441,7 +451,7 @@ async def otp_send(payload: OtpSendRequest, db: AsyncSession = Depends(get_db)):
     )
     await db.commit()
 
-    if not settings.OTP_DEV_MODE:
+    if not settings.OTP_DEV_MODE and not is_review_account:
         try:
             from app.integrations.providers import msg91_client
             await msg91_client.send_otp(phone, code)
@@ -452,7 +462,7 @@ async def otp_send(payload: OtpSendRequest, db: AsyncSession = Depends(get_db)):
         sent=True,
         phone_e164=phone,
         expires_in_seconds=settings.OTP_EXPIRE_MINUTES * 60,
-        dev_otp=code if settings.OTP_DEV_MODE else None,
+        dev_otp=code if (settings.OTP_DEV_MODE and not is_review_account) else None,
     )
 
 
