@@ -150,11 +150,11 @@ class TestPhase4WebSocketHeartbeat:
         token = worker_auth["tokens"]["access_token"]
         url = _ws_url("/ws/user", token=token)
         try:
-            reply = asyncio.get_event_loop().run_until_complete(_ws_ping_pong(url, ts=999))
+            reply = asyncio.run(_ws_ping_pong(url, ts=999))
         except Exception:
             # Fallback to localhost in case ingress doesn't expose WS upgrade
             url = _ws_url("/ws/user", token=token, base=_WS_LOCAL)
-            reply = asyncio.get_event_loop().run_until_complete(_ws_ping_pong(url, ts=999))
+            reply = asyncio.run(_ws_ping_pong(url, ts=999))
         assert reply.get("type") == "pong", reply
         assert reply.get("ts") == 999, reply
 
@@ -170,10 +170,10 @@ class TestPhase4WebSocketHeartbeat:
         bid = bks[0]["id"]
         url = _ws_url(f"/ws/booking/{bid}", token=token)
         try:
-            reply = asyncio.get_event_loop().run_until_complete(_ws_ping_pong(url, ts=12345))
+            reply = asyncio.run(_ws_ping_pong(url, ts=12345))
         except Exception:
             url = _ws_url(f"/ws/booking/{bid}", token=token, base=_WS_LOCAL)
-            reply = asyncio.get_event_loop().run_until_complete(_ws_ping_pong(url, ts=12345))
+            reply = asyncio.run(_ws_ping_pong(url, ts=12345))
         assert reply.get("type") == "pong", reply
         assert reply.get("ts") == 12345, reply
 
@@ -191,9 +191,9 @@ class TestPhase4WebSocketHeartbeat:
                 # Pre-handshake rejection (HTTP-level)
                 return getattr(e, "status_code", None) or "rejected_pre_handshake"
 
-        code = asyncio.get_event_loop().run_until_complete(_try(_WS_BASE))
+        code = asyncio.run(_try(_WS_BASE))
         if code is None or (isinstance(code, int) and code != 1008):
-            code = asyncio.get_event_loop().run_until_complete(_try(_WS_LOCAL))
+            code = asyncio.run(_try(_WS_LOCAL))
         # Accept either 1008 close OR pre-handshake reject (some ingresses block bad-handshake)
         assert code == 1008 or code == "rejected_pre_handshake" or (isinstance(code, int) and 1000 <= code <= 4999), \
             f"expected 1008 close, got: {code}"
@@ -212,9 +212,9 @@ class TestPhase4WebSocketHeartbeat:
                 # Functionally equivalent to 1008 from a security standpoint.
                 return getattr(e.response, "status_code", None) or "rejected_pre_handshake"
 
-        code = asyncio.get_event_loop().run_until_complete(_try(_WS_BASE))
+        code = asyncio.run(_try(_WS_BASE))
         if code is None:
-            code = asyncio.get_event_loop().run_until_complete(_try(_WS_LOCAL))
+            code = asyncio.run(_try(_WS_LOCAL))
         # Accept 1008 close OR HTTP 403 pre-handshake reject (both mean "unauthorized").
         assert code == 1008 or code == 403 or code == "rejected_pre_handshake", \
             f"expected 1008 or 403 reject, got {code}"
@@ -382,9 +382,9 @@ class TestPhase4EscalationBroadcast:
                 return resp, got_msg, pong
 
         try:
-            resp, got_msg, pong = asyncio.get_event_loop().run_until_complete(_flow(_WS_BASE))
+            resp, got_msg, pong = asyncio.run(_flow(_WS_BASE))
         except Exception:
-            resp, got_msg, pong = asyncio.get_event_loop().run_until_complete(_flow(_WS_LOCAL))
+            resp, got_msg, pong = asyncio.run(_flow(_WS_LOCAL))
 
         assert resp.status_code == 200, f"escalate failed: {resp.status_code} {resp.text}"
         assert pong.get("type") == "pong" and pong.get("ts") == 7777, pong

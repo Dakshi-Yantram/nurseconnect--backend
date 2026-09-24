@@ -24,7 +24,7 @@ from fastapi import HTTPException, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.deps import CurrentUser, is_admin
+from app.core.deps import CurrentUser, is_admin, is_staff
 from app.models.enums import UserRole
 from app.models.models import (
     Booking,
@@ -223,3 +223,23 @@ async def assert_user_can_access_visit_record(
     vres = await db.execute(select(VisitRecord).where(VisitRecord.booking_id == booking_id))
     visit = vres.scalar_one_or_none()
     return booking, visit
+
+# ---------------------------------------------------------------------------
+# Read-only booking records (invoices, prescriptions, checklists)
+# ---------------------------------------------------------------------------
+async def assert_can_view_booking_records(
+    db: AsyncSession, current: CurrentUser, booking_id: UUID
+) -> Booking:
+    """Read access to records attached to a booking.
+
+    Internal staff (admin/reviewer/operations/support/clinical) may read for
+    support and audit purposes; everyone else must pass the normal booking
+    ownership rule (owning consumer or assigned worker).
+    """
+    if is_staff(current.role):
+        res = await db.execute(select(Booking).where(Booking.id == booking_id))
+        booking = res.scalar_one_or_none()
+        if not booking:
+            raise HTTPException(status_code=404, detail="Booking not found")
+        return booking
+    return await assert_user_can_access_booking(db, current, booking_id)

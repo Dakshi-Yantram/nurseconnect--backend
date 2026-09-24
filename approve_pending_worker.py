@@ -13,7 +13,8 @@ import requests
 
 BASE_URL = "http://localhost:8000/api"
 ADMIN_EMAIL = "admin@nurseconnect.in"
-ADMIN_PASSWORD = "Admin@1234"
+import getpass as _getpass, os as _os
+ADMIN_PASSWORD = _os.environ.get("ADMIN_PASSWORD") or _getpass.getpass("Admin password: ")
 
 
 def main():
