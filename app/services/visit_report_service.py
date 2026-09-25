@@ -28,7 +28,6 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.company import get_company
-<<<<<<< HEAD
 from app.models.enums import BookingStatus, UserRole
 from app.models.models import (
     Booking,
@@ -41,10 +40,6 @@ from app.models.models import (
     VitalSignReading,
     WorkerProfile,
 )
-=======
-from app.models.enums import UserRole
-from app.models.models import Patient, User, VisitRecord, VitalSignReading, WorkerProfile
->>>>>>> origin/staging
 from app.services.visit_report_pdf import PdfWatermark, render_visit_report_pdf
 
 logger = logging.getLogger(__name__)
@@ -119,7 +114,6 @@ class VisitReportPdfInputs:
     family_summary: Optional[str]
     care_notes: Optional[str]
     include_clinical_notes: bool
-<<<<<<< HEAD
     nurse_id: Optional[str] = None
     package_name: Optional[str] = None
     package_code: Optional[str] = None
@@ -200,8 +194,6 @@ async def _next_scheduled_visit(db: AsyncSession, booking: Optional[Booking]) ->
         f"{nxt.scheduled_date.strftime('%d-%b-%Y')}, "
         f"{nxt.scheduled_start_time.strftime('%I:%M %p').lstrip('0') or '12:00 AM'}"
     )
-=======
->>>>>>> origin/staging
 
 
 async def load_visit_report_pdf_inputs(
@@ -210,10 +202,7 @@ async def load_visit_report_pdf_inputs(
     booking_ref: str,
     *,
     include_clinical_notes: bool,
-<<<<<<< HEAD
     booking: Optional[Booking] = None,
-=======
->>>>>>> origin/staging
 ) -> VisitReportPdfInputs:
     pres = await db.execute(select(Patient).where(Patient.id == visit.patient_id))
     patient = pres.scalar_one_or_none()
@@ -226,7 +215,6 @@ async def load_visit_report_pdf_inputs(
         nurse_user = ures.scalar_one_or_none()
         nurse_name = (nurse_user.full_name if nurse_user and nurse_user.full_name else None) or "\u2014"
 
-<<<<<<< HEAD
     if booking is None:
         bres = await db.execute(select(Booking).where(Booking.id == visit.booking_id))
         booking = bres.scalar_one_or_none()
@@ -238,8 +226,6 @@ async def load_visit_report_pdf_inputs(
         if package is not None:
             package_name, package_code = package.name, package.package_code
 
-=======
->>>>>>> origin/staging
     return VisitReportPdfInputs(
         booking_ref=booking_ref,
         patient_name=(patient.full_name if patient and patient.full_name else "\u2014"),
@@ -247,28 +233,21 @@ async def load_visit_report_pdf_inputs(
         nurse_council_no=(worker.registration_no if worker else None),
         check_in_at=visit.check_in_at,
         check_out_at=visit.check_out_at,
-<<<<<<< HEAD
         # Recomputed from the timestamps rather than trusting the stored
         # column, which used to surface as a hard-coded-looking "0 min".
         duration_minutes=_duration_from_timestamps(
             visit.check_in_at, visit.check_out_at, visit.actual_duration_minutes
         ),
-=======
-        duration_minutes=visit.actual_duration_minutes,
->>>>>>> origin/staging
         vitals=await latest_vitals(db, visit.booking_id),
         family_summary=visit.family_summary,
         # Never even loaded into the family view's inputs.
         care_notes=visit.care_notes if include_clinical_notes else None,
         include_clinical_notes=include_clinical_notes,
-<<<<<<< HEAD
         nurse_id=(f"NUR-{str(worker.id)[:8].upper()}" if worker else None),
         package_name=package_name,
         package_code=package_code,
         questionnaire=await _package_questionnaire(db, visit),
         next_visit_label=await _next_scheduled_visit(db, booking),
-=======
->>>>>>> origin/staging
     )
 
 
@@ -290,13 +269,10 @@ def render_visit_report(inputs: VisitReportPdfInputs, watermark: PdfWatermark) -
         care_notes=inputs.care_notes if inputs.include_clinical_notes else None,
         watermark=watermark,
         generated_at=watermark.generated_at,
-<<<<<<< HEAD
         nurse_id=inputs.nurse_id,
         package_name=inputs.package_name,
         package_code=inputs.package_code,
         questionnaire=inputs.questionnaire,
         next_visit_label=inputs.next_visit_label,
         document_title="NURSE VISIT REPORT" if inputs.include_clinical_notes else "VISIT CARE SUMMARY",
-=======
->>>>>>> origin/staging
     )
