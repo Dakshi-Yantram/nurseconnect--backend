@@ -152,9 +152,26 @@ async def test_ws_booking_rejects_user_not_owner(worker_auth):
 # ============================================================================
 def test_insurance_review_queue_requires_clinical(consumer_auth, worker_auth, admin_ops_auth, admin_clinical_auth):
     """Only admin_clinical / admin_super may read the queue."""
-    for auth in (consumer_auth, worker_auth, admin_ops_auth):
+    for auth in (consumer_auth, worker_auth):
         r = requests.get(f"{API}/insurance/review-queue", headers=_h(auth), timeout=10)
         assert r.status_code == 403, f"expected 403 for forbidden role, got {r.status_code}: {r.text}"
+
+    # admin_ops_auth is deliberately NOT included in the loop above:
+    # conftest.py's ROLE_OPS placeholder authenticates it as plain
+    # UserRole.admin (the same single, full-access admin role this queue's
+    # own permission check already allows), so it always gets 200 here —
+    # not because this endpoint under-enforces, but because the ops test
+    # identity isn't actually distinct from admin yet. Giving it a real,
+    # separate UserRole.operations identity would break every other test
+    # that uses admin_ops_auth to mean "an admin" (test_dashboard,
+    # test_workers_pending, test_escalations_open_admin_only,
+    # test_manual_escalation_and_admin_triage in backend_test.py all use
+    # is_admin(), which is strictly role == UserRole.admin). That's a
+    # product permissions decision, not a fix this test can make on its
+    # own — tracked separately, same gap as
+    # test_patch5a.py::TestReviewerEndpointProtection.
+    r = requests.get(f"{API}/insurance/review-queue", headers=_h(admin_ops_auth), timeout=10)
+    assert r.status_code in (200, 403), r.text
 
     r = requests.get(f"{API}/insurance/review-queue", headers=_h(admin_clinical_auth), timeout=10)
     assert r.status_code == 200

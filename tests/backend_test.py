@@ -284,8 +284,33 @@ def booking_ctx(consumer_auth, worker_auth):
     r = requests.post(f"{API}/bookings/", headers=ch, json=payload, timeout=10)
     assert r.status_code == 200, r.text
     booking = r.json()
+    bid = booking["id"]
+
+    # Patch 5A gates check-in/checklist behind service consent and
+    # medications behind medication consent (see app/api/v1/visits.py
+    # require_consent calls) — nothing creates that consent automatically,
+    # a real consumer grants it explicitly via POST /consents. Grant both,
+    # scoped to this booking, so test_05_checkin/test_07_medication below
+    # can actually proceed like a real flow would, instead of asserting
+    # around a step this suite never took (same fix already applied in
+    # tests/test_patch3_proximity.py for the identical gap).
+    for consent_type in ("service", "medication"):
+        cr = requests.post(
+            f"{API}/consents",
+            headers=ch,
+            json={
+                "patient_id": pid,
+                "booking_id": bid,
+                "consent_type": consent_type,
+                "consented_by_name": "Backend Test Family",
+                "relationship_to_patient": "self",
+            },
+            timeout=10,
+        )
+        assert cr.status_code == 200, f"consent grant ({consent_type}) failed: {cr.status_code} {cr.text}"
+
     return {
-        "ch": ch, "wh": wh, "booking": booking, "bid": booking["id"], "pid": pid, "svc_id": svc_id,
+        "ch": ch, "wh": wh, "booking": booking, "bid": bid, "pid": pid, "svc_id": svc_id,
     }
 
 

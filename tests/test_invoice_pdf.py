@@ -24,6 +24,20 @@ from tests import _offline_stubs
 
 _offline_stubs.install()
 
+
+def tearDownModule() -> None:
+    """Undo _offline_stubs.install() once every test in this module has
+    run. Standard unittest hook, recognised by both `python -m unittest`
+    and pytest. Without this, the fake sqlalchemy/app.core.database
+    modules this file installs stay in sys.modules for the rest of the
+    pytest process, breaking any test file collected afterward (e.g.
+    test_patch5a.py, test_patch5b_hardening.py) that imports the real
+    ones. See _offline_stubs.uninstall()'s docstring for the exact
+    failures this caused.
+    """
+    _offline_stubs.uninstall()
+
+
 from app.core.company import CompanyIdentity  # noqa: E402
 from app.services.invoice_pdf import (  # noqa: E402
     render_customer_invoice_pdf,

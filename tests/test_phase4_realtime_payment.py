@@ -24,7 +24,7 @@ import pytest
 import requests
 import websockets
 
-from tests.conftest import API, auth_headers
+from tests.conftest import API, WORKER_PHONE, _release_worker_schedule, auth_headers
 
 
 # Public preview URL is HTTPS; local backend is http://localhost:8001.
@@ -247,6 +247,16 @@ class TestPhase4VisitIdempotency:
             timeout=10,
         )
         assert verify.status_code == 200, verify.text
+        # This fixture is class-scoped, so it runs BEFORE conftest.py's
+        # function-scoped autouse `_release_shared_worker_schedules` fixture
+        # (pytest instantiates broader-scoped fixtures first) — that cleanup
+        # would arrive too late to help this accept() call. Release
+        # WORKER_PHONE's schedule here explicitly instead. See the block
+        # comment in conftest.py above `_release_worker_schedule` for why
+        # this exists at all: other test files book this same shared worker
+        # for this same fixed slot, and one that never reaches checkout
+        # leaves it occupied for every test after it.
+        _release_worker_schedule(WORKER_PHONE)
         acc = requests.post(f"{API}/bookings/{bid}/accept", headers=wh, timeout=10)
         assert acc.status_code == 200, acc.text
         return {"bid": bid, "wh": wh}
@@ -346,7 +356,13 @@ class TestPhase4EscalationBroadcast:
             },
             timeout=10,
         )
-        requests.post(f"{API}/bookings/{bid}/accept", headers=wh, timeout=10)
+        # This result was previously never checked, so a WORKER_SCHEDULE_
+        # CONFLICT here (shared worker, shared test slot — see conftest.py)
+        # silently left the booking unassigned, and the actual failure only
+        # surfaced several steps later as a confusing WS 403 on
+        # /ws/booking/{bid} rather than a clear accept-time error.
+        acc = requests.post(f"{API}/bookings/{bid}/accept", headers=wh, timeout=10)
+        assert acc.status_code == 200, f"accept failed: {acc.status_code} {acc.text}"
 
         token = worker_auth["tokens"]["access_token"]
 
