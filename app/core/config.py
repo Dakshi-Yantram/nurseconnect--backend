@@ -107,13 +107,10 @@ class Settings(BaseSettings):
     # year per series (see app/services/billing_service.py).
     INVOICE_NUMBER_PREFIX: str = "YM-INV"
     PAYOUT_STATEMENT_PREFIX: str = "YM-COMM"
-<<<<<<< HEAD
     # The patient payment receipt shares the invoice's financial-year/sequence
     # suffix (see app/services/receipt_service.py) so the two documents for
     # the same booking are trivially cross-referenced by a support agent.
     RECEIPT_NUMBER_PREFIX: str = "YM-RCPT"
-=======
->>>>>>> origin/staging
 
     # ---------------------------------------------------------------------
     # Worker payouts.
