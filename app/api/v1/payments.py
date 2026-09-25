@@ -1,10 +1,7 @@
 """Payments: Razorpay order creation, signature verification, webhook, history, refunds."""
 import json
 import logging
-<<<<<<< HEAD
 import re
-=======
->>>>>>> origin/staging
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import List, Optional
@@ -50,10 +47,7 @@ from app.models.models import (
     ConsumerProfile,
     FinancialLedger,
     Invoice,
-<<<<<<< HEAD
     Patient,
-=======
->>>>>>> origin/staging
     User,
     WorkerPayout,
     WorkerProfile,
@@ -832,7 +826,6 @@ async def get_booking_invoice(
     }
 
 
-<<<<<<< HEAD
 @router.get("/bookings/{booking_id}/receipt")
 async def get_booking_payment_receipt(
     booking_id: UUID,
@@ -945,8 +938,6 @@ async def get_booking_payment_receipt(
     )
 
 
-=======
->>>>>>> origin/staging
 @router.get("/worker/payout-statements")
 async def worker_payout_statements(
     current: CurrentUser = Depends(get_current_user),
