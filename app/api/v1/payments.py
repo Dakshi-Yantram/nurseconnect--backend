@@ -1,12 +1,16 @@
 """Payments: Razorpay order creation, signature verification, webhook, history, refunds."""
 import json
 import logging
+<<<<<<< HEAD
+import re
+=======
+>>>>>>> origin/staging
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import List, Optional
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Request
+from fastapi import APIRouter, Depends, Header, HTTPException, Request, Response
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -41,9 +45,15 @@ class RefundRequest(BaseModel):
 
 from app.models.models import (
     Booking,
+    CarePackage,
+    CarePackageBooking,
     ConsumerProfile,
     FinancialLedger,
     Invoice,
+<<<<<<< HEAD
+    Patient,
+=======
+>>>>>>> origin/staging
     User,
     WorkerPayout,
     WorkerProfile,
@@ -822,6 +832,121 @@ async def get_booking_invoice(
     }
 
 
+<<<<<<< HEAD
+@router.get("/bookings/{booking_id}/receipt")
+async def get_booking_payment_receipt(
+    booking_id: UUID,
+    profile: ConsumerProfile = Depends(get_consumer_profile),
+    db: AsyncSession = Depends(get_db),
+):
+    """The patient's payment receipt — a short, print-ready confirmation of
+    what was paid, distinct from the line-item GST tax invoice.
+
+    Rendered fresh on every call from the same `Booking`/`Invoice`/
+    `CarePackage` rows the tax invoice uses, so the figures can never drift
+    between the two documents. Deliberately carries no platform fee,
+    commission, nurse payout or other internal figure — `CompanyIdentity`
+    and the booking/invoice rows passed to the renderer simply don't have
+    one to pass.
+    """
+    from app.core.company import get_company
+    from app.services.payment_receipt_pdf import render_payment_receipt_pdf
+
+    bres = await db.execute(
+        select(Booking).where(Booking.id == booking_id, Booking.consumer_id == profile.id)
+    )
+    booking = bres.scalar_one_or_none()
+    if not booking:
+        raise HTTPException(status_code=404, detail="Booking not found")
+    if booking.payment_status not in (PaymentStatus.captured, PaymentStatus.partially_refunded, PaymentStatus.refunded):
+        raise HTTPException(
+            status_code=404,
+            detail="A payment receipt is available once payment is completed.",
+        )
+
+    ires = await db.execute(select(Invoice).where(Invoice.booking_id == booking_id))
+    invoice = ires.scalar_one_or_none()
+    if invoice is None:
+        from app.services.billing_service import generate_customer_invoice
+
+        invoice = await generate_customer_invoice(db, booking)
+        await db.commit()
+        if invoice is None:
+            raise HTTPException(status_code=500, detail="Could not generate receipt")
+
+    pres = await db.execute(select(Patient).where(Patient.id == booking.patient_id))
+    patient = pres.scalar_one_or_none()
+    patient_name = (patient.full_name if patient and patient.full_name else None) or "\u2014"
+
+    package_name = package_code = service_period = None
+    if booking.package_id:
+        pkres = await db.execute(select(CarePackage).where(CarePackage.id == booking.package_id))
+        package = pkres.scalar_one_or_none()
+        if package is not None:
+            package_name, package_code = package.name, package.package_code
+    if booking.package_booking_id:
+        cpbres = await db.execute(
+            select(CarePackageBooking).where(CarePackageBooking.id == booking.package_booking_id)
+        )
+        cpb = cpbres.scalar_one_or_none()
+        if cpb is not None:
+            start = cpb.start_date.strftime("%d-%b-%Y")
+            end = cpb.end_date.strftime("%d-%b-%Y") if cpb.end_date else "Ongoing"
+            service_period = f"{start} to {end}"
+    if service_period is None:
+        # One-time (non-package) booking — the service period is just the
+        # scheduled visit date.
+        service_period = booking.scheduled_date.strftime("%d-%b-%Y")
+
+    if booking.payment_method == PaymentMethod.cash:
+        payment_id = f"CASH-{booking.booking_ref}"
+        payment_method_label = "Cash"
+        payment_datetime = booking.cash_collected_at or booking.cash_remitted_at
+    else:
+        payment_id = booking.razorpay_payment_id or "\u2014"
+        payment_method_label = "Razorpay (Online)"
+        payment_datetime = invoice.generated_at
+
+    receipt_suffix = invoice.invoice_number[len(settings.INVOICE_NUMBER_PREFIX):] \
+        if invoice.invoice_number.startswith(settings.INVOICE_NUMBER_PREFIX) \
+        else f"-{invoice.invoice_number}"
+    receipt_number = f"{settings.RECEIPT_NUMBER_PREFIX}{receipt_suffix}"
+
+    pdf_bytes = render_payment_receipt_pdf(
+        company=get_company(),
+        receipt_number=receipt_number,
+        receipt_date=(invoice.generated_at or datetime.now(timezone.utc)).date(),
+        booking_ref=booking.booking_ref,
+        patient_name=patient_name,
+        package_name=package_name,
+        package_code=package_code,
+        service_period=service_period,
+        payment_id=payment_id,
+        payment_datetime=payment_datetime,
+        payment_method_label=payment_method_label,
+        payment_status_label=booking.payment_status.value.replace("_", " ").title(),
+        amount_paid=Decimal(invoice.total_amount),
+        taxable_value=Decimal(invoice.taxable_value or 0),
+        exempt_value=Decimal(invoice.exempt_value or 0),
+        cgst_amount=Decimal(invoice.cgst_amount or 0),
+        sgst_amount=Decimal(invoice.sgst_amount or 0),
+        subsidy_amount=Decimal(booking.subsidy_amount or 0),
+        invoice_number=invoice.invoice_number,
+    )
+
+    safe_ref = re.sub(r"[^A-Za-z0-9_-]", "", booking.booking_ref or "")[:40] or "receipt"
+    return Response(
+        content=pdf_bytes,
+        media_type="application/pdf",
+        headers={
+            "Content-Disposition": f'attachment; filename="payment-receipt-{safe_ref}.pdf"',
+            "Cache-Control": "no-store, private, max-age=0",
+        },
+    )
+
+
+=======
+>>>>>>> origin/staging
 @router.get("/worker/payout-statements")
 async def worker_payout_statements(
     current: CurrentUser = Depends(get_current_user),
