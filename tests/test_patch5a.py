@@ -376,4 +376,17 @@ class TestConsentService:
                     booking_id=uuid.uuid4(),
                 )
 
-        assert asyncio.run(_run()) is False
+        async def _run_with_timeout():
+            # This test opens a REAL AsyncSessionLocal connection — unlike
+            # the rest of this suite, which only ever talks to the API over
+            # HTTP. If the DB is unreachable, misconfigured, or the async
+            # engine's connection pool deadlocks across asyncio.run()'s
+            # fresh event loop, `await` on it hangs with no error and no
+            # timeout, silently stalling the whole CI job (this is exactly
+            # what happened: the job sat here for 20+ minutes with no
+            # progress and no failure). 15s is generous for a single
+            # SELECT against a local/CI Postgres; if it's not back by then
+            # something is genuinely wrong and the test should say so.
+            return await asyncio.wait_for(_run(), timeout=15)
+
+        assert asyncio.run(_run_with_timeout()) is False

@@ -24,6 +24,24 @@ from sqlalchemy import select
 from tests.conftest import API, auth_headers
 
 
+def _run_db_check(coro, *, timeout: float = 15.0):
+    """asyncio.run(coro), but with a hard timeout.
+
+    This file talks to the real DB directly (AsyncSessionLocal) in a few
+    places, unlike the rest of the suite which only ever goes through the
+    API over HTTP. If that connection is unreachable, misconfigured, or the
+    async engine's connection pool deadlocks against asyncio.run()'s fresh
+    event loop, the bare `await` hangs with no error and no timeout —
+    silently stalling the whole CI job with no indication why (this
+    happened for real: a job sat with no progress for 20+ minutes on the
+    equivalent direct-DB test in test_patch5a.py). 15s is generous for a
+    handful of queries against a local/CI Postgres; if it's not back by
+    then, something is genuinely wrong and the test should say so instead
+    of hanging.
+    """
+    return asyncio.run(asyncio.wait_for(coro, timeout=timeout))
+
+
 def _h(auth: dict) -> dict:
     return auth_headers(auth)
 
@@ -247,7 +265,7 @@ def test_security_audit_log_created_for_denied_access(worker_auth):
     # "not found" before ownership check — still a valid path, just nothing
     # to audit).
     if r.status_code == 403:
-        assert asyncio.run(_count()) >= 1
+        assert _run_db_check(_count()) >= 1
 
 
 def test_insurance_override_writes_audit_entry(admin_clinical_auth):
@@ -377,7 +395,7 @@ def test_insurance_override_writes_audit_entry(admin_clinical_auth):
         audits = await _read_audit(seeded["assessment_id"])
         return seeded, audits, resp.json() if resp.ok else {"_status": resp.status_code, "_text": resp.text}
 
-    seeded, audits, body = asyncio.run(_run())
+    seeded, audits, body = _run_db_check(_run(), timeout=25.0)
     assert body.get("coverage_status") == "covered", body
     assert body.get("reviewed_by") is not None
     assert body.get("reviewed_at") is not None
