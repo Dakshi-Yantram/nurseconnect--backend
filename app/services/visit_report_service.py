@@ -28,8 +28,23 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.company import get_company
+<<<<<<< HEAD
+from app.models.enums import BookingStatus, UserRole
+from app.models.models import (
+    Booking,
+    CarePackage,
+    CarePackageBooking,
+    Patient,
+    User,
+    VisitDocumentationItem,
+    VisitRecord,
+    VitalSignReading,
+    WorkerProfile,
+)
+=======
 from app.models.enums import UserRole
 from app.models.models import Patient, User, VisitRecord, VitalSignReading, WorkerProfile
+>>>>>>> origin/staging
 from app.services.visit_report_pdf import PdfWatermark, render_visit_report_pdf
 
 logger = logging.getLogger(__name__)
@@ -104,6 +119,89 @@ class VisitReportPdfInputs:
     family_summary: Optional[str]
     care_notes: Optional[str]
     include_clinical_notes: bool
+<<<<<<< HEAD
+    nurse_id: Optional[str] = None
+    package_name: Optional[str] = None
+    package_code: Optional[str] = None
+    questionnaire: Optional[list] = None
+    next_visit_label: Optional[str] = None
+
+
+def _duration_from_timestamps(
+    check_in_at: Optional[datetime], check_out_at: Optional[datetime], fallback: Optional[int]
+) -> Optional[int]:
+    """Always derive the duration from the actual check-in/check-out
+    timestamps when both are present, rather than trusting a stored column
+    that may be stale or zero (the "0 min" bug) — the timestamps are the
+    source of truth; `actual_duration_minutes` is only a cache of them.
+    """
+    if check_in_at and check_out_at and check_out_at > check_in_at:
+        return int((check_out_at - check_in_at).total_seconds() // 60)
+    return fallback
+
+
+async def _package_questionnaire(db: AsyncSession, visit: VisitRecord) -> list:
+    """Package-specific questionnaire answers for this visit, in the order
+    they were captured. Pulled from `VisitDocumentationItem`, which snapshots
+    the field's label at completion time — so a later edit to the template
+    can never rewrite what this visit actually asked and recorded.
+    """
+    res = await db.execute(
+        select(VisitDocumentationItem)
+        .where(VisitDocumentationItem.visit_record_id == visit.id, VisitDocumentationItem.is_completed.is_(True))
+        .order_by(VisitDocumentationItem.created_at.asc())
+    )
+    items = res.scalars().all()
+    out = []
+    for item in items:
+        value = item.value_json
+        if isinstance(value, dict) and "value" in value:
+            value = value["value"]
+        if isinstance(value, bool):
+            answer = "Yes" if value else "No"
+        elif isinstance(value, (list, tuple)):
+            answer = ", ".join(str(v) for v in value)
+        elif value is None:
+            answer = "\u2014"
+        else:
+            answer = str(value)
+        out.append((item.field_label_snapshot, answer))
+    return out
+
+
+async def _next_scheduled_visit(db: AsyncSession, booking: Optional[Booking]) -> Optional[str]:
+    """A display string for the next upcoming visit under the same
+    care-package booking, if any — only meaningful for multi-visit packages;
+    a one-time booking has none.
+
+    Returned pre-formatted (not a `datetime`) because `scheduled_date` /
+    `scheduled_start_time` are entered and shown as local wall-clock time
+    throughout the booking flow, unlike the UTC-instant timestamps
+    (`check_in_at` etc.) the renderer's IST-converting formatter expects —
+    running this through that formatter would silently shift it by 5h30m.
+    """
+    if booking is None or not booking.package_booking_id:
+        return None
+    res = await db.execute(
+        select(Booking)
+        .where(
+            Booking.package_booking_id == booking.package_booking_id,
+            Booking.id != booking.id,
+            Booking.scheduled_date >= booking.scheduled_date,
+            Booking.status.notin_([BookingStatus.cancelled, BookingStatus.completed, BookingStatus.missed]),
+        )
+        .order_by(Booking.scheduled_date.asc(), Booking.scheduled_start_time.asc())
+        .limit(1)
+    )
+    nxt = res.scalar_one_or_none()
+    if nxt is None:
+        return None
+    return (
+        f"{nxt.scheduled_date.strftime('%d-%b-%Y')}, "
+        f"{nxt.scheduled_start_time.strftime('%I:%M %p').lstrip('0') or '12:00 AM'}"
+    )
+=======
+>>>>>>> origin/staging
 
 
 async def load_visit_report_pdf_inputs(
@@ -112,6 +210,10 @@ async def load_visit_report_pdf_inputs(
     booking_ref: str,
     *,
     include_clinical_notes: bool,
+<<<<<<< HEAD
+    booking: Optional[Booking] = None,
+=======
+>>>>>>> origin/staging
 ) -> VisitReportPdfInputs:
     pres = await db.execute(select(Patient).where(Patient.id == visit.patient_id))
     patient = pres.scalar_one_or_none()
@@ -124,6 +226,20 @@ async def load_visit_report_pdf_inputs(
         nurse_user = ures.scalar_one_or_none()
         nurse_name = (nurse_user.full_name if nurse_user and nurse_user.full_name else None) or "\u2014"
 
+<<<<<<< HEAD
+    if booking is None:
+        bres = await db.execute(select(Booking).where(Booking.id == visit.booking_id))
+        booking = bres.scalar_one_or_none()
+
+    package_name = package_code = None
+    if booking is not None and booking.package_id:
+        pkres = await db.execute(select(CarePackage).where(CarePackage.id == booking.package_id))
+        package = pkres.scalar_one_or_none()
+        if package is not None:
+            package_name, package_code = package.name, package.package_code
+
+=======
+>>>>>>> origin/staging
     return VisitReportPdfInputs(
         booking_ref=booking_ref,
         patient_name=(patient.full_name if patient and patient.full_name else "\u2014"),
@@ -131,12 +247,28 @@ async def load_visit_report_pdf_inputs(
         nurse_council_no=(worker.registration_no if worker else None),
         check_in_at=visit.check_in_at,
         check_out_at=visit.check_out_at,
+<<<<<<< HEAD
+        # Recomputed from the timestamps rather than trusting the stored
+        # column, which used to surface as a hard-coded-looking "0 min".
+        duration_minutes=_duration_from_timestamps(
+            visit.check_in_at, visit.check_out_at, visit.actual_duration_minutes
+        ),
+=======
         duration_minutes=visit.actual_duration_minutes,
+>>>>>>> origin/staging
         vitals=await latest_vitals(db, visit.booking_id),
         family_summary=visit.family_summary,
         # Never even loaded into the family view's inputs.
         care_notes=visit.care_notes if include_clinical_notes else None,
         include_clinical_notes=include_clinical_notes,
+<<<<<<< HEAD
+        nurse_id=(f"NUR-{str(worker.id)[:8].upper()}" if worker else None),
+        package_name=package_name,
+        package_code=package_code,
+        questionnaire=await _package_questionnaire(db, visit),
+        next_visit_label=await _next_scheduled_visit(db, booking),
+=======
+>>>>>>> origin/staging
     )
 
 
@@ -158,4 +290,13 @@ def render_visit_report(inputs: VisitReportPdfInputs, watermark: PdfWatermark) -
         care_notes=inputs.care_notes if inputs.include_clinical_notes else None,
         watermark=watermark,
         generated_at=watermark.generated_at,
+<<<<<<< HEAD
+        nurse_id=inputs.nurse_id,
+        package_name=inputs.package_name,
+        package_code=inputs.package_code,
+        questionnaire=inputs.questionnaire,
+        next_visit_label=inputs.next_visit_label,
+        document_title="NURSE VISIT REPORT" if inputs.include_clinical_notes else "VISIT CARE SUMMARY",
+=======
+>>>>>>> origin/staging
     )
