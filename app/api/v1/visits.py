@@ -1416,11 +1416,7 @@ async def download_visit_report_pdf(
     name, hint = watermark_identity(user)
     try:
         inputs = await load_visit_report_pdf_inputs(
-<<<<<<< HEAD
             db, visit, booking.booking_ref, include_clinical_notes=include_notes, booking=booking,
-=======
-            db, visit, booking.booking_ref, include_clinical_notes=include_notes,
->>>>>>> origin/staging
         )
         pdf_bytes = await run_in_threadpool(
             render_visit_report, inputs,
