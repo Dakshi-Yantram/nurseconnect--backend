@@ -34,14 +34,14 @@ OTP = "123456"
 # ----------------------------- helpers -----------------------------
 def _unique_phone() -> str:
     """Fresh consumer phone per scenario to avoid stale-state collisions."""
-    return f"+9199{str(uuid4().int)[-9:]}"
+    return f"+919{str(uuid4().int)[-9:]}"  # 10-digit Indian mobile (+91 9XXXXXXXXX)
 
 
 def _login(phone: str, role: str) -> tuple[str, str]:
-    r = requests.post(f"{API}/auth/send-otp", json={"phone_e164": phone, "role": role}, timeout=10)
+    r = requests.post(f"{API}/auth/otp/send", json={"phone_e164": phone, "role": role}, timeout=10)
     assert r.status_code == 200, f"send-otp {r.status_code}: {r.text}"
     r = requests.post(
-        f"{API}/auth/verify-otp",
+        f"{API}/auth/otp/verify",
         json={
             "phone_e164": phone,
             "code": OTP,
