@@ -35,9 +35,17 @@ class WorkerTier(str, Enum):
 class WorkerOnboardingStatus(str, Enum):
     documents_pending = "documents_pending"
     pending_review = "pending_review"
+    # New — inserted between pending_review and approved so existing rows
+    # (which only ever held documents_pending/pending_review/approved/
+    # rejected/suspended) keep working unchanged; nothing back-fills these
+    # two automatically, they're only set going forward by the training/
+    # assessment services once a provider type requires them.
+    training_pending = "training_pending"
+    assessment_pending = "assessment_pending"
     approved = "approved"
     rejected = "rejected"
     suspended = "suspended"
+    expired = "expired"
 
 
 class WorkerAvailability(str, Enum):
@@ -99,6 +107,17 @@ class DrugAllergyEscalation(str, Enum):
     emergency = "emergency"
 
 
+class AlertnessTier(str, Enum):
+    """Outcome of a pre-visit reaction-time safety check.
+
+    See app/services/fatigue_engine.py for the thresholds that decide
+    which tier a given attempt lands in.
+    """
+    ok = "pass"
+    warning = "warning"
+    fail = "fail"
+
+
 class BookingStatus(str, Enum):
     draft = "draft"
     pending_payment = "pending_payment"
@@ -112,6 +131,16 @@ class BookingStatus(str, Enum):
     missed = "missed"
     rematch_pending = "rematch_pending"
     disputed = "disputed"
+    # ── Workflow 1: Composite Care Package (material_included bookings) ──
+    prescription_pending = "prescription_pending"     # Rx uploaded, awaiting pharmacist review
+    searching_nurse = "searching_nurse"                # Rx approved, dispatch engine searching
+    quality_discrepancy_alert = "quality_discrepancy_alert"  # nurse/patient safety-check mismatch
+
+
+class FulfillmentRoute(str, Enum):
+    """How the procedural kit reaches the nurse for a material_included booking."""
+    pouch_stock = "pouch_stock"
+    partner_pickup = "partner_pickup"
 
 
 class BookingType(str, Enum):
@@ -130,6 +159,12 @@ class PackageBookingStatus(str, Enum):
 
 class VisitStatus(str, Enum):
     scheduled = "scheduled"
+    # Added so VisitRecord.status can actually reach the en_route_at /
+    # arrived_at timestamp columns that already existed on the model —
+    # previously those columns were dead weight because the enum jumped
+    # straight from scheduled to in_progress.
+    en_route = "en_route"
+    arrived = "arrived"
     in_progress = "in_progress"
     completed = "completed"
     cancelled = "cancelled"
@@ -152,6 +187,29 @@ class PrescriptionStatus(str, Enum):
     verified = "verified"
     rejected = "rejected"
     expired = "expired"
+
+
+class TeleConsultationStage(str, Enum):
+    """Stages of a tele-doctor's in-call workflow for one booking, driven
+    from the admin dashboard: doctor picks up a booking from the waiting
+    queue, records diet notes, records patient issues (or marks all okay),
+    then issues the e-prescription. Strictly forward-moving (no skipping
+    stages) so the admin queue view always reflects real progress."""
+    waiting = "waiting"
+    diet_review = "diet_review"
+    patient_assessment = "patient_assessment"
+    prescription = "prescription"
+    completed = "completed"
+
+
+class PayoutApprovalStatus(str, Enum):
+    """Gate in front of WorkerPayout release: a payout must be explicitly
+    approved by an admin before /process can pay it out. Kept separate from
+    WorkerPayoutStatus (which tracks the money-movement state machine) so
+    'approved but not yet paid' and 'on hold' remain distinguishable."""
+    pending_approval = "pending_approval"
+    approved = "approved"
+    rejected = "rejected"
 
 
 class ConsentType(str, Enum):
@@ -334,6 +392,25 @@ class PaymentStatus(str, Enum):
     failed = "failed"
     refunded = "refunded"
     partially_refunded = "partially_refunded"
+    # Cash-on-delivery only: the booking is confirmed and dispatchable, but
+    # no money has moved yet — the provider collects it at the visit.
+    # Deliberately distinct from `pending` (nothing arranged) and from
+    # `captured` (money actually received), so revenue reporting, payouts
+    # and the "has this been paid?" question all stay truthful.
+    cash_due = "cash_due"
+
+
+class PaymentMethod(str, Enum):
+    """How the customer chose to pay.
+
+    Kept as its own dimension rather than being folded into PaymentStatus:
+    method answers "how", status answers "where in the lifecycle". Mixing
+    them is what forces `if razorpay_order_id is not None` checks to stand in
+    for "is this an online booking", which then break the moment a second
+    method exists.
+    """
+    razorpay = "razorpay"
+    cash = "cash"
 
 
 class ComplaintStatus(str, Enum):
@@ -421,8 +498,59 @@ class AssessmentQuestionType(str, Enum):
     text = "text"
 
 class WorkerType(str, Enum):
-    """A professionally-trained nurse vs. a non-clinical caregiver/helper.
-    Drives which onboarding documents are required and which services they can
-    be qualified for."""
+    """The Provider Type. This is the fundamental field that drives dynamic
+    onboarding, which documents/licenses are required, which services a
+    worker can be qualified for, and which packages they're eligible for.
+
+    IMPORTANT: adding a value here is additive only (existing 'nurse' and
+    'caregiver' rows are untouched). Postgres requires each new value to be
+    registered on the live enum type before it can be written — see
+    add_provider_type_schema.py, which does this with
+    `ALTER TYPE ... ADD VALUE IF NOT EXISTS` (safe to re-run, no downtime).
+    """
     nurse = "nurse"
     caregiver = "caregiver"
+    doctor = "doctor"
+    dentist = "dentist"
+    physiotherapist = "physiotherapist"
+    mother_baby_caregiver = "mother_baby_caregiver"
+    # Tele-Doctor and Physical Doctor are separate Provider Types rather
+    # than a mode flag on `doctor`. That choice is deliberate: every piece
+    # of machinery that needs to tell them apart — required documents,
+    # package eligibility (allowed_provider_types), training modules,
+    # onboarding forms, the qualification gate — is already keyed on
+    # Provider Type. Modelling them as types means all of that separates
+    # them automatically, with no parallel branching to keep in sync.
+    #
+    # `doctor` is retained and untouched. Existing doctor rows keep working
+    # exactly as before and are treated as capable of both modes (see
+    # TELE_CAPABLE_PROVIDER_TYPES / PHYSICAL_CAPABLE_PROVIDER_TYPES in
+    # app/core/provider_types.py), so nothing that works today stops
+    # working. New doctors should be onboarded as one of the two specific
+    # types.
+    tele_doctor = "tele_doctor"
+    physical_doctor = "physical_doctor"
+
+
+class ProviderStatusChangeReason(str, Enum):
+    """Why a WorkerProfile.onboarding_status (or availability opt-in) changed.
+    Written to ProviderStatusHistory for audit purposes."""
+    applied = "applied"
+    documents_submitted = "documents_submitted"
+    document_rejected = "document_rejected"
+    training_completed = "training_completed"
+    training_required = "training_required"
+    assessment_passed = "assessment_passed"
+    assessment_failed = "assessment_failed"
+    practical_signoff_passed = "practical_signoff_passed"
+    practical_signoff_failed = "practical_signoff_failed"
+    background_check_cleared = "background_check_cleared"
+    background_check_failed = "background_check_failed"
+    admin_approved = "admin_approved"
+    admin_rejected = "admin_rejected"
+    admin_suspended = "admin_suspended"
+    admin_reinstated = "admin_reinstated"
+    license_expired = "license_expired"
+    qualification_expired = "qualification_expired"
+    opted_in = "opted_in"
+    opted_out = "opted_out"

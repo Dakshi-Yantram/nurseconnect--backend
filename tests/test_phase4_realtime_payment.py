@@ -24,7 +24,7 @@ import pytest
 import requests
 import websockets
 
-from tests.conftest import API, auth_headers
+from tests.conftest import API, WORKER_PHONE, _release_worker_schedule, auth_headers
 
 
 # Public preview URL is HTTPS; local backend is http://localhost:8001.
@@ -150,11 +150,11 @@ class TestPhase4WebSocketHeartbeat:
         token = worker_auth["tokens"]["access_token"]
         url = _ws_url("/ws/user", token=token)
         try:
-            reply = asyncio.get_event_loop().run_until_complete(_ws_ping_pong(url, ts=999))
+            reply = asyncio.run(_ws_ping_pong(url, ts=999))
         except Exception:
             # Fallback to localhost in case ingress doesn't expose WS upgrade
             url = _ws_url("/ws/user", token=token, base=_WS_LOCAL)
-            reply = asyncio.get_event_loop().run_until_complete(_ws_ping_pong(url, ts=999))
+            reply = asyncio.run(_ws_ping_pong(url, ts=999))
         assert reply.get("type") == "pong", reply
         assert reply.get("ts") == 999, reply
 
@@ -170,10 +170,10 @@ class TestPhase4WebSocketHeartbeat:
         bid = bks[0]["id"]
         url = _ws_url(f"/ws/booking/{bid}", token=token)
         try:
-            reply = asyncio.get_event_loop().run_until_complete(_ws_ping_pong(url, ts=12345))
+            reply = asyncio.run(_ws_ping_pong(url, ts=12345))
         except Exception:
             url = _ws_url(f"/ws/booking/{bid}", token=token, base=_WS_LOCAL)
-            reply = asyncio.get_event_loop().run_until_complete(_ws_ping_pong(url, ts=12345))
+            reply = asyncio.run(_ws_ping_pong(url, ts=12345))
         assert reply.get("type") == "pong", reply
         assert reply.get("ts") == 12345, reply
 
@@ -191,9 +191,9 @@ class TestPhase4WebSocketHeartbeat:
                 # Pre-handshake rejection (HTTP-level)
                 return getattr(e, "status_code", None) or "rejected_pre_handshake"
 
-        code = asyncio.get_event_loop().run_until_complete(_try(_WS_BASE))
+        code = asyncio.run(_try(_WS_BASE))
         if code is None or (isinstance(code, int) and code != 1008):
-            code = asyncio.get_event_loop().run_until_complete(_try(_WS_LOCAL))
+            code = asyncio.run(_try(_WS_LOCAL))
         # Accept either 1008 close OR pre-handshake reject (some ingresses block bad-handshake)
         assert code == 1008 or code == "rejected_pre_handshake" or (isinstance(code, int) and 1000 <= code <= 4999), \
             f"expected 1008 close, got: {code}"
@@ -212,9 +212,9 @@ class TestPhase4WebSocketHeartbeat:
                 # Functionally equivalent to 1008 from a security standpoint.
                 return getattr(e.response, "status_code", None) or "rejected_pre_handshake"
 
-        code = asyncio.get_event_loop().run_until_complete(_try(_WS_BASE))
+        code = asyncio.run(_try(_WS_BASE))
         if code is None:
-            code = asyncio.get_event_loop().run_until_complete(_try(_WS_LOCAL))
+            code = asyncio.run(_try(_WS_LOCAL))
         # Accept 1008 close OR HTTP 403 pre-handshake reject (both mean "unauthorized").
         assert code == 1008 or code == 403 or code == "rejected_pre_handshake", \
             f"expected 1008 or 403 reject, got {code}"
@@ -247,6 +247,16 @@ class TestPhase4VisitIdempotency:
             timeout=10,
         )
         assert verify.status_code == 200, verify.text
+        # This fixture is class-scoped, so it runs BEFORE conftest.py's
+        # function-scoped autouse `_release_shared_worker_schedules` fixture
+        # (pytest instantiates broader-scoped fixtures first) — that cleanup
+        # would arrive too late to help this accept() call. Release
+        # WORKER_PHONE's schedule here explicitly instead. See the block
+        # comment in conftest.py above `_release_worker_schedule` for why
+        # this exists at all: other test files book this same shared worker
+        # for this same fixed slot, and one that never reaches checkout
+        # leaves it occupied for every test after it.
+        _release_worker_schedule(WORKER_PHONE)
         acc = requests.post(f"{API}/bookings/{bid}/accept", headers=wh, timeout=10)
         assert acc.status_code == 200, acc.text
         return {"bid": bid, "wh": wh}
@@ -346,7 +356,13 @@ class TestPhase4EscalationBroadcast:
             },
             timeout=10,
         )
-        requests.post(f"{API}/bookings/{bid}/accept", headers=wh, timeout=10)
+        # This result was previously never checked, so a WORKER_SCHEDULE_
+        # CONFLICT here (shared worker, shared test slot — see conftest.py)
+        # silently left the booking unassigned, and the actual failure only
+        # surfaced several steps later as a confusing WS 403 on
+        # /ws/booking/{bid} rather than a clear accept-time error.
+        acc = requests.post(f"{API}/bookings/{bid}/accept", headers=wh, timeout=10)
+        assert acc.status_code == 200, f"accept failed: {acc.status_code} {acc.text}"
 
         token = worker_auth["tokens"]["access_token"]
 
@@ -382,9 +398,9 @@ class TestPhase4EscalationBroadcast:
                 return resp, got_msg, pong
 
         try:
-            resp, got_msg, pong = asyncio.get_event_loop().run_until_complete(_flow(_WS_BASE))
+            resp, got_msg, pong = asyncio.run(_flow(_WS_BASE))
         except Exception:
-            resp, got_msg, pong = asyncio.get_event_loop().run_until_complete(_flow(_WS_LOCAL))
+            resp, got_msg, pong = asyncio.run(_flow(_WS_LOCAL))
 
         assert resp.status_code == 200, f"escalate failed: {resp.status_code} {resp.text}"
         assert pong.get("type") == "pong" and pong.get("ts") == 7777, pong

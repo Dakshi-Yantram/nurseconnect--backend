@@ -20,11 +20,11 @@ def _h(auth):
 class TestAuth:
     def test_admin_clinical_login(self, admin_clinical_auth):
         assert admin_clinical_auth["tokens"]["access_token"]
-        assert admin_clinical_auth["user"]["role"] == "admin_clinical"
+        assert admin_clinical_auth["user"]["role"] == "admin"
 
     def test_admin_super_login(self, admin_super_auth):
         assert admin_super_auth["tokens"]["access_token"]
-        assert admin_super_auth["user"]["role"] == "admin_super"
+        assert admin_super_auth["user"]["role"] == "admin"
 
     def test_worker_login(self, worker_auth):
         assert worker_auth["tokens"]["access_token"]

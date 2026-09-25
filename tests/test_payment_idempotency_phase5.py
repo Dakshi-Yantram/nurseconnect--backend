@@ -34,14 +34,14 @@ OTP = "123456"
 # ----------------------------- helpers -----------------------------
 def _unique_phone() -> str:
     """Fresh consumer phone per scenario to avoid stale-state collisions."""
-    return f"+9199{str(uuid4().int)[-9:]}"
+    return f"+919{str(uuid4().int)[-9:]}"  # 10-digit Indian mobile (+91 9XXXXXXXXX)
 
 
 def _login(phone: str, role: str) -> tuple[str, str]:
-    r = requests.post(f"{API}/auth/send-otp", json={"phone_e164": phone, "role": role}, timeout=10)
+    r = requests.post(f"{API}/auth/otp/send", json={"phone_e164": phone, "role": role}, timeout=10)
     assert r.status_code == 200, f"send-otp {r.status_code}: {r.text}"
     r = requests.post(
-        f"{API}/auth/verify-otp",
+        f"{API}/auth/otp/verify",
         json={
             "phone_e164": phone,
             "code": OTP,
@@ -272,6 +272,30 @@ class TestBookingWorkerVisitLifecycle:
         vbody = v.json()
         assert vbody["booking_status"] == "confirmed"
         assert vbody["payment_status"] == "captured"
+
+        # Patch 5A gates check-in behind service consent and medication
+        # administration behind medication consent (see
+        # app/api/v1/visits.py require_consent calls) — nothing creates
+        # that consent automatically, a real consumer grants it explicitly
+        # via POST /consents. Grant both, scoped to this booking, so
+        # test_visit_checkin/test_visit_medication_submit below can
+        # actually proceed like a real flow would (same fix already
+        # applied in tests/test_patch3_proximity.py for the identical gap).
+        for consent_type in ("service", "medication"):
+            cr = requests.post(
+                f"{API}/consents",
+                headers=_h(ctoken),
+                json={
+                    "patient_id": pid,
+                    "booking_id": booking["id"],
+                    "consent_type": consent_type,
+                    "consented_by_name": "Phase5 Test Family",
+                    "relationship_to_patient": "self",
+                },
+                timeout=10,
+            )
+            assert cr.status_code == 200, f"consent grant ({consent_type}) failed: {cr.status_code} {cr.text}"
+
         return {
             "ctoken": ctoken,
             "wtoken": wtoken,

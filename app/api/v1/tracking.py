@@ -122,6 +122,44 @@ async def _audit_ws_reject(user_id, role: str, endpoint: str, entity_type: str, 
         pass
 
 
+async def _ws_authenticate(token: str | None):
+    """Validate a WebSocket query-string token the same way get_current_user
+    validates a Bearer header.
+
+    SECURITY: the sockets used to accept ANY token the server had signed —
+    including 30-day refresh tokens and 60-second report-download tokens — and
+    never checked whether the account was suspended or the session revoked.
+    Returns (user_id, role_value) or None.
+    """
+    from app.models.enums import UserStatus
+    from app.models.models import UserSession
+
+    if not token:
+        return None
+    try:
+        claims = decode_token(token)
+    except ValueError:
+        return None
+    if claims.get("type") != "access":
+        return None
+    try:
+        user_id = UUID(str(claims.get("sub")))
+    except (TypeError, ValueError):
+        return None
+    async with AsyncSessionLocal() as db:
+        sid = claims.get("sid")
+        if sid:
+            revoked = (await db.execute(
+                select(UserSession.revoked).where(UserSession.refresh_token_jti == sid)
+            )).scalar_one_or_none()
+            if revoked is None or revoked:
+                return None
+        user = (await db.execute(select(User).where(User.id == user_id))).scalar_one_or_none()
+        if not user or user.status not in (UserStatus.active, UserStatus.onboarding):
+            return None
+        return user.id, user.role.value
+
+
 @router.websocket("/ws/booking/{booking_id}")
 async def ws_booking(websocket: WebSocket, booking_id: UUID, token: str | None = None, db: AsyncSession = Depends(get_db)):
     # Auth via query token
@@ -129,14 +167,12 @@ async def ws_booking(websocket: WebSocket, booking_id: UUID, token: str | None =
         await _audit_ws_reject(None, "anonymous", "/ws/booking/{id}", "booking", booking_id, "missing_token")
         await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
         return
-    try:
-        claims = decode_token(token)
-    except ValueError:
+    auth = await _ws_authenticate(token)
+    if auth is None:
         await _audit_ws_reject(None, "anonymous", "/ws/booking/{id}", "booking", booking_id, "invalid_token")
         await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
         return
-    user_id = UUID(claims["sub"])
-    role = claims.get("role", "")
+    user_id, role = auth  # role from the DATABASE, not the token claims
     # Verify user has access
     bres = await db.execute(select(Booking).where(Booking.id == booking_id))
     b = bres.scalar_one_or_none()
@@ -148,7 +184,7 @@ async def ws_booking(websocket: WebSocket, booking_id: UUID, token: str | None =
     cp = cres.scalar_one_or_none()
     wres = await db.execute(select(WorkerProfile).where(WorkerProfile.id == b.worker_id)) if b.worker_id else None
     wp = wres.scalar_one_or_none() if wres else None
-    allowed = (cp and cp.user_id == user_id) or (wp and wp.user_id == user_id) or role.startswith("admin")
+    allowed = (cp and cp.user_id == user_id) or (wp and wp.user_id == user_id) or role == "admin"
     if not allowed:
         await _audit_ws_reject(user_id, role, "/ws/booking/{id}", "booking", booking_id, "not_owner_or_assigned")
         await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
@@ -181,13 +217,12 @@ async def ws_user(websocket: WebSocket, token: str | None = None):
         await _audit_ws_reject(None, "anonymous", "/ws/user", "ws_user", None, "missing_token")
         await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
         return
-    try:
-        claims = decode_token(token)
-    except ValueError:
+    auth = await _ws_authenticate(token)
+    if auth is None:
         await _audit_ws_reject(None, "anonymous", "/ws/user", "ws_user", None, "invalid_token")
         await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
         return
-    user_id = UUID(claims["sub"])
+    user_id, _role = auth
     topic = user_topic(user_id)
     await manager.connect(websocket, topic)
     try:

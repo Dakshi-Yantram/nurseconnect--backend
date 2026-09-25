@@ -44,10 +44,10 @@ class TestHealth:
 class TestAuth:
     def test_send_otp_consumer(self):
         r = requests.post(
-            f"{API}/auth/send-otp",
-            json={"phone_e164": "+919999000001", "role": "consumer"},
-            timeout=10,
-        )
+        f"{API}/auth/otp/send",   # ✅ correct
+        json={"phone_e164": "+919999000001", "role": "consumer"},
+        timeout=10,
+    )
         assert r.status_code == 200, r.text
         body = r.json()
         assert body.get("dev_otp") == "123456"
@@ -58,10 +58,10 @@ class TestAuth:
         roles = [
             ("+919999000001", "consumer"),
             ("+919999000002", "worker"),
-            ("+919999000003", "admin_ops"),
-            ("+919999000004", "admin_super"),
-            ("+919999000005", "admin_finance"),
-            ("+919999000006", "admin_clinical"),
+            ("+919999000003", "admin"),
+            ("+919999000004", "admin"),
+            ("+919999000005", "admin"),
+            ("+919999000006", "admin"),
         ]
         for phone, role in roles:
             data = _login(phone, role)
@@ -284,8 +284,33 @@ def booking_ctx(consumer_auth, worker_auth):
     r = requests.post(f"{API}/bookings/", headers=ch, json=payload, timeout=10)
     assert r.status_code == 200, r.text
     booking = r.json()
+    bid = booking["id"]
+
+    # Patch 5A gates check-in/checklist behind service consent and
+    # medications behind medication consent (see app/api/v1/visits.py
+    # require_consent calls) — nothing creates that consent automatically,
+    # a real consumer grants it explicitly via POST /consents. Grant both,
+    # scoped to this booking, so test_05_checkin/test_07_medication below
+    # can actually proceed like a real flow would, instead of asserting
+    # around a step this suite never took (same fix already applied in
+    # tests/test_patch3_proximity.py for the identical gap).
+    for consent_type in ("service", "medication"):
+        cr = requests.post(
+            f"{API}/consents",
+            headers=ch,
+            json={
+                "patient_id": pid,
+                "booking_id": bid,
+                "consent_type": consent_type,
+                "consented_by_name": "Backend Test Family",
+                "relationship_to_patient": "self",
+            },
+            timeout=10,
+        )
+        assert cr.status_code == 200, f"consent grant ({consent_type}) failed: {cr.status_code} {cr.text}"
+
     return {
-        "ch": ch, "wh": wh, "booking": booking, "bid": booking["id"], "pid": pid, "svc_id": svc_id,
+        "ch": ch, "wh": wh, "booking": booking, "bid": bid, "pid": pid, "svc_id": svc_id,
     }
 
 
