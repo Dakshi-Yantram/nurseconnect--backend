@@ -78,7 +78,12 @@ async def list_services(
         conds.append(ServiceCatalogue.is_active.is_(True))
     if category:
         conds.append(ServiceCatalogue.category == category)
-    res = await db.execute(select(ServiceCatalogue).where(and_(*conds)) if conds else select(ServiceCatalogue))
+    # Deterministic order: without an ORDER BY, Postgres may return these
+    # rows in a different sequence between calls, which made any client
+    # (or test) that relied on "the first service" — e.g. svcs[0] — flaky
+    # in a way that had nothing to do with what it was actually testing.
+    query = select(ServiceCatalogue).where(and_(*conds)) if conds else select(ServiceCatalogue)
+    res = await db.execute(query.order_by(ServiceCatalogue.name))
     # Filtered in Python rather than SQL: allowed_provider_types is a
     # nullable ARRAY and "NULL means unrestricted" does not express cleanly
     # as an indexable predicate. The catalogue is small and already fully

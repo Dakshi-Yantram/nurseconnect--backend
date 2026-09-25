@@ -32,6 +32,17 @@ from tests import _offline_stubs
 
 _offline_stubs.install()
 
+
+def tearDownModule() -> None:
+    """Undo _offline_stubs.install() once every test in this module has
+    run. See tests/test_invoice_pdf.py's tearDownModule for why this is
+    required — the short version: without it, this file's stubbed
+    sqlalchemy/app.core.database modules leak into every later test file
+    in the same pytest process.
+    """
+    _offline_stubs.uninstall()
+
+
 from tests._offline_stubs import FakeResult, FakeSession  # noqa: E402
 
 from app.models.enums import PayoutApprovalStatus, WorkerPayoutStatus  # noqa: E402

@@ -96,7 +96,15 @@ def ctx(nurse_auth, family_auth):
     wh = auth_headers(nurse_auth)
 
     svcs = requests.get(f"{API}/services", timeout=10).json()
-    svc_id = svcs[0]["id"]
+    # GET /services has no stable sort order (no ORDER BY in
+    # catalog.py::list_services), so svcs[0] can land on a service with
+    # requires_prescription=True on any given call — this suite's
+    # test_05_medications submits a medication with no prescription_id, so
+    # it needs a service that does NOT gate on one. Pick explicitly rather
+    # than relying on index 0.
+    non_rx_svcs = [s for s in svcs if not s.get("requires_prescription")]
+    assert non_rx_svcs, "no service without requires_prescription found in catalogue"
+    svc_id = non_rx_svcs[0]["id"]
     patients = requests.get(f"{API}/patients", headers=ch, timeout=10).json()
     pid = patients[0]["id"]
 

@@ -1807,10 +1807,80 @@ async def seed_training_modules(session) -> int:
     return created
 
 
+# Fixed, hand-authored assessments the test suite (test_patch4b_lifecycle.py)
+# asserts on by exact code — distinct from the auto-generated question-bank
+# modules above, which use "ASM-MOD-*" codes and don't include either of
+# these. Kept small and separate rather than folded into the generator so
+# their content stays stable and legible for what the tests check:
+#   - IV_INFUSION_ASSESSMENT_V1 (published): a full flat-submit round trip
+#     (single_select / boolean / multi_select / text) with a known-passing
+#     answer set [1, True, [0, 1, 2], "desc"] and a known-failing one
+#     [0, False, [], ""].
+#   - PICC_LINE_ASSESSMENT_V1_DRAFT (draft): exists only to prove a draft
+#     assessment is invisible to the worker-facing list/detail/submit
+#     endpoints (which all filter on status == published) and only visible
+#     via the admin draft listing.
+TEST_FIXTURE_ASSESSMENT_MODULES = [
+    {
+        "code": "IV_INFUSION_ASSESSMENT_V1",
+        "title": "IV Infusion — Assessment",
+        "description": "Scored assessment for the IV Infusion qualification.",
+        "pass_score": 70,
+        "linked_training_module_code": "IV_INFUSION_V1",
+        "status": "published",
+        "questions": [
+            {
+                "id": "q1", "type": "single_select",
+                "text": "Before starting a prescribed IV infusion, what must the nurse verify first?",
+                "options": [
+                    "The infusion pump's brand",
+                    "Prescription, patient identity, and IV site patency",
+                    "The patient's insurance details",
+                    "Nothing — proceed directly",
+                ],
+                "correct_index": 1,
+            },
+            {
+                "id": "q2", "type": "boolean",
+                "text": "A sudden fever and breathlessness during infusion should be escalated immediately.",
+                "correct_bool": True,
+            },
+            {
+                "id": "q3", "type": "multi_select",
+                "text": "Which of these are part of the infusion-site safety check? (select all that apply)",
+                "options": ["Patency", "Signs of infection", "Correct patient", "Room temperature"],
+                "correct_indices": [0, 1, 2],
+            },
+            {
+                "id": "q4", "type": "text",
+                "text": "Briefly describe what you would do if the IV site shows swelling.",
+            },
+        ],
+    },
+    {
+        "code": "PICC_LINE_ASSESSMENT_V1_DRAFT",
+        "title": "PICC Line Care — Assessment (draft)",
+        "description": "Draft assessment for the PICC Line Care qualification — not yet published.",
+        "pass_score": 70,
+        "linked_training_module_code": "PICC_LINE_CARE",
+        "status": "draft",
+        "questions": [
+            {
+                "id": "q1", "type": "single_select",
+                "text": "How often should a PICC line dressing be changed under routine care?",
+                "options": ["Daily", "Weekly, or per protocol", "Only when visibly soiled", "Never"],
+                "correct_index": 1,
+            },
+        ],
+    },
+]
+
+
 async def seed_assessment_modules(session) -> int:
-    """Seed workbook assessment modules grouped from Questionnaire to Package."""
+    """Seed workbook assessment modules grouped from Questionnaire to Package,
+    plus the fixed test-fixture assessments above. Idempotent."""
     created = 0
-    for source in GENERATED_ASSESSMENT_MODULES:
+    for source in [*GENERATED_ASSESSMENT_MODULES, *TEST_FIXTURE_ASSESSMENT_MODULES]:
         data = dict(source)
         exists = await session.execute(
             select(AssessmentModule).where(AssessmentModule.code == data["code"])
@@ -1818,6 +1888,7 @@ async def seed_assessment_modules(session) -> int:
         if exists.scalar_one_or_none():
             print(f"  · assessment module {data['code']} already exists, skipping")
             continue
+        status = ContentStatus(data.get("status", "published"))
         session.add(AssessmentModule(
             code=data["code"],
             title=data["title"],
@@ -1826,13 +1897,13 @@ async def seed_assessment_modules(session) -> int:
             questions=data.get("questions") or [],
             linked_training_module_code=data.get("linked_training_module_code"),
             questions_per_attempt=data.get("questions_per_attempt"),
-            status=ContentStatus.published,
+            status=status,
             is_active=True,
             version=1,
-            published_version=1,
+            published_version=1 if status == ContentStatus.published else None,
         ))
         created += 1
-        print(f"  + created assessment module {data['code']}")
+        print(f"  + created assessment module {data['code']} ({status.value})")
     return created
 
 

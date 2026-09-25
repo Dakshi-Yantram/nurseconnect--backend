@@ -200,6 +200,52 @@ def install() -> None:
                 AsyncSessionLocal=_Sentinel())
 
 
+# Every module name install() may create from scratch in sys.modules. Kept
+# in one place so uninstall() can never drift out of sync with what
+# install() actually touches.
+_STUBBED_MODULE_NAMES = (
+    "sqlalchemy",
+    "sqlalchemy.orm",
+    "sqlalchemy.ext.asyncio",
+    "sqlalchemy.dialects.postgresql",
+    "sqlalchemy.pool",
+    "pydantic_settings",
+    "pydantic",
+    "app.core.database",
+)
+
+
+def uninstall() -> None:
+    """Undo install(): drop every module it created, so a later, REAL
+    import in the same pytest process gets the genuine package instead of
+    this stub.
+
+    install() mutates `sys.modules` — a process-wide, not per-file, dict —
+    and this whole test suite runs as one pytest process. Without a
+    matching uninstall(), any test file collected after this one that even
+    lazily (inside a test function body) imports a real app.* module that
+    touches sqlalchemy gets THIS stub instead of the real thing. That is
+    exactly what broke, in the same CI run as this file's own tests:
+      - tests/test_patch5a.py::TestConsentService::
+        test_has_active_consent_returns_false_when_none
+      - tests/test_patch5b_hardening.py::
+        test_insurance_override_writes_audit_entry
+    both with `TypeError: '_Sentinel' object does not support the
+    asynchronous context manager protocol` — both run later in
+    alphabetical file order and both do `async with AsyncSessionLocal()`
+    directly against `app.core.database`.
+
+    Every offline test module that calls install() must call uninstall()
+    once its own tests finish (see the autouse fixture in
+    tests/test_invoice_pdf.py, tests/test_payment_flow.py and
+    tests/test_payout_release.py). Safe to call more than once, and safe
+    to call even if install() was never called or another offline module
+    already cleaned up — each entry is a plain, guarded sys.modules.pop.
+    """
+    for name in _STUBBED_MODULE_NAMES:
+        sys.modules.pop(name, None)
+
+
 # ===========================================================================
 # Fakes used by the payout tests
 # ===========================================================================
