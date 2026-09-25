@@ -71,6 +71,22 @@ def _seed_paid_booking_or_order_only(*, pay=False):
     }, timeout=15)
     bk.raise_for_status()
     bid = bk.json()["id"]
+
+    # Patch 5A gates check-in/checklist behind service consent and
+    # medications behind medication consent (see app/api/v1/visits.py
+    # require_consent calls) — nothing creates that consent automatically,
+    # a real consumer grants it explicitly via POST /consents. Grant both,
+    # scoped to this booking, so the checkin/checklist/checkout flow below
+    # can actually proceed like a real flow would (same fix already applied
+    # in tests/test_patch3_proximity.py, tests/backend_test.py and
+    # tests/test_payment_idempotency_phase5.py for the identical gap).
+    for consent_type in ("service", "medication"):
+        cr = httpx.post(f"{BASE}/consents", headers=_hdr(token), json={
+            "patient_id": pid, "booking_id": bid, "consent_type": consent_type,
+            "consented_by_name": "Phase6 Test Family", "relationship_to_patient": "self",
+        }, timeout=15)
+        assert cr.status_code == 200, f"consent grant ({consent_type}) failed: {cr.status_code} {cr.text}"
+
     order = httpx.post(f"{BASE}/payments/order", headers=_hdr(token),
                       json={"booking_id": bid}, timeout=15).json()
     rpid = None

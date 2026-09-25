@@ -232,6 +232,22 @@ class TestPhase4VisitIdempotency:
         wh = auth_headers(worker_auth)
         booking = _create_consumer_booking(ch)
         bid = booking["id"]
+
+        # Patch 5A gates check-in behind service consent (see
+        # app/api/v1/visits.py require_consent calls) — nothing creates
+        # that consent automatically, a real consumer grants it explicitly
+        # via POST /consents. Grant it here so test_checkin_idempotent /
+        # test_checkout_idempotent below can actually proceed (same fix
+        # already applied in tests/test_patch3_proximity.py,
+        # tests/backend_test.py, tests/test_payment_idempotency_phase5.py
+        # and tests/test_phase6_hardening.py for the identical gap).
+        cr = requests.post(f"{API}/consents", headers=ch, json={
+            "patient_id": booking["patient_id"], "booking_id": bid,
+            "consent_type": "service", "consented_by_name": "Phase4 Test Family",
+            "relationship_to_patient": "self",
+        }, timeout=10)
+        assert cr.status_code == 200, f"consent grant failed: {cr.status_code} {cr.text}"
+
         order = requests.post(
             f"{API}/payments/order", headers=ch, json={"booking_id": bid}, timeout=10
         ).json()
