@@ -41,11 +41,7 @@ from reportlab.lib.units import mm
 from reportlab.pdfgen import canvas as pdf_canvas
 
 from app.core.company import CompanyIdentity
-<<<<<<< HEAD
 from app.services.invoice_pdf import _SMALL, _Doc, _header, _meta_pairs
-=======
-from app.services.invoice_pdf import _Doc, _header, _meta_pairs
->>>>>>> origin/staging
 
 # All user-facing times are shown in IST. Timestamps in the DB are UTC and the
 # EC2 host clock is UTC; before this change the PDF printed raw UTC times with
@@ -168,7 +164,6 @@ class _WatermarkedDoc(_Doc):
         c = self.c
         line = self._identity_line()
         c.saveState()
-<<<<<<< HEAD
         # 1) A single centred diagonal watermark stamp, drawn ON TOP of the
         #    content (semi-transparent) so it can't be hidden by covering it
         #    with a white box and can't be cropped off.
@@ -188,29 +183,6 @@ class _WatermarkedDoc(_Doc):
         c.translate(self.width / 2, self.height / 2)
         c.rotate(32)
         c.drawCentredString(0, 0, line)
-=======
-        # 1) Tiled diagonal watermark across the whole page, drawn ON TOP of
-        #    the content (semi-transparent) so it can't be hidden by covering
-        #    it with a white box and can't be cropped off.
-        c.setFillColor(colors.HexColor("#1f2937"))
-        c.setFillAlpha(_WM_ALPHA)
-        c.setFont(_WM_FONT, _WM_SIZE)
-        text_w = c.stringWidth(line, _WM_FONT, _WM_SIZE)
-        step_x = text_w + 40 * mm
-        step_y = 38 * mm
-        c.translate(self.width / 2, self.height / 2)
-        c.rotate(32)
-        span = max(self.width, self.height) * 1.2
-        y = -span
-        row = 0
-        while y < span:
-            x = -span - (row % 2) * (step_x / 2)
-            while x < span:
-                c.drawString(x, y, line)
-                x += step_x
-            y += step_y
-            row += 1
->>>>>>> origin/staging
         c.restoreState()
 
         # 2) Solid footer on every page: readable even on a low-quality photo.
@@ -247,15 +219,12 @@ def render_visit_report_pdf(
     watermark: PdfWatermark,
     care_notes: Optional[str] = None,
     generated_at: Optional[datetime] = None,
-<<<<<<< HEAD
     nurse_id: Optional[str] = None,
     package_name: Optional[str] = None,
     package_code: Optional[str] = None,
     questionnaire: Optional[list[tuple[str, str]]] = None,
     next_visit_label: Optional[str] = None,
     document_title: Optional[str] = None,
-=======
->>>>>>> origin/staging
 ) -> bytes:
     """Render a visit's care summary, watermarked for `watermark`'s viewer.
 
@@ -263,7 +232,6 @@ def render_visit_report_pdf(
     no code path that can produce an un-attributed copy of this document.
     `care_notes` is only rendered when `include_clinical_notes` is True, so a
     family PDF can never carry them even if a caller passed them in.
-<<<<<<< HEAD
 
     `document_title` lets the caller distinguish the two audiences at the
     top of the page ("NURSE VISIT REPORT" vs "VISIT CARE SUMMARY") without
@@ -278,16 +246,12 @@ def render_visit_report_pdf(
     if check_in_at and check_out_at and check_out_at > check_in_at:
         duration_minutes = int((check_out_at - check_in_at).total_seconds() // 60)
 
-=======
-    """
->>>>>>> origin/staging
     buf = io.BytesIO()
     doc = _WatermarkedDoc(buf, watermark)
 
     _header(
         doc,
         company,
-<<<<<<< HEAD
         document_title or ("NURSE VISIT REPORT" if include_clinical_notes else "VISIT CARE SUMMARY"),
         "(Nurse's working copy — internal use only)" if include_clinical_notes else "(Family copy)",
     )
@@ -315,27 +279,6 @@ def render_visit_report_pdf(
             doc.row("Package Code:", pdf_safe(package_code, limit=40))
         doc.rule()
 
-=======
-        "VISIT CARE SUMMARY",
-        "(Nurse's working copy)" if include_clinical_notes else "(Family copy)",
-    )
-
-    _meta_pairs(
-        doc,
-        [
-            ("Booking Ref", pdf_safe(booking_ref, limit=40) or "\u2014"),
-            ("Generated", _fmt_dt(generated_at or watermark.generated_at)),
-            ("Patient", pdf_safe(patient_name) or "\u2014"),
-            (
-                "Care Provider",
-                (pdf_safe(nurse_name) or "\u2014")
-                + (f" ({pdf_safe(nurse_council_no, limit=30)})" if nurse_council_no else ""),
-            ),
-        ],
-    )
-    doc.rule()
-
->>>>>>> origin/staging
     doc.text("VISIT TIMING:", bold=True)
     doc.rule()
     doc.row("Checked in:", _fmt_dt(check_in_at))
@@ -369,7 +312,6 @@ def render_visit_report_pdf(
         doc.wrapped("No vitals were recorded during this visit.")
     doc.rule()
 
-<<<<<<< HEAD
     if questionnaire:
         doc.gap()
         doc.text("PACKAGE QUESTIONNAIRE:", bold=True)
@@ -379,8 +321,6 @@ def render_visit_report_pdf(
             doc.text(pdf_safe(answer, limit=90) or "\u2014", size=_SMALL, indent=5 * mm)
         doc.rule()
 
-=======
->>>>>>> origin/staging
     doc.text(f"{summary_label.upper()}:", bold=True)
     doc.rule()
     doc.wrapped(pdf_safe(summary_text, limit=20000).strip() or "Not recorded.")
@@ -388,25 +328,18 @@ def render_visit_report_pdf(
 
     if include_clinical_notes:
         doc.gap()
-<<<<<<< HEAD
         doc.text("CLINICAL NOTES / OBSERVATIONS (INTERNAL):", bold=True)
-=======
-        doc.text("CLINICAL NOTES (INTERNAL):", bold=True)
->>>>>>> origin/staging
         doc.rule()
         doc.wrapped(pdf_safe(care_notes, limit=20000).strip() or "No clinical notes recorded.")
         doc.rule()
 
     doc.gap()
-<<<<<<< HEAD
     doc.text("NEXT VISIT:" if not include_clinical_notes else "NEXT ACTION / NEXT VISIT:", bold=True)
     doc.rule()
     doc.wrapped(pdf_safe(next_visit_label, limit=80) or "No further visit is currently scheduled.")
     doc.rule()
 
     doc.gap()
-=======
->>>>>>> origin/staging
     doc.wrapped(
         "This is a computer-generated visit summary and does not require a signature. "
         f"For queries contact {company.support_email}."
