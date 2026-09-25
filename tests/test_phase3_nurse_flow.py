@@ -81,6 +81,28 @@ def ctx(nurse_auth, family_auth):
         "UPDATE bookings SET status='confirmed', payment_status='captured', worker_id=NULL WHERE id=%s",
         (bid,),
     )
+    # Patch 5A gates check-in/checklist behind service consent and
+    # medications behind medication consent (see app/api/v1/visits.py
+    # require_consent calls) — nothing creates that consent automatically,
+    # a real consumer grants it explicitly via POST /consents. Grant both,
+    # scoped to this booking, so the visit lifecycle below can actually
+    # proceed through check-in and medications like a real flow would
+    # (same fix already applied in tests/test_patch3_proximity.py for the
+    # identical gap).
+    for consent_type in ("service", "medication"):
+        cr = requests.post(
+            f"{API}/consents",
+            headers=ch,
+            json={
+                "patient_id": pid,
+                "booking_id": bid,
+                "consent_type": consent_type,
+                "consented_by_name": "Phase3 Test Family",
+                "relationship_to_patient": "self",
+            },
+            timeout=10,
+        )
+        assert cr.status_code == 200, f"consent grant ({consent_type}) failed: {cr.status_code} {cr.text}"
     return {"ch": ch, "wh": wh, "bid": bid, "pid": pid, "booking": booking}
 
 
