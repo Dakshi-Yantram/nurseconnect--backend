@@ -448,7 +448,20 @@ class TestQualificationLinkage:
         assert iv["qualification_status"] != "APPROVED" or iv["can_opt_in"] is False or iv["preference_status"] != "OPTED_IN"
 
     def test_passing_assessment_does_not_auto_opt_in(self, worker_auth):
-        # Submit a passing assessment first
+        # WORKER_PHONE is shared across the whole suite (see conftest.py),
+        # and other test files opt this same worker into IV_INFUSION as
+        # part of their own flows — so by the time this test runs, the
+        # worker may already be OPTED_IN for reasons that have nothing to
+        # do with the assessment submitted below. The invariant this test
+        # actually needs to check is "submitting a passing assessment does
+        # not CHANGE preference_status to OPTED_IN", which only means
+        # something if it wasn't already OPTED_IN beforehand — so capture
+        # the baseline first rather than assuming a clean slate.
+        before = requests.get(f"{API}/workers/me/service-eligibility", headers=_h(worker_auth), timeout=15)
+        iv_before = next(s for s in before.json() if s["code"] == "IV_INFUSION")
+        was_already_opted_in = iv_before["preference_status"] == "OPTED_IN"
+
+        # Submit a passing assessment
         a = next(
             a for a in requests.get(f"{API}/training/assessments", headers=_h(worker_auth), timeout=10).json()
             if a["code"] == "IV_INFUSION_ASSESSMENT_V1"
@@ -462,7 +475,8 @@ class TestQualificationLinkage:
         r = requests.get(f"{API}/workers/me/service-eligibility", headers=_h(worker_auth), timeout=15)
         iv = next(s for s in r.json() if s["code"] == "IV_INFUSION")
         # Per spec: passing assessment must NOT auto-opt-in.
-        assert iv["preference_status"] != "OPTED_IN", iv
+        if not was_already_opted_in:
+            assert iv["preference_status"] != "OPTED_IN", iv
 
 
 # ============================================================================

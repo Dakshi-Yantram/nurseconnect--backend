@@ -232,7 +232,14 @@ class TestDeviceRegistration:
         r = requests.post(
             f"{API}/notifications/devices",
             headers=wh,
-            json={"device_id": "pytest-device-2"},
+            # `platform` is a required field on DeviceRegisterRequest (see
+            # app/schemas/schemas.py) — omitting it, as this test used to,
+            # never reached the endpoint's own "at least one token" check at
+            # all; pydantic rejected the request first with a 422 before
+            # that business rule ever ran. Supply it so the request is
+            # otherwise valid and the actual rule under test — no fcm_token
+            # and no apns_voip_token — is what produces the 400.
+            json={"device_id": "pytest-device-2", "platform": "android"},
             timeout=10,
         )
         assert r.status_code == 400, r.text
