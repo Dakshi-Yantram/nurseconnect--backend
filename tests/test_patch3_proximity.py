@@ -341,6 +341,27 @@ class TestWorkerBookings:
         ]
         assert eligible_svcs, f"no eligible non-prescription service found: {elig}"
         svc_id = eligible_svcs[0]["id"]
+        # Pin the worker's own current location to the exact same coordinates
+        # this booking will use. WORKER_PHONE is shared across the whole
+        # suite, and other tests in THIS SAME proximity-testing file
+        # deliberately set the worker's location to various points to
+        # exercise wave/radius logic — if one of those left a FRESH
+        # (within CURRENT_LOCATION_FRESHNESS_MINUTES) location on file that
+        # isn't near Mumbai, /worker/new-requests computes a real
+        # haversine distance against it and the wave-1 5km radius excludes
+        # this booking, with no city-name fallback (that fallback only
+        # applies when the worker has NO fresh-or-home location at all —
+        # see app/api/v1/bookings.py's new_requests). Setting it here
+        # removes that uncertainty entirely rather than hoping no earlier
+        # test left the worker somewhere else.
+        loc = requests.post(
+            f"{API}/workers/me/location",
+            headers=wh,
+            json={"latitude": 19.0760, "longitude": 72.8777},
+            timeout=10,
+        )
+        assert loc.status_code == 200, f"location update failed: {loc.status_code} {loc.text}"
+
         patients = requests.get(f"{API}/patients", headers=ch, timeout=10).json()
         pid = patients[0]["id"]
         scheduled_date = (date.today() + timedelta(days=random.randint(1, 30))).isoformat()
