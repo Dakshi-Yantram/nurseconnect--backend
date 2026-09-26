@@ -11,7 +11,7 @@ from decimal import Decimal
 from app.core.database import AsyncSessionLocal, engine, Base
 from app.models.models import (
     ServiceCatalogue, CarePackage, TrainingModule, AssessmentModule, Faq,
-    ChecklistTemplate,
+    ChecklistTemplate, ClinicalRuleSet,
 )
 from app.models.enums import (
     ServiceCategory,
@@ -1876,6 +1876,87 @@ TEST_FIXTURE_ASSESSMENT_MODULES = [
 ]
 
 
+async def seed_clinical_rule_sets(session) -> int:
+    """A single, hand-authored ClinicalRuleSet so vitals-triggered
+    escalation (app/services/clinical_engine.py::evaluate_vitals) can
+    actually be exercised. Nothing in this file seeded one before —
+    booking.rule_set_id_snapshot (set from service/package.
+    escalation_rule_set_id at booking creation, see app/api/v1/bookings.py)
+    was always None, so evaluate_vitals was never called at all and any
+    vitals submission always came back with abnormal_flags=[] regardless
+    of how extreme the values were.
+    """
+    exists = await session.execute(
+        select(ClinicalRuleSet).where(ClinicalRuleSet.rule_set_code == "STANDARD_VITALS_V1")
+    )
+    if exists.scalar_one_or_none():
+        print("  · clinical rule set STANDARD_VITALS_V1 already exists, skipping")
+        return 0
+    session.add(ClinicalRuleSet(
+        rule_set_code="STANDARD_VITALS_V1",
+        name="Standard Vitals Safety Thresholds",
+        version=1,
+        is_active=True,
+        vital_thresholds={
+            "bp_systolic": {"critical_high": 180, "warning_high": 140, "critical_low": 90},
+            "bp_diastolic": {"critical_high": 120, "warning_high": 90, "critical_low": 60},
+            "pulse": {"critical_high": 130, "warning_high": 100, "critical_low": 50},
+            "spo2": {"critical_low": 90, "warning_low": 94},
+            "temperature_f": {"critical_high": 104.0, "warning_high": 102.0},
+        },
+        red_flag_symptoms=[],
+        allergy_check_required=True,
+        escalation_levels={
+            "emergency": {"notify": ["family", "admin"], "sla_minutes": 15, "auto_call_112": True},
+            "contact_doctor": {"notify": ["family"], "sla_minutes": 60, "auto_call_112": False},
+            "inform_family": {"notify": ["family"], "sla_minutes": None, "auto_call_112": False},
+        },
+    ))
+    print("  + created clinical rule set STANDARD_VITALS_V1")
+    return 1
+
+
+async def link_service_rule_sets(session) -> int:
+    """Attach STANDARD_VITALS_V1 to one service that has neither a
+    checklist_template_id nor a documentation_template_id.
+
+    Deliberately NOT a checklist/documentation-gated service: no endpoint
+    in this app actually creates the structured VisitChecklistResponse /
+    VisitDocumentationItem rows those gates read (see
+    tests/test_phase6_hardening.py's comments for the full story), so a
+    booking against such a service can never reach checkout at all today.
+    Picking one of those would make the escalation rule set untestable via
+    the same booking flow it's meant to be exercised through. Ordered by
+    name to land on the same service GET /services returns first (see
+    app/api/v1/catalog.py::list_services' ORDER BY) — the one
+    tests/backend_test.py's booking_ctx already uses via services[0], so
+    no test needs to change which service it asks for.
+    """
+    rres = await session.execute(
+        select(ClinicalRuleSet).where(ClinicalRuleSet.rule_set_code == "STANDARD_VITALS_V1")
+    )
+    rule_set = rres.scalar_one_or_none()
+    if not rule_set:
+        return 0
+    sres = await session.execute(
+        select(ServiceCatalogue)
+        .where(
+            ServiceCatalogue.escalation_rule_set_id.is_(None),
+            ServiceCatalogue.checklist_template_id.is_(None),
+            ServiceCatalogue.documentation_template_id.is_(None),
+        )
+        .order_by(ServiceCatalogue.name)
+        .limit(1)
+    )
+    service = sres.scalar_one_or_none()
+    if not service:
+        print("  ! no baseline (checklist/documentation-free) service found to link a rule set to")
+        return 0
+    service.escalation_rule_set_id = rule_set.id
+    print(f"  + linked service {service.service_code} -> clinical rule set {rule_set.rule_set_code}")
+    return 1
+
+
 async def seed_assessment_modules(session) -> int:
     """Seed workbook assessment modules grouped from Questionnaire to Package,
     plus the fixed test-fixture assessments above. Idempotent."""
@@ -2324,6 +2405,12 @@ async def main():
         print("\nLinking checklist templates onto care packages...")
         checklists_linked += await link_package_checklists(session)
 
+        print("\nSeeding clinical rule sets...")
+        rule_sets_created = await seed_clinical_rule_sets(session)
+
+        print("\nLinking a clinical rule set onto a baseline service...")
+        rule_sets_linked = await link_service_rule_sets(session)
+
         await session.commit()
 
         # Cleanup: remove stale package-level WorkerServiceQualification rows
@@ -2433,12 +2520,15 @@ async def main():
         f"{training_created} training modules, {assessments_created} assessments, "
         f"{workbook_packages_changed} workbook package mappings, {faqs_created} FAQs, "
         f"{checklists_created} checklist templates created, "
-        f"{checklists_linked} service-checklist links created."
+        f"{checklists_linked} service-checklist links created, "
+        f"{rule_sets_created} clinical rule sets created, "
+        f"{rule_sets_linked} service-rule-set links created."
     )
     if (
         services_created == 0 and packages_created == 0 and training_created == 0
         and assessments_created == 0 and workbook_packages_changed == 0
         and faqs_created == 0 and checklists_created == 0 and checklists_linked == 0
+        and rule_sets_created == 0 and rule_sets_linked == 0
     ):
         print("(Everything already existed — database was already seeded.)")
 
