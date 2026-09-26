@@ -50,6 +50,19 @@ def _seed_paid_booking_or_order_only(*, pay=False):
     """Create consumer+patient+booking+order. Optionally pay via verify."""
     phone = _new_consumer_phone()
     token = _login(phone, "consumer")
+    # NOTE: no API endpoint actually creates a VisitChecklistResponse row
+    # (the structured, per-question table validate_documentation_completion
+    # reads) — POST /visits/{id}/checklist only ever wrote the legacy
+    # VisitRecord.checklist_responses JSON blob, which that gate doesn't
+    # read at all. So a service with a real ChecklistTemplate can never be
+    # checked out through this test's flow regardless of what's submitted,
+    # and this suite's checkout tests are only ever exercising the
+    # template-less BASELINE gate (care_notes + family_summary on
+    # VisitRecord) — whichever service lands in services[0] is fine for
+    # that as long as it has no checklist/documentation template forcing
+    # an unsatisfiable path. Deliberately left as services[0], not switched
+    # to a checklist-gated service — see test_checkout_400_when_checklist_missing
+    # below for how the "without checklist" case is actually verified.
     svc_id = httpx.get(f"{BASE}/services", timeout=15).json()[0]["id"]
     # Patient
     patients = httpx.get(f"{BASE}/patients", headers=_hdr(token), timeout=15).json()
@@ -348,18 +361,39 @@ class TestCheckoutBlockedWithoutChecklist:
             "content": "Visit done", "note_type": "observation",
         }, timeout=15)
 
-        # NO checklist call
+        # NO checklist call, and — this is the actual point of the test —
+        # NO family_summary/care_notes in the checkout payload either.
+        # This booking's service has no ChecklistTemplate/DocumentationTemplate
+        # (see the comment in _seed_paid_booking_or_order_only above), so the
+        # only gate that can possibly apply is the template-less BASELINE
+        # report gate, which requires care_notes + family_summary on the
+        # VisitRecord. Supplying them here — as this test used to — fully
+        # satisfies that gate and checkout succeeds regardless of any
+        # checklist, which defeated the entire premise of this test. Omit
+        # them so checkout has nothing to work with and is genuinely blocked.
         co = httpx.post(f"{BASE}/visits/{bid}/checkout", headers=_hdr(wtoken), json={
             "latitude": "19.0760", "longitude": "72.8777",
-            "family_summary": "x", "care_notes": "y",
         }, timeout=15)
-        assert co.status_code == 400, \
-            f"checkout must be 400 without checklist, got {co.status_code}: {co.text}"
+        # Checkout-blocked always comes back as 422 in this app — both the
+        # missing-baseline-report path and the CLINICAL_TEMPLATE_MISSING
+        # WorkflowError path (app/services/care_workflow_engine.py) return
+        # 422, never 400. There is no checkout-blocking response anywhere
+        # in the codebase that returns 400; this assertion used to expect
+        # 400, which could never have matched regardless of which service
+        # or payload this test used — it just never got far enough to
+        # notice, having been blocked earlier by WORKER_SCHEDULE_CONFLICT
+        # and then SERVICE_CONSENT_MISSING in prior fixes.
+        assert co.status_code == 422, \
+            f"checkout must be 422 when blocked, got {co.status_code}: {co.text}"
         body = co.json()
-        detail = body.get("detail")
-        # detail may be dict or string - we accept both
-        detail_str = str(detail).lower()
-        assert "incomplete_documentation" in detail_str, \
-            f"detail must mention incomplete_documentation: {detail}"
-        assert "checklist" in detail_str, \
-            f"detail must list 'checklist' as missing: {detail}"
+        # This booking's service has no ChecklistTemplate/DocumentationTemplate
+        # (see _seed_paid_booking_or_order_only), and no endpoint in this app
+        # actually creates a VisitChecklistResponse row regardless — so the
+        # only gate that can ever block checkout here is the baseline report
+        # gate, not a checklist one. Assert on what actually comes back
+        # (VISIT_REPORT_REQUIRED, naming the still-empty baseline fields)
+        # rather than "checklist" wording this response was never going to
+        # contain.
+        assert body.get("code") == "VISIT_REPORT_REQUIRED", body
+        missing_ids = {item.get("id") for item in body.get("missing_items", [])}
+        assert {"care_notes", "family_summary"} & missing_ids, body
