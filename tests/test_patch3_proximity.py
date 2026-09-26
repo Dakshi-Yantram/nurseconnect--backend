@@ -301,10 +301,46 @@ class TestWorkerBookings:
         # one instead of asserting a 13-year-out booking survives a
         # nearest-50 cut it was never designed to survive.
         ch = auth_headers(family_auth)
+        wh = auth_headers(nurse_auth)
+        # A tier/prescription heuristic still isn't enough here — /worker/
+        # new-requests gates on can_worker_receive_service
+        # (app/services/qualification.py), which also checks training and
+        # certificate requirements this test can't see from GET /services
+        # at all. WORKER_PHONE is shared across the whole suite with no
+        # guaranteed qualification beyond whatever earlier tests happened
+        # to set up, so ask the worker's OWN eligibility list
+        # (GET /workers/me/service-eligibility) which services it can
+        # actually receive right now, and use one of those — the same
+        # ground truth can_worker_receive_service itself checks, rather
+        # than guessing from service metadata.
+        elig = requests.get(f"{API}/workers/me/service-eligibility", headers=wh, timeout=10).json()
+        # NOT qualification_status: that field only ever reflects an
+        # EXPLICIT WorkerServiceQualification row, defaulting to the literal
+        # string "NOT_QUALIFIED" whenever no such row exists (see
+        # app/api/v1/workers.py's service-eligibility handler) — which is
+        # the common case for a plain, low-tier service that a worker
+        # qualifies for implicitly via tier alone, no explicit approval row
+        # ever created. `can_opt_in` is this same endpoint's own computed
+        # is_worker_qualified_for_service(...) result — the actual gate
+        # /worker/new-requests uses — so that's the one to filter on.
+        eligible_ids = {
+            e["id"] for e in elig
+            if e.get("target_type") == "service"
+            and e.get("can_opt_in") is True
+            # Matches is_worker_opted_in_for_service exactly: OPTED_OUT and
+            # PAUSED (a third real WorkerPreferenceStatus value) must both
+            # be excluded, not just OPTED_OUT.
+            and e.get("preference_status") == "OPTED_IN"
+            and e.get("willing_to_accept") is True
+        }
+        assert eligible_ids, f"worker has no eligible (can_opt_in) services: {elig}"
         svcs = requests.get(f"{API}/services", timeout=10).json()
-        non_rx_svcs = [s for s in svcs if not s.get("requires_prescription")]
-        assert non_rx_svcs, "no service without requires_prescription found in catalogue"
-        svc_id = non_rx_svcs[0]["id"]
+        eligible_svcs = [
+            s for s in svcs
+            if s["id"] in eligible_ids and not s.get("requires_prescription")
+        ]
+        assert eligible_svcs, f"no eligible non-prescription service found: {elig}"
+        svc_id = eligible_svcs[0]["id"]
         patients = requests.get(f"{API}/patients", headers=ch, timeout=10).json()
         pid = patients[0]["id"]
         scheduled_date = (date.today() + timedelta(days=random.randint(1, 30))).isoformat()
