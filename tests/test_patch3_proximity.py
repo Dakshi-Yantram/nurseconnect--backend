@@ -282,14 +282,61 @@ class TestWorkerBookings:
         assert r.status_code == 200, r.text
         assert isinstance(r.json(), list)
 
-    def test_worker_new_requests_contains_our_booking(self, nurse_auth, ctx):
+    def test_worker_new_requests_contains_our_booking(self, nurse_auth, family_auth):
+        # Deliberately NOT using the shared `ctx` fixture here. `ctx`'s
+        # booking is scheduled ~13-24 years out on purpose (see
+        # _unique_future_slot's docstring — it's what keeps repeated LOCAL
+        # runs on a persistent dev DB from tripping worker_has_schedule_
+        # conflict against a previous run's leftover booking). But
+        # /bookings/worker/new-requests orders by scheduled_date ASCENDING
+        # and caps the result at 50 rows — a fair, real product design
+        # (show the worker their nearest opportunities first, not an
+        # unbounded feed). Once enough OTHER unassigned test bookings with
+        # nearer dates pile up in the same CI run (now common since the
+        # schedule-conflict/consent fixes let far more of the suite reach
+        # "create a booking" than before), ctx's far-future booking no
+        # longer fits in that top-50 window — through no fault of the
+        # endpoint. This test only needs a booking that's unassigned and
+        # eligible "right now", so it creates its own, close-in, dedicated
+        # one instead of asserting a 13-year-out booking survives a
+        # nearest-50 cut it was never designed to survive.
+        ch = auth_headers(family_auth)
+        svcs = requests.get(f"{API}/services", timeout=10).json()
+        non_rx_svcs = [s for s in svcs if not s.get("requires_prescription")]
+        assert non_rx_svcs, "no service without requires_prescription found in catalogue"
+        svc_id = non_rx_svcs[0]["id"]
+        patients = requests.get(f"{API}/patients", headers=ch, timeout=10).json()
+        pid = patients[0]["id"]
+        scheduled_date = (date.today() + timedelta(days=random.randint(1, 30))).isoformat()
+        r = requests.post(
+            f"{API}/bookings/",
+            headers=ch,
+            json={
+                "patient_id": pid,
+                "service_id": svc_id,
+                "scheduled_date": scheduled_date,
+                "scheduled_start_time": "09:00:00",
+                "address": {"line1": "Phase3 New-Requests Lane", "city": "Mumbai", "state": "MH", "pincode": "400001"},
+                "latitude": "19.0760",
+                "longitude": "72.8777",
+                "is_urgent": False,
+            },
+            timeout=10,
+        )
+        assert r.status_code == 200, r.text
+        bid = r.json()["id"]
+        _sql(
+            "UPDATE bookings SET status='confirmed', payment_status='captured', worker_id=NULL WHERE id=%s",
+            (bid,),
+        )
+
         r = requests.get(
             f"{API}/bookings/worker/new-requests", headers=auth_headers(nurse_auth), timeout=10
         )
         assert r.status_code == 200, r.text
         items = r.json()
         ids = [b["id"] for b in items]
-        assert ctx["bid"] in ids, f"booking {ctx['bid']} should be in new-requests, got {ids[:5]}"
+        assert bid in ids, f"booking {bid} should be in new-requests, got {ids[:5]}"
 
 
 # --------- 6. Visit lifecycle ---------
