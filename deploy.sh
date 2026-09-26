@@ -7,6 +7,19 @@ echo "Starting NurseConnect deployment..."
 cd ~/nurseconnect--backend
 
 echo "Installing dependencies..."
+# Pillow==11.0.0 (requirements.txt) has no prebuilt wheel for whatever
+# Python this server now runs (seen failing against python3.14 — a version
+# far newer than Pillow 11.0.0 shipped wheels for), so pip falls back to
+# compiling it from source, which then fails with
+# "RequiredDependencyException: headers or library files could not be
+# found for jpeg" because this server never had the system-level image
+# headers Pillow's source build needs. Installing them is idempotent and
+# safe to run on every deploy, whether or not this particular deploy
+# actually needs to rebuild Pillow.
+if command -v apt-get >/dev/null 2>&1; then
+    sudo apt-get update -y
+    sudo apt-get install -y libjpeg-dev zlib1g-dev libpng-dev python3-dev
+fi
 if [ -f requirements.txt ]; then
     pip install --break-system-packages -r requirements.txt
 fi
