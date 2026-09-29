@@ -1064,14 +1064,14 @@ class DigioClient:
             "notify_signers": True,
             "send_sign_link": True,
             "file_name": file_name,
+            "file_data": base64.b64encode(pdf_bytes).decode(),
         }
         try:
-            async with httpx.AsyncClient(timeout=httpx.Timeout(20.0, connect=5.0)) as client:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(30.0, connect=5.0)) as client:
                 resp = await client.post(
                     f"{self.base_url}/v2/client/document/uploadpdf",
                     auth=self._auth(),
-                    data={"request": __import__("json").dumps(payload)},
-                    files={"file": (file_name, pdf_bytes, "application/pdf")},
+                    json=payload,
                 )
         except httpx.TimeoutException as exc:
             logger.exception("digio create_esign_request timed out")
