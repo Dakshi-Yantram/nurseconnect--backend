@@ -1047,10 +1047,14 @@ class DigioClient:
                 ],
             }
 
-        import base64
+        import json
         import httpx
 
-        payload = {
+        # Digio's uploadpdf endpoint is multipart/form-data: the PDF goes in
+        # a `file` part and the signing config goes in a `request` part as a
+        # JSON *string*. Sending a JSON body (with base64 "file_data") is
+        # rejected with 400 UNSUPPORTED_MEDIA_TYPE.
+        request_payload = {
             "signers": [
                 {
                     "identifier": signer_identifier,
@@ -1064,14 +1068,14 @@ class DigioClient:
             "notify_signers": True,
             "send_sign_link": True,
             "file_name": file_name,
-            "file_data": base64.b64encode(pdf_bytes).decode(),
         }
         try:
             async with httpx.AsyncClient(timeout=httpx.Timeout(30.0, connect=5.0)) as client:
                 resp = await client.post(
                     f"{self.base_url}/v2/client/document/uploadpdf",
                     auth=self._auth(),
-                    json=payload,
+                    files={"file": (file_name, pdf_bytes, "application/pdf")},
+                    data={"request": json.dumps(request_payload)},
                 )
         except httpx.TimeoutException as exc:
             logger.exception("digio create_esign_request timed out")
