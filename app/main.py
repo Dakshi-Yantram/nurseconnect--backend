@@ -89,6 +89,12 @@ async def lifespan(app: FastAPI):
 
     if not settings.is_production:
         _ensure_infra_running()  # dev-container convenience only
+
+    # Additive columns/table the current code reads. Never raises and is
+    # bounded by timeouts, so it cannot prevent the app (or login) from booting.
+    from app.core.database import engine as _engine
+    from app.core.schema_guard import ensure_additive_schema
+    await ensure_additive_schema(_engine)
     if settings.run_seed_on_startup:
         # Run seed (creates tables + initial config)
         from app.seed import main as seed

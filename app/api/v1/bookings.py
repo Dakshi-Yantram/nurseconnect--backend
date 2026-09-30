@@ -228,13 +228,7 @@ async def create_booking(
                 status_code=409,
                 detail={"code": _reason, "message": "This care package is not available for booking."},
             )
-        if package.available_cities:
-            _city = (resolved_snapshot or {}).get("city") if isinstance(resolved_snapshot, dict) else None
-            if _city and _city not in package.available_cities:
-                raise HTTPException(
-                    status_code=409,
-                    detail={"code": "PACKAGE_NOT_AVAILABLE_IN_CITY", "message": "This package is not available in your city."},
-                )
+
         # per_visit_price and package_price are both nullable — an admin can
         # save a package without ever setting either. That used to silently
         # fall through to a ₹0 booking, which shows up to the consumer as
@@ -484,7 +478,9 @@ async def new_requests(profile: WorkerProfile = Depends(get_worker_profile), db:
         target = target_cache[key]
 
         current_wave = compute_current_wave(b, now=now)
-        elig = await evaluate_worker_for_booking(db, profile, b, target, now=now, wave=current_wave)
+        elig = await evaluate_worker_for_booking(
+            db, profile, b, target, now=now, wave=current_wave, check_availability=False,
+        )
         if not elig.ok:
             continue
         if current_wave > (b.assignment_wave or 1):
@@ -493,7 +489,9 @@ async def new_requests(profile: WorkerProfile = Depends(get_worker_profile), db:
                 b.assignment_escalated_at = now
             wave_dirty = True
         visible.append((b, elig.distance_km, target))
-        if len(visible) >= 20:
+        # 20 was too tight: with more than 20 open, eligible bookings the
+        # newest ones never appeared on any nurse's list at all.
+        if len(visible) >= 100:
             break
 
     if wave_dirty:
@@ -793,7 +791,10 @@ async def accept_booking(
     # branch below.
     already_mine = pre_b.worker_id == worker_id and pre_b.status == BookingStatus.assigned
     if not already_mine and pre_b.worker_id is None:
-        elig = await evaluate_worker_for_booking(db, profile, pre_b, target, now=now)
+        elig = await evaluate_worker_for_booking(
+            db, profile, pre_b, target, now=now,
+            check_availability=False, check_radius=False,
+        )
         if not elig.ok:
             await db.rollback()
             if elig.reason == "SCHEDULE_CONFLICT":

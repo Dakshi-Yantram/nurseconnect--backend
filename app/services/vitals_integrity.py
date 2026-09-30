@@ -61,10 +61,13 @@ def validate_vitals(values: Mapping[str, Any]) -> List[Dict[str, str]]:
         lo, hi = LIMITS[k]
         if v is None or v < lo or v > hi:
             problems.append({"field": k, "message": f"{k} must be between {lo:g} and {hi:g}."})
+    # A single BP number IS accepted. Rejecting a reading because only one half
+    # of the blood pressure was captured would also reject whatever else came
+    # with it (e.g. a critical SpO2) and stop the emergency escalation that is
+    # driven by saved vitals. Reports already print a half BP as "(incomplete)".
+    # Only the ordering is checked, and only when both numbers are present.
     s, d = _num(values.get("bp_systolic")), _num(values.get("bp_diastolic"))
-    if (s is None) != (d is None):
-        problems.append({"field": "bp", "message": "Blood pressure needs both systolic and diastolic."})
-    elif s is not None and d is not None and s <= d:
+    if s is not None and d is not None and s <= d:
         problems.append({"field": "bp_systolic", "message": "Systolic must be higher than diastolic."})
     return problems
 

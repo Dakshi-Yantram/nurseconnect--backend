@@ -260,10 +260,19 @@ class TestVitalsIntegrity(unittest.TestCase):
                     {"bp_systolic": 0, "bp_diastolic": 0}, {"pulse": -5}):
             self.assertTrue(vitals_integrity.validate_vitals(bad), bad)
 
-    def test_bp_needs_both_and_systolic_above_diastolic(self):
-        self.assertTrue(vitals_integrity.validate_vitals({"bp_systolic": 120}))
+    def test_partial_bp_is_accepted_but_wrong_order_is_not(self):
+        # One BP number alone must NOT block the reading (see the safety test below).
+        self.assertEqual(vitals_integrity.validate_vitals({"bp_systolic": 120, "pulse": 70}), [])
+        self.assertEqual(vitals_integrity.validate_vitals({"bp_diastolic": 80, "pulse": 70}), [])
         self.assertTrue(vitals_integrity.validate_vitals({"bp_systolic": 80, "bp_diastolic": 120}))
         self.assertEqual(vitals_integrity.validate_vitals({"bp_systolic": 120, "bp_diastolic": 80}), [])
+
+    def test_critical_reading_with_half_a_bp_is_never_rejected(self):
+        """Patient safety: a critical SpO2 must be saved (and so escalate) even
+        if only the systolic pressure was captured alongside it."""
+        reading = {"spo2": 80, "bp_systolic": 120, "pulse": 80, "temperature_f": 98.6}
+        self.assertEqual(vitals_integrity.validate_vitals(reading), [])
+        vitals_integrity.assert_valid_vitals(reading)  # must not raise
 
     def test_optional_data_may_stay_missing(self):
         self.assertEqual(vitals_integrity.validate_vitals({"pulse": 72}), [])
@@ -370,6 +379,148 @@ class TestDispatchBuildingBlocks(unittest.TestCase):
     def test_wave_window_now_reaches_wave_two_and_three_rings(self):
         from app.services.proximity import radius_for_wave
         self.assertEqual([radius_for_wave(w, False) for w in (1, 2, 3, 4)], [5, 8, 12, 12])
+
+
+class TestEligibilitySwitches(unittest.TestCase):
+    """Availability gates only the PUSH; accept/pull keep pre-change behaviour."""
+
+    def setUp(self):
+        from app.services import dispatch
+        from app.models.enums import (BookingStatus, WorkerAvailability,
+                                      WorkerOnboardingStatus, WorkerType)
+        self.d = dispatch
+        self.worker = SimpleNamespace(
+            id="w1", onboarding_status=WorkerOnboardingStatus.approved,
+            availability=WorkerAvailability.offline, worker_type=WorkerType.nurse,
+            current_latitude=None, current_longitude=None, current_location_updated_at=None,
+            home_latitude=Decimal("28.6139"), home_longitude=Decimal("77.2090"), base_city="Delhi",
+        )
+        # Booking ~1,150 km away (Mumbai) -> far outside any wave radius.
+        self.booking = SimpleNamespace(
+            id="b1", latitude=Decimal("19.0760"), longitude=Decimal("72.8777"), is_urgent=False,
+            address_snapshot={"city": "Mumbai"}, created_at=utc(2026, 10, 1), dispatch_started_at=None,
+            worker_id=None, status=BookingStatus.confirmed,
+            scheduled_date=date(2026, 10, 3), scheduled_start_time=time(10, 0),
+            scheduled_duration_minutes=60,
+        )
+
+    def run_eval(self, **kw):
+        async def go():
+            with mock.patch("app.services.qualification.can_worker_receive_service",
+                            mock.AsyncMock(return_value=(True, None))), \
+                 mock.patch.object(self.d, "worker_has_schedule_conflict",
+                                   mock.AsyncMock(return_value=False)):
+                return await self.d.evaluate_worker_for_booking(
+                    None, self.worker, self.booking, object(), now=utc(2026, 10, 1, 6), **kw)
+        return asyncio.run(go())
+
+    def test_push_skips_offline_workers(self):
+        self.assertEqual(self.run_eval().reason, "WORKER_UNAVAILABLE")
+
+    def test_accept_semantics_ignore_availability_and_radius(self):
+        r = self.run_eval(check_availability=False, check_radius=False)
+        self.assertTrue(r.ok, r)
+
+    def test_pull_semantics_ignore_availability_but_keep_radius(self):
+        r = self.run_eval(check_availability=False)
+        self.assertFalse(r.ok)
+        self.assertEqual(r.reason, "OUT_OF_RADIUS")
+
+    def test_unapproved_worker_is_refused_everywhere(self):
+        from app.models.enums import WorkerOnboardingStatus
+        self.worker.onboarding_status = WorkerOnboardingStatus.pending_review
+        r = self.run_eval(check_availability=False, check_radius=False)
+        self.assertEqual(r.reason, "WORKER_NOT_APPROVED")
+
+
+class TestSchemaGuard(unittest.TestCase):
+    """The startup schema guard must be lock-free when complete, create what is
+    missing, and NEVER raise (it runs in the app's startup path)."""
+
+    def setUp(self):
+        from app.core import schema_guard
+        self.sg = schema_guard
+        # The offline sqlalchemy stub discards text()'s SQL; use a passthrough
+        # so the fake connection can see and record the real statements.
+        p = mock.patch.object(schema_guard, "text", lambda s: s)
+        p.start()
+        self.addCleanup(p.stop)
+
+    @staticmethod
+    def _engine(present, table_exists=True, boom_on=None):
+        """Fake async engine recording every DDL/statement text it is given."""
+        executed = []
+
+        def sql_of(stmt):
+            return str(stmt)
+
+        class Res:
+            def __init__(self, rows=None, scalar=None):
+                self._rows, self._scalar = rows or [], scalar
+            def fetchall(self): return self._rows
+            def scalar(self): return self._scalar
+
+        class Conn:
+            async def execute(self, stmt, params=None):
+                q = sql_of(stmt)
+                executed.append(q)
+                if boom_on and boom_on in q:
+                    raise RuntimeError("db exploded")
+                if "information_schema.columns" in q:
+                    return Res(rows=list(present))
+                if "to_regclass" in q:
+                    return Res(scalar="booking_dispatch_notifications" if table_exists else None)
+                return Res()
+
+        class Ctx:
+            async def __aenter__(self_inner): return Conn()
+            async def __aexit__(self_inner, *a): return False
+
+        class Engine:
+            def connect(self_inner): return Ctx()
+            def begin(self_inner): return Ctx()
+
+        return Engine(), executed
+
+    ALL = [("bookings", "dispatch_cycle"), ("bookings", "no_worker_alerted_cycle"),
+           ("visit_records", "report_finalized_at"), ("visit_records", "report_finalized_by"),
+           ("visit_records", "report_content_hash")]
+
+    def test_complete_schema_runs_no_ddl_and_no_locks(self):
+        eng, ex = self._engine(self.ALL)
+        self.assertTrue(asyncio.run(self.sg.ensure_additive_schema(eng)))
+        joined = " ".join(ex).upper()
+        self.assertNotIn("ALTER TABLE", joined)
+        self.assertNotIn("CREATE TABLE", joined)
+        self.assertNotIn("ADVISORY", joined)
+
+    def test_missing_columns_are_created_under_timeouts_and_advisory_lock(self):
+        eng, ex = self._engine(self.ALL[:2], table_exists=False)
+        self.assertTrue(asyncio.run(self.sg.ensure_additive_schema(eng)))
+        joined = " ".join(ex)
+        self.assertIn("lock_timeout", joined)
+        self.assertIn("pg_advisory_xact_lock", joined)
+        self.assertEqual(joined.count("ADD COLUMN IF NOT EXISTS"), 5)
+        self.assertIn("CREATE TABLE IF NOT EXISTS booking_dispatch_notifications", joined)
+
+    def test_every_statement_is_additive_and_idempotent(self):
+        for stmt in self.sg.STATEMENTS:
+            # "ON DELETE CASCADE" in a foreign key is not a destructive statement.
+            u = " ".join(stmt.split()).upper().replace("ON DELETE CASCADE", "")
+            self.assertTrue("IF NOT EXISTS" in u, stmt)
+            for bad in ("DROP ", "DELETE ", "TRUNCATE", "UPDATE ", "RENAME", "ALTER COLUMN"):
+                self.assertNotIn(bad, u, stmt)
+
+    def test_never_raises_even_if_the_database_fails(self):
+        for boom in ("information_schema", "ADD COLUMN", "pg_advisory_xact_lock"):
+            eng, _ = self._engine(self.ALL[:1], boom_on=boom)
+            self.assertFalse(asyncio.run(self.sg.ensure_additive_schema(eng)), boom)
+
+    def test_never_raises_if_connect_itself_fails(self):
+        class Dead:
+            def connect(self): raise ConnectionError("no db")
+            def begin(self): raise ConnectionError("no db")
+        self.assertFalse(asyncio.run(self.sg.ensure_additive_schema(Dead())))
 
 
 # --------------------------------------------------------------------------- 8

@@ -174,8 +174,10 @@ async def _start_visit_guarded(
     if not booking:
         raise _http(404, "BOOKING_NOT_FOUND", "Booking not found or not assigned to you")
 
+    # 400 (not 409) on purpose: the existing API contract, client handling and
+    # tests all treat a repeated start as 400 "Already checked in".
     if booking.status == BookingStatus.in_progress:
-        raise _http(409, "VISIT_ALREADY_STARTED", "This visit has already started.")
+        raise _http(400, "VISIT_ALREADY_STARTED", "Already checked in - this visit has already started.")
     if booking.status in (BookingStatus.completed, BookingStatus.cancelled, BookingStatus.missed):
         raise _http(409, "VISIT_NOT_ACTIVE", f"This booking is {booking.status.value} and can't be started.")
     # Strict mode (always on in production; ENFORCE_VISIT_START_GEOFENCE=false
@@ -192,7 +194,7 @@ async def _start_visit_guarded(
     vres = await db.execute(select(VisitRecord).where(VisitRecord.booking_id == booking_id))
     visit = vres.scalar_one_or_none()
     if visit and (visit.check_in_at or visit.check_out_at):
-        raise _http(409, "VISIT_ALREADY_STARTED", "This visit has already started.")
+        raise _http(400, "VISIT_ALREADY_STARTED", "Already checked in - this visit has already started.")
 
     # Location gate — before the OTP is even looked at, so a nurse who is not
     # there can neither start the visit nor burn/guess the customer's code.

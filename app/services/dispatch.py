@@ -156,8 +156,23 @@ async def evaluate_worker_for_booking(
     now: Optional[datetime] = None,
     wave: Optional[int] = None,
     check_schedule: bool = True,
+    check_availability: bool = True,
+    check_radius: bool = True,
 ) -> Eligibility:
-    """The single eligibility decision. Order is cheap-checks-first."""
+    """The single eligibility decision. Order is cheap-checks-first.
+
+    Who checks what (kept identical to the behaviour before this change so no
+    nurse loses access she had):
+      * PUSH   (notify_nearby_workers)  availability + radius  - we only ping
+               nurses who are reachable and near.
+      * PULL   (new-requests list)      radius only            - a nurse who is
+               looking at her list is available by definition; the old pull
+               list never checked availability either.
+      * ACCEPT (accept_booking)         neither                - explicit intent
+               to take the job; the old accept had no availability or radius
+               check. Approval, qualification/opt-in, schedule conflict, open
+               status and slot expiry still apply.
+    """
     from app.core.provider_types import is_physical_capable, is_tele_capable
     from app.services.proximity import (
         compute_current_wave,
@@ -171,7 +186,7 @@ async def evaluate_worker_for_booking(
 
     if worker.onboarding_status != WorkerOnboardingStatus.approved:
         return Eligibility(False, "WORKER_NOT_APPROVED")
-    if worker.availability in _UNAVAILABLE:
+    if check_availability and worker.availability in _UNAVAILABLE:
         return Eligibility(False, "WORKER_UNAVAILABLE")
     if target is None:
         return Eligibility(False, "NO_TARGET")
@@ -182,7 +197,7 @@ async def evaluate_worker_for_booking(
 
     distance_km: Optional[float] = None
     tele_only = is_tele_capable(worker.worker_type) and not is_physical_capable(worker.worker_type)
-    if not tele_only:
+    if not tele_only and check_radius:
         wave_no = wave if wave is not None else compute_current_wave(booking, now=now)
         radius_km = radius_for_wave(wave_no, booking.is_urgent) or 10
         origin = effective_origin_for_worker(worker)

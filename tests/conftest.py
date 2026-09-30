@@ -164,15 +164,47 @@ def _release_worker_schedule(phone: str) -> None:
         pass
 
 
-@pytest.fixture(autouse=True)
-def _release_shared_worker_schedules():
-    """Runs before every test in the suite (autouse, function-scoped).
+# Multi-step lifecycle classes. Each of these builds ONE booking (usually in a
+# class/module-scoped fixture), accepts it, and then walks it through
+# accept -> check-in -> vitals -> ... -> check-out across SEPARATE test
+# functions. Releasing the worker's bookings before every test cancels that
+# booking between two steps ("This booking is cancelled and can't be started"),
+# which is why these classes failed even though the application was fine.
+# For them the worker is released ONCE, before the class's first test (and
+# before its fixtures), instead of before every test. Every other test keeps the
+# original per-test release. Add a class name here if a new multi-step
+# lifecycle class is introduced.
+_SEQUENTIAL_LIFECYCLE_CLASSES = frozenset(
+    {
+        "TestVisitLifecycle",  # test_phase3_nurse_flow, test_patch3_proximity
+        "TestPositivePath",  # test_patch5a_e2e
+        "TestBookingWorkerVisitLifecycle",  # test_payment_idempotency_phase5
+        "TestPhase4VisitIdempotency",  # test_phase4_realtime_payment
+        "TestBookingLifecycle",  # backend_test (test_01 ... test_08_checkout)
+        "TestCallLifecycle",  # test_calls
+        "TestConsentAndMedicationEnforcement",  # test_patch5a
+    }
+)
+_released_lifecycle_classes: set = set()
 
-    Guarantees every test starts with the shared test worker(s) free to
-    accept a new booking, regardless of what any earlier test — in this
-    file or any other — left dangling. See the block comment above for why
-    this exists.
-    """
-    for phone in _SHARED_TEST_WORKER_PHONES:
-        _release_worker_schedule(phone)
-    yield
+
+def _should_release_worker_schedule(item) -> bool:
+    """True when the shared worker must be freed before this test runs."""
+    cls = getattr(item, "cls", None)
+    if cls is None or cls.__name__ not in _SEQUENTIAL_LIFECYCLE_CLASSES:
+        return True  # ordinary test: original behaviour, release every time
+    key = (getattr(item, "module", None).__name__ if getattr(item, "module", None) else "", cls.__name__)
+    if key in _released_lifecycle_classes:
+        return False  # later step of a lifecycle class: leave its booking alone
+    _released_lifecycle_classes.add(key)
+    return True
+
+
+@pytest.hookimpl(tryfirst=True)
+def pytest_runtest_setup(item):
+    """Runs before ANY fixture of the test is created (class- and module-scoped
+    fixtures included), so a lifecycle class's booking is created after the
+    release, never cancelled by it. Replaces the old per-test autouse fixture."""
+    if _should_release_worker_schedule(item):
+        for phone in _SHARED_TEST_WORKER_PHONES:
+            _release_worker_schedule(phone)

@@ -94,13 +94,19 @@ async def create_order(
 
     # Idempotent: reuse the order already created for this booking.
     if booking.razorpay_order_id and booking.payment_status == PaymentStatus.initiated:
+        # Copy what the response needs BEFORE rolling back: rollback() expires
+        # every loaded ORM object, and reading an expired attribute on an async
+        # session raises MissingGreenlet (the 500 described in the ROOT-CAUSE
+        # NOTE further down in this file).
+        existing_order_id = booking.razorpay_order_id
+        existing_booking_id = booking.id
         await db.rollback()  # release the row lock
         return PaymentOrderResponse(
-            razorpay_order_id=booking.razorpay_order_id,
+            razorpay_order_id=existing_order_id,
             razorpay_key_id=settings.RAZORPAY_KEY_ID or "rzp_test_placeholder",
             amount=amount_paise,
             currency="INR",
-            booking_id=booking.id,
+            booking_id=existing_booking_id,
         )
 
     order = await razorpay_client.create_order(
