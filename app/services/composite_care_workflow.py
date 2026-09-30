@@ -161,6 +161,8 @@ async def generate_invoice(db: AsyncSession, booking: Booking, visit: VisitRecor
         return invoice
 
     subtotal = Decimal(booking.total_amount)
+    from app.services.pricing_resolver import resolve_offering_name
+    offering = await resolve_offering_name(db, booking)
 
     if booking.material_included:
         invoice_type = "composite_healthcare_service"
@@ -169,7 +171,7 @@ async def generate_invoice(db: AsyncSession, booking: Booking, visit: VisitRecor
         total_amount = subtotal
         line_items = [
             {
-                "description": "Composite Healthcare Service (Nursing Visit + Procedural Kit)",
+                "description": (f"{offering} — " if offering else "") + "Composite Healthcare Service (Nursing Visit + Procedural Kit)",
                 "amount": str(subtotal),
             }
         ]
@@ -180,7 +182,7 @@ async def generate_invoice(db: AsyncSession, booking: Booking, visit: VisitRecor
         total_amount = subtotal
         line_items = [
             {
-                "description": "Paramedical Nursing Service (Procedure Technique Only — GST Exempt)",
+                "description": (f"{offering} — " if offering else "") + "Paramedical Nursing Service (Procedure Technique Only — GST Exempt)",
                 "amount": str(subtotal),
             }
         ]
@@ -190,7 +192,7 @@ async def generate_invoice(db: AsyncSession, booking: Booking, visit: VisitRecor
         tax_amount = Decimal(booking.tax_amount or 0)
         total_amount = Decimal(booking.total_amount)
         line_items = [
-            {"description": "Professional Nursing Service", "amount": str(booking.base_amount)},
+            {"description": offering or "Professional Nursing Service", "amount": str(booking.base_amount)},
         ]
         if booking.surge_amount:
             line_items.append({"description": "Surge Charge", "amount": str(booking.surge_amount)})

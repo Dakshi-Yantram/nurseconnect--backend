@@ -95,7 +95,40 @@ async def load_rate_card(db: AsyncSession, booking: Booking) -> list[PricingComp
     ]
 
 
-def _legacy_component(booking: Booking) -> PricingComponent:
+GENERIC_LABELS = {
+    "professional nursing service",
+    "nursing service",
+    "service",
+    "professional service",
+}
+
+
+async def resolve_offering_name(db: AsyncSession, booking: Booking) -> Optional[str]:
+    """Name of what the customer actually purchased — the source of truth for
+    every invoice/receipt label. Package wins over the service id that may
+    also be stored on the row; service is used for one-time service bookings.
+
+    ROOT CAUSE (generic invoice text): the legacy single-line fallback and the
+    composite invoice hardcoded "Professional Nursing Service", and the rate
+    card's generic component label was printed as-is, so nothing on the
+    invoice said which package/service was bought.
+    """
+    from app.models.models import CarePackage, ServiceCatalogue
+
+    if booking.package_id:
+        r = await db.execute(select(CarePackage.name).where(CarePackage.id == booking.package_id))
+        name = r.scalar_one_or_none()
+        if name:
+            return name
+    if booking.service_id:
+        r = await db.execute(select(ServiceCatalogue.name).where(ServiceCatalogue.id == booking.service_id))
+        name = r.scalar_one_or_none()
+        if name:
+            return name
+    return None
+
+
+def _legacy_component(booking: Booking, offering_name: Optional[str] = None) -> PricingComponent:
     """The single-line fallback for offerings with no rate card configured.
 
     Uses base + surge as the customer-facing service value, which is exactly
@@ -112,7 +145,7 @@ def _legacy_component(booking: Booking) -> PricingComponent:
         rate = (tax / service_value * Decimal("100")).quantize(Decimal("0.01"))
         return PricingComponent(
             code="service",
-            label="Professional Nursing Service",
+            label=offering_name or "Professional Nursing Service",
             input_amount=money(service_value + tax),
             basis="customer_rate",
             gst_rate_pct=rate,
@@ -121,7 +154,7 @@ def _legacy_component(booking: Booking) -> PricingComponent:
 
     return PricingComponent(
         code="service",
-        label="Professional Nursing Service",
+        label=offering_name or "Professional Nursing Service",
         input_amount=service_value,
         basis="customer_rate",
         gst_rate_pct=Decimal("0"),
@@ -132,8 +165,20 @@ def _legacy_component(booking: Booking) -> PricingComponent:
 
 
 async def build_components(db: AsyncSession, booking: Booking) -> list[PricingComponent]:
+    name = await resolve_offering_name(db, booking)
     components = await load_rate_card(db, booking)
-    return components or [_legacy_component(booking)]
+    if not components:
+        return [_legacy_component(booking, name)]
+    if name:
+        # A rate-card row still carrying the generic label is re-labelled with
+        # the purchased package/service; specific labels (e.g. "Consumables kit")
+        # are left alone.
+        from dataclasses import replace as _replace
+        components = [
+            _replace(c, label=name) if (c.label or "").strip().lower() in GENERIC_LABELS else c
+            for c in components
+        ]
+    return components
 
 
 async def price_booking(

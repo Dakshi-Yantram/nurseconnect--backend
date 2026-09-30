@@ -72,6 +72,7 @@ from app.services.care_workflow_engine import (
     validate_documentation_completion,
 )
 from app.services.common_services import audit, notify_parties
+from app.services import report_lock
 from app.services.consent_service import (
     ConsentMissingError,
     has_active_consent,
@@ -105,33 +106,166 @@ async def checkin(
     profile: WorkerProfile = Depends(get_worker_profile),
     db: AsyncSession = Depends(get_db),
 ):
-    booking, visit = await _get_visit_for_worker(db, booking_id, profile.id)
-    if visit.check_in_at:
-        raise HTTPException(status_code=400, detail="Already checked in")
-    # Patch 5A — service consent gate
+    """Legacy OTP-less start.
+
+    ROOT CAUSE: this endpoint started a visit for any assigned booking with no
+    OTP, no status check and no location check, so it was a complete bypass of
+    the OTP + geofence gate on /verify-start-otp. It is now refused unless the
+    environment explicitly allows legacy check-in (never in production); even
+    then the status and geofence rules still apply.
+    """
+    if settings.is_production or not settings.ALLOW_LEGACY_CHECKIN:
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "code": "OTP_REQUIRED",
+                "message": "Ask the customer for the visit code and start the visit with it.",
+            },
+        )
+    booking, visit = await _start_visit_guarded(
+        db, booking_id, profile, float(payload.latitude), float(payload.longitude),
+        accuracy_m=None, captured_at=None, method="legacy_checkin",
+    )
+    await db.commit()
+    await db.refresh(visit)
+    await manager.broadcast(booking_topic(booking_id), {"type": "visit.checked_in", "booking_id": str(booking_id)})
+    return VisitRecordOut.model_validate(visit)
+
+
+# Statuses from which a nurse may start a visit: she must have completed the
+# safety-check-gated "en route" step first.
+_START_ELIGIBLE_STATUSES = (BookingStatus.worker_en_route, BookingStatus.worker_arrived)
+
+
+def _http(status: int, code: str, message: str, **extra) -> HTTPException:
+    return HTTPException(status_code=status, detail={"code": code, "message": message, **extra})
+
+
+async def _start_visit_guarded(
+    db: AsyncSession,
+    booking_id: UUID,
+    profile: WorkerProfile,
+    lat: float,
+    lng: float,
+    *,
+    accuracy_m: Optional[float],
+    captured_at: Optional[datetime],
+    method: str,
+    before_commit=None,
+):
+    """Every server-side precondition for starting a visit, in one place.
+
+    Verified here (never trusted from the client): booking exists and belongs
+    to THIS nurse, booking not cancelled/completed/already started, the nurse
+    went en-route (safety gate), visit not already checked in, service
+    consent, and the nurse's position vs the customer's address.
+
+    The booking row is locked (`FOR UPDATE`) so a double-tap or two devices
+    cannot start the same visit twice.
+    """
+    from app.services import geofence
+
+    bres = await db.execute(
+        select(Booking)
+        .where(Booking.id == booking_id, Booking.worker_id == profile.id)
+        .with_for_update()
+    )
+    booking = bres.scalar_one_or_none()
+    if not booking:
+        raise _http(404, "BOOKING_NOT_FOUND", "Booking not found or not assigned to you")
+
+    if booking.status == BookingStatus.in_progress:
+        raise _http(409, "VISIT_ALREADY_STARTED", "This visit has already started.")
+    if booking.status in (BookingStatus.completed, BookingStatus.cancelled, BookingStatus.missed):
+        raise _http(409, "VISIT_NOT_ACTIVE", f"This booking is {booking.status.value} and can't be started.")
+    # Strict mode (always on in production; ENFORCE_VISIT_START_GEOFENCE=false
+    # is honoured ONLY in dev/test so the legacy integration suite can start
+    # visits without simulating GPS + the en-route safety gate).
+    strict = settings.ENFORCE_VISIT_START_GEOFENCE or settings.is_production
+    allowed = _START_ELIGIBLE_STATUSES if strict else (BookingStatus.assigned, *_START_ELIGIBLE_STATUSES)
+    if booking.status not in allowed:
+        raise _http(
+            409, "VISIT_NOT_EN_ROUTE",
+            "Mark yourself en route (and complete the safety check) before starting the visit.",
+        )
+
+    vres = await db.execute(select(VisitRecord).where(VisitRecord.booking_id == booking_id))
+    visit = vres.scalar_one_or_none()
+    if visit and (visit.check_in_at or visit.check_out_at):
+        raise _http(409, "VISIT_ALREADY_STARTED", "This visit has already started.")
+
+    # Location gate — before the OTP is even looked at, so a nurse who is not
+    # there can neither start the visit nor burn/guess the customer's code.
+    if strict:
+        geo = geofence.check_arrival(
+            nurse_lat=lat, nurse_lng=lng,
+            customer_lat=booking.latitude, customer_lng=booking.longitude,
+            radius_m=settings.VISIT_START_RADIUS_M,
+            accuracy_m=accuracy_m, fix_captured_at=captured_at,
+        )
+        if not geo.ok:
+            await audit(
+                db, profile.user_id, "worker", "visit.start_rejected_location", "booking", booking.id,
+                {"code": geo.code, "distance_m": geo.distance_m, "method": method},
+            )
+            await db.commit()
+            raise _http(403, geo.code or "LOCATION_CHECK_FAILED", geo.message or "Location check failed.",
+                        distance_m=geo.distance_m, radius_m=settings.VISIT_START_RADIUS_M)
+        distance_m = geo.distance_m
+        # Anti-spoof: if the server also has a *fresh* tracked position for
+        # this nurse, the fix sent with the request must agree with it.
+        cur_lat, cur_lng, cur_ts = (
+            profile.current_latitude, profile.current_longitude, profile.current_location_updated_at,
+        )
+        if cur_lat is not None and cur_lng is not None and cur_ts is not None:
+            ts = cur_ts if cur_ts.tzinfo else cur_ts.replace(tzinfo=timezone.utc)
+            if (datetime.now(timezone.utc) - ts).total_seconds() <= 300:
+                skew = geofence.distance_metres(lat, lng, cur_lat, cur_lng)
+                if skew > 1000:
+                    await audit(
+                        db, profile.user_id, "worker", "visit.start_rejected_location_mismatch",
+                        "booking", booking.id, {"skew_m": skew, "method": method},
+                    )
+                    await db.commit()
+                    raise _http(403, "LOCATION_MISMATCH",
+                                "Your reported position doesn't match your live location. Refresh location and retry.")
+    else:
+        distance_m = None
+
     try:
         await require_consent(
-            db,
-            patient_id=booking.patient_id,
-            consent_type=ConsentType.service,
-            booking_id=booking.id,
-            action="start the visit",
+            db, patient_id=booking.patient_id, consent_type=ConsentType.service,
+            booking_id=booking.id, action="start the visit",
         )
     except ConsentMissingError as ce:
         raise HTTPException(
             status_code=403,
             detail={"code": ce.code, "message": ce.message, "consent_type": ce.consent_type.value},
         ) from None
-    visit.check_in_at = datetime.now(timezone.utc)
-    visit.check_in_latitude = payload.latitude
-    visit.check_in_longitude = payload.longitude
+
+    if before_commit is not None:
+        # OTP verification/consumption happens here, after every other gate
+        # has passed but before anything is persisted.
+        await before_commit(booking)
+
+    if not visit:
+        visit = VisitRecord(booking_id=booking.id, worker_id=profile.id, patient_id=booking.patient_id)
+        db.add(visit)
+        await db.flush()
+
+    now = datetime.now(timezone.utc)
+    visit.arrived_at = visit.arrived_at or now
+    visit.check_in_at = now
+    visit.check_in_latitude = lat
+    visit.check_in_longitude = lng
+    visit.check_in_distance_metres = distance_m
     visit.status = VisitStatus.in_progress
     booking.status = BookingStatus.in_progress
-    await audit(db, profile.user_id, "worker", "visit.checkin", "visit", visit.id)
-    await db.commit()
-    await db.refresh(visit)
-    await manager.broadcast(booking_topic(booking_id), {"type": "visit.checked_in", "booking_id": str(booking_id)})
-    return VisitRecordOut.model_validate(visit)
+    await audit(
+        db, profile.user_id, "worker", f"visit.checkin_{method}", "visit", visit.id,
+        {"distance_m": distance_m, "otp_verified": method == "otp"},
+    )
+    return booking, visit
 
 
 # ============================================================================
@@ -161,48 +295,57 @@ _OTP_MAX_ATTEMPTS = 5           # brute-force cap
 _OTP_KEY_PREFIX = "visit_start_otp"
 _OTP_ATTEMPTS_PREFIX = "visit_start_otp_attempts"
 
+# The start code exists to be spoken at the door BEFORE the visit begins.
+# ROOT CAUSE of the extra "timed code" the family saw after Visit Start:
+# in_progress was in this tuple (and in the app's VisitOtpChip ELIGIBLE list),
+# so the moment a visit started the family's screen called generate-start-otp
+# again, which minted a brand-new 10-minute code and SMSed it. Nothing could
+# ever use it (the visit was already started) — it only confused families and
+# produced a stray SMS. It is NOT the completion code, which is a separate,
+# intentional mechanism for guarded packages (composite_care.py).
 _OTP_ELIGIBLE_STATUSES = (
     BookingStatus.assigned,
     BookingStatus.worker_en_route,
     BookingStatus.worker_arrived,
-    BookingStatus.in_progress,
 )
 
 
-def _otp_key(booking_id) -> str:
-    return f"{_OTP_KEY_PREFIX}:{booking_id}"
+# The code is bound to the nurse who accepted the booking: if the booking is
+# re-matched, the previous nurse's code is a different key and stops working.
+def _otp_key(booking_id, worker_id) -> str:
+    return f"{_OTP_KEY_PREFIX}:{booking_id}:{worker_id}"
 
 
-def _attempts_key(booking_id) -> str:
-    return f"{_OTP_ATTEMPTS_PREFIX}:{booking_id}"
+def _attempts_key(booking_id, worker_id) -> str:
+    return f"{_OTP_ATTEMPTS_PREFIX}:{booking_id}:{worker_id}"
 
 
 class VisitStartOtpVerifyRequest(BaseModel):
-    otp: str
-    latitude: float
-    longitude: float
+    otp: str = Field(min_length=4, max_length=8)
+    latitude: float = Field(ge=-90, le=90)
+    longitude: float = Field(ge=-180, le=180)
+    # Optional GPS metadata; when present the geofence uses it.
+    accuracy_m: Optional[float] = Field(default=None, ge=0)
+    captured_at: Optional[datetime] = None
 
 
 async def _ensure_visit_start_otp(db: AsyncSession, booking: Booking) -> dict:
-    """Idempotently ensure a visit-start OTP exists for this booking —
-    returns the existing one if still active, otherwise generates a new
-    4-digit code, stores it in Redis for 10 minutes, and best-effort SMSes
-    the consumer.
+    """Idempotently ensure a visit-start OTP exists for this booking's
+    currently assigned nurse — returns the live one, otherwise mints a new
+    4-digit code (10 min TTL) and best-effort SMSes the consumer.
 
-    The code is scoped to a specific accepted worker implicitly: verify
-    only succeeds when called by the worker on `booking.worker_id`, so
-    even though the OTP itself is a bare 4-digit code, it's useless to any
-    nurse other than the one who accepted this booking.
-
-    Real SMS delivery isn't reliably configured in most environments this
-    app runs in, so the code is also returned in the response body
-    whenever OTP_DEV_MODE is on, or whenever the SMS send itself failed —
-    matching the on-screen fallback this endpoint already promised in its
-    own message text ("Show it to your nurse from the app").
+    Only valid while a nurse is assigned and the visit has not started.
     """
-    existing = await redis_client.get(_otp_key(booking.id))
+    if booking.worker_id is None or booking.status not in _OTP_ELIGIBLE_STATUSES:
+        raise HTTPException(
+            status_code=400,
+            detail={"code": "BOOKING_NOT_READY",
+                    "message": "Visit cannot be started in the current booking state."},
+        )
+    key = _otp_key(booking.id, booking.worker_id)
+    existing = await redis_client.get(key)
     if existing:
-        ttl = await redis_client.ttl(_otp_key(booking.id))
+        ttl = await redis_client.ttl(key)
         otp_code = existing.decode() if isinstance(existing, bytes) else existing
         return {
             "sent": True,
@@ -213,8 +356,18 @@ async def _ensure_visit_start_otp(db: AsyncSession, booking: Booking) -> dict:
         }
 
     otp_code = f"{secrets.randbelow(9000) + 1000}"
-    await redis_client.setex(_otp_key(booking.id), _OTP_TTL_SECONDS, otp_code)
-    await redis_client.delete(_attempts_key(booking.id))
+    # SET NX: two concurrent generators must converge on one code.
+    created = await redis_client.set(key, otp_code, ex=_OTP_TTL_SECONDS, nx=True)
+    if not created:
+        winner = await redis_client.get(key)
+        ttl = await redis_client.ttl(key)
+        return {
+            "sent": True, "sms_sent": None,
+            "message": "Show this code to your nurse when they arrive.",
+            "expires_in_seconds": ttl,
+            "otp": winner.decode() if isinstance(winner, bytes) else winner,
+        }
+    await redis_client.delete(_attempts_key(booking.id, booking.worker_id))
 
     from app.models.models import ConsumerProfile as _ConsumerProfile, User
     cres = await db.execute(select(_ConsumerProfile).where(_ConsumerProfile.id == booking.consumer_id))
@@ -237,7 +390,6 @@ async def _ensure_visit_start_otp(db: AsyncSession, booking: Booking) -> dict:
             )
             sms_sent = resp.get("type") == "success"
         except Exception:
-            # SMS failure must not block — the code is still shown in-app below.
             sms_sent = False
 
     if consumer_user_id:
@@ -257,9 +409,6 @@ async def _ensure_visit_start_otp(db: AsyncSession, booking: Booking) -> dict:
             else "Visit code generated. Show it to your nurse from the app."
         ),
         "expires_in_seconds": _OTP_TTL_SECONDS,
-        # Always shown on the consumer's booking card, regardless of SMS
-        # delivery — SMS is a best-effort convenience, not the source of
-        # truth for the code the consumer hands to their nurse.
         "otp": otp_code,
     }
 
@@ -270,31 +419,14 @@ async def generate_visit_start_otp(
     profile: ConsumerProfile = Depends(get_consumer_profile),
     db: AsyncSession = Depends(get_db),
 ):
-    """
-    Called by the CONSUMER (or auto-triggered right when a nurse accepts —
-    see bookings.py accept_booking) to ensure a visit-start OTP is ready.
-    The consumer reads the code aloud to the nurse, who enters it in the
-    nurse app to start the visit.
-    """
+    """Consumer-side: ensure the visit-start OTP is ready (also auto-created
+    when a nurse accepts). The consumer reads it aloud to the nurse."""
     bres = await db.execute(
-        select(Booking).where(
-            Booking.id == booking_id,
-            Booking.consumer_id == profile.id,
-        )
+        select(Booking).where(Booking.id == booking_id, Booking.consumer_id == profile.id)
     )
     booking = bres.scalar_one_or_none()
     if not booking:
         raise HTTPException(status_code=404, detail="Booking not found")
-
-    if booking.status not in _OTP_ELIGIBLE_STATUSES:
-        raise HTTPException(
-            status_code=400,
-            detail={
-                "code": "BOOKING_NOT_READY",
-                "message": "Visit cannot be started in the current booking state.",
-            },
-        )
-
     return await _ensure_visit_start_otp(db, booking)
 
 
@@ -305,120 +437,56 @@ async def verify_visit_start_otp(
     profile: WorkerProfile = Depends(get_worker_profile),
     db: AsyncSession = Depends(get_db),
 ):
+    """Nurse enters the customer's code to start the visit.
+
+    OTP ALONE IS NOT ENOUGH. The server requires, in this order: correct nurse
+    + booking, active (en-route/arrived) not-already-started visit, the nurse's
+    position within VISIT_START_RADIUS_M of the customer's location, service
+    consent — and only then a valid, unexpired, single-use OTP.
     """
-    Called by the NURSE after the consumer reads the OTP aloud.
-    On success, checks the nurse in and starts the visit — identical outcome
-    to /checkin but gated on OTP verification first.
-    """
-    bres = await db.execute(
-        select(Booking).where(
-            Booking.id == booking_id,
-            Booking.worker_id == profile.id,
-        )
-    )
-    booking = bres.scalar_one_or_none()
-    if not booking:
-        raise HTTPException(status_code=404, detail="Booking not found or not assigned to you")
+    worker_id = profile.id
 
-    # ── Brute-force guard ───────────────────────────────────────────────────
-    attempts_raw = await redis_client.get(_attempts_key(booking_id))
-    attempts = int(attempts_raw) if attempts_raw else 0
-    if attempts >= _OTP_MAX_ATTEMPTS:
-        await redis_client.delete(_otp_key(booking_id))
-        await redis_client.delete(_attempts_key(booking_id))
-        raise HTTPException(
-            status_code=400,
-            detail={
-                "code": "OTP_MAX_ATTEMPTS_EXCEEDED",
-                "message": (
-                    "Too many incorrect attempts. "
-                    "Ask the consumer to generate a new visit code."
-                ),
-            },
-        )
+    async def _check_otp(booking: Booking) -> None:
+        akey = _attempts_key(booking_id, worker_id)
+        okey = _otp_key(booking_id, worker_id)
 
-    stored_otp = await redis_client.get(_otp_key(booking_id))
-    if not stored_otp:
-        raise HTTPException(
-            status_code=400,
-            detail={
-                "code": "OTP_EXPIRED",
-                "message": "Visit code has expired. Ask the consumer to generate a new one.",
-            },
-        )
+        # Count the attempt FIRST (atomic INCR) so parallel guesses can't
+        # slip past the cap between "read count" and "write count".
+        attempts = await redis_client.incr(akey)
+        if attempts == 1:
+            await redis_client.expire(akey, _OTP_TTL_SECONDS)
+        if attempts > _OTP_MAX_ATTEMPTS:
+            await redis_client.delete(okey)
+            raise _http(400, "OTP_MAX_ATTEMPTS_EXCEEDED",
+                        "Too many incorrect attempts. Ask the consumer to generate a new visit code.")
 
-    if payload.otp.strip() != stored_otp:
-        pipe = redis_client.pipeline()
-        pipe.incr(_attempts_key(booking_id))
-        pipe.expire(_attempts_key(booking_id), _OTP_TTL_SECONDS)
-        await pipe.execute()
+        stored = await redis_client.get(okey)
+        if not stored:
+            raise _http(400, "OTP_EXPIRED",
+                        "Visit code has expired. Ask the consumer to generate a new one.")
+        stored = stored.decode() if isinstance(stored, bytes) else stored
+        if not secrets.compare_digest(payload.otp.strip(), stored):
+            remaining = max(0, _OTP_MAX_ATTEMPTS - attempts)
+            raise _http(400, "OTP_INVALID", f"Incorrect visit code. {remaining} attempt(s) remaining.",
+                        attempts_remaining=remaining)
 
-        remaining = _OTP_MAX_ATTEMPTS - (attempts + 1)
-        raise HTTPException(
-            status_code=400,
-            detail={
-                "code": "OTP_INVALID",
-                "message": f"Incorrect visit code. {remaining} attempt(s) remaining.",
-                "attempts_remaining": remaining,
-            },
-        )
+        # Single use: DEL returns how many keys it removed, so exactly one of
+        # two racing correct submissions gets 1 and proceeds.
+        if await redis_client.delete(okey) != 1:
+            raise _http(409, "OTP_ALREADY_USED", "This visit code has already been used.")
+        await redis_client.delete(akey)
 
-    # OTP matches — but don't consume it yet. If a downstream check (consent,
-    # already-checked-in) fails, the nurse/consumer shouldn't have to
-    # generate a brand new code for something unrelated to the code itself.
-    vres = await db.execute(select(VisitRecord).where(VisitRecord.booking_id == booking_id))
-    visit = vres.scalar_one_or_none()
-    if visit and visit.check_in_at:
-        raise HTTPException(status_code=400, detail="Already checked in")
-
-    try:
-        await require_consent(
-            db,
-            patient_id=booking.patient_id,
-            consent_type=ConsentType.service,
-            booking_id=booking.id,
-            action="start the visit",
-        )
-    except ConsentMissingError as ce:
-        raise HTTPException(
-            status_code=403,
-            detail={"code": ce.code, "message": ce.message, "consent_type": ce.consent_type.value},
-        ) from None
-
-    # All checks passed — the code is now spent, whether or not the rest of
-    # the check-in succeeds (matches the original all-or-nothing behavior
-    # for genuine check-in failures past this point).
-    await redis_client.delete(_otp_key(booking_id))
-    await redis_client.delete(_attempts_key(booking_id))
-
-    if not visit:
-        visit = VisitRecord(
-            booking_id=booking.id,
-            worker_id=profile.id,
-            patient_id=booking.patient_id,
-        )
-        db.add(visit)
-        await db.flush()
-
-    visit.check_in_at = datetime.now(timezone.utc)
-    visit.check_in_latitude = payload.latitude
-    visit.check_in_longitude = payload.longitude
-    visit.status = VisitStatus.in_progress
-    booking.status = BookingStatus.in_progress
-
-    await audit(
-        db, profile.user_id, "worker",
-        "visit.checkin_via_otp", "visit", visit.id,
-        {"otp_verified": True},
+    booking, visit = await _start_visit_guarded(
+        db, booking_id, profile, payload.latitude, payload.longitude,
+        accuracy_m=payload.accuracy_m, captured_at=payload.captured_at,
+        method="otp", before_commit=_check_otp,
     )
     await db.commit()
     await db.refresh(visit)
-
     await manager.broadcast(
         booking_topic(booking_id),
         {"type": "visit.checked_in", "booking_id": str(booking_id), "method": "otp"},
     )
-
     return VisitRecordOut.model_validate(visit)
 
 
@@ -434,6 +502,8 @@ async def checkout(
     profile: WorkerProfile = Depends(get_worker_profile),
     db: AsyncSession = Depends(get_db),
 ):
+    # Serialize concurrent checkouts (double-tap / two devices).
+    await db.execute(select(Booking.id).where(Booking.id == booking_id).with_for_update())
     booking, visit = await _get_visit_for_worker(db, booking_id, profile.id)
     if not visit.check_in_at:
         raise HTTPException(status_code=400, detail="Cannot checkout without check-in")
@@ -506,6 +576,8 @@ async def checkout(
     visit.status = VisitStatus.completed
     visit.documentation_complete = True
     booking.status = BookingStatus.completed
+    # Freeze the report: from here every content write path returns 409.
+    report_lock.finalize_report(visit, profile.user_id)
 
     # increment worker stats
     profile.completed_visits_count += 1
@@ -621,6 +693,11 @@ async def submit_vitals(
     db: AsyncSession = Depends(get_db),
 ):
     booking, visit = await _get_visit_for_worker(db, booking_id, profile.id)
+    report_lock.assert_report_editable(visit)
+    from app.services.vitals_integrity import assert_valid_vitals
+    # Reject empty / implausible readings instead of storing a blank row that
+    # later reads as "vitals were recorded".
+    assert_valid_vitals(payload.model_dump())
     # Evaluate against rule set
     rule_set = None
     if booking.rule_set_id_snapshot:
@@ -730,6 +807,7 @@ async def submit_medication(
     db: AsyncSession = Depends(get_db),
 ):
     booking, visit = await _get_visit_for_worker(db, booking_id, profile.id)
+    report_lock.assert_report_editable(visit)
     # Patch 5A — medication consent gate
     try:
         await require_consent(
@@ -845,6 +923,7 @@ async def submit_checklist(
     db: AsyncSession = Depends(get_db),
 ):
     booking, visit = await _get_visit_for_worker(db, booking_id, profile.id)
+    report_lock.assert_report_editable(visit)
     # Patch 5A — service consent gate
     try:
         await require_consent(
@@ -1062,6 +1141,10 @@ def _report_payload(visit: VisitRecord, status: dict | None = None) -> dict:
         "check_out_at": visit.check_out_at.isoformat() if visit.check_out_at else None,
         "actual_duration_minutes": visit.actual_duration_minutes,
         "status": visit.status.value,
+        # Immutability surface for the apps: when true, hide editing and don't
+        # bother submitting — the server will answer 409 REPORT_FINALIZED.
+        "is_final": report_lock.is_finalized(visit),
+        "report_finalized_at": visit.report_finalized_at.isoformat() if visit.report_finalized_at else None,
     }
     if status is not None:
         out["can_complete_visit"] = status["can_checkout"]
@@ -1112,14 +1195,20 @@ async def save_visit_report(
     profile: WorkerProfile = Depends(get_worker_profile),
     db: AsyncSession = Depends(get_db),
 ):
-    """Save (or re-save) the nurse's visit report.
+    """Save (or re-save) the nurse's DRAFT visit report.
 
-    Deliberately permitted after checkout as well: a nurse correcting a
-    typo in a report an hour later is normal, and refusing it would push
-    people into raising support tickets to fix their own notes. Every save
-    is audited, so an after-the-fact edit is traceable.
+    Only allowed until the visit is checked out. At checkout the report is
+    finalized and immutable: this endpoint then returns 409 REPORT_FINALIZED.
+    (It used to be deliberately permitted after checkout, which let a
+    completed clinical record be rewritten by any client.)
     """
     _booking, visit = await _get_visit_for_worker(db, booking_id, profile.id)
+    if report_lock.is_finalized(visit):
+        await audit(
+            db, profile.user_id, "worker", "visit.report_edit_rejected_finalized", "visit", visit.id, {},
+        )
+        await db.commit()
+    report_lock.assert_report_editable(visit)
 
     if payload.care_notes is not None:
         visit.care_notes = payload.care_notes.strip() or None
@@ -1133,7 +1222,7 @@ async def save_visit_report(
         "visit.report_saved",
         "visit",
         visit.id,
-        {"after_checkout": bool(visit.check_out_at)},
+        {"after_checkout": False},
     )
     await db.commit()
     await db.refresh(visit)

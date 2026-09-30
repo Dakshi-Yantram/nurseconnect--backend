@@ -761,6 +761,15 @@ class Booking(Base):
     # burned the whole 20-minute wave window while the consumer was still
     # on the payment screen.
     dispatch_started_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    # Incremented every time a booking is handed back to dispatch (worker
+    # cancelled, failed safety check, Rx approved). The per-(booking, worker)
+    # broadcast ledger is keyed on it, so a nurse is notified at most once per
+    # dispatch cycle no matter how many payment replays / retries / beat ticks
+    # try to broadcast.
+    dispatch_cycle: Mapped[int] = mapped_column(Integer, default=1, server_default="1")
+    # The dispatch cycle for which ops was already told "no provider reachable".
+    # Claimed with a conditional UPDATE so replays cannot alert ops repeatedly.
+    no_worker_alerted_cycle: Mapped[Optional[int]] = mapped_column(Integer)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now, server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now, onupdate=_now, server_default=func.now())
 
@@ -867,6 +876,36 @@ class VisitRecord(Base):
     # hygiene self-report. Both block the procedure pending ops review.
     supply_issue_reported: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false")
     supply_issue_details: Mapped[Optional[dict]] = mapped_column(JSONB)  # {issue_type, notes, reported_at}
+
+    # ── Report finalization (immutability) ──
+    # Set exactly once, at checkout. After this the report, vitals, checklist
+    # and documentation for the visit are frozen: every write path calls
+    # app.services.report_lock.assert_report_editable(). The hash lets an audit
+    # prove the stored report is the one that was finalized.
+    report_finalized_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    report_finalized_by: Mapped[Optional[UUID]] = mapped_column(PG_UUID(as_uuid=True), ForeignKey("users.id"))
+    report_content_hash: Mapped[Optional[str]] = mapped_column(String(64))
+
+
+class BookingDispatchNotification(Base):
+    """Ledger of which worker was pushed which booking, per dispatch cycle.
+
+    The UNIQUE (booking_id, worker_id, cycle) constraint is the idempotency
+    guarantee: broadcasting is `INSERT ... ON CONFLICT DO NOTHING` and only a
+    row that was actually inserted triggers a push. Concurrent /verify,
+    webhook, reconcile and beat-driven wave broadcasts therefore cannot
+    double-notify a nurse.
+    """
+    __tablename__ = "booking_dispatch_notifications"
+    __table_args__ = (
+        UniqueConstraint("booking_id", "worker_id", "cycle", name="ux_dispatch_notif_booking_worker_cycle"),
+    )
+    id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), primary_key=True, default=_uuid)
+    booking_id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), ForeignKey("bookings.id", ondelete="CASCADE"), index=True)
+    worker_id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), ForeignKey("worker_profiles.id", ondelete="CASCADE"), index=True)
+    cycle: Mapped[int] = mapped_column(Integer, default=1, server_default="1")
+    wave: Mapped[int] = mapped_column(Integer, default=1, server_default="1")
+    notified_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now, server_default=func.now())
 
 
 # ============================================================================

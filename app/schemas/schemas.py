@@ -529,6 +529,10 @@ class BookingOut(ORMModel):
     patient_name: Optional[str] = None
     service_name: Optional[str] = None
     worker_name: Optional[str] = None
+    # Server-computed so no client has to guess: 'upcoming' | 'active' | 'past'.
+    time_bucket: Optional[str] = None
+    # True when the slot has already passed and the booking never started.
+    is_expired: bool = False
 
 
 class BookingCancelRequest(BaseModel):

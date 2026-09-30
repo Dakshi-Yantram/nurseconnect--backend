@@ -79,13 +79,21 @@ def watermark_identity(user: User) -> tuple[str, Optional[str]]:
 
 
 async def latest_vitals(db: AsyncSession, booking_id: UUID) -> Optional[dict]:
+    from app.services.vitals_integrity import MEASUREMENT_FIELDS
+
     res = await db.execute(
         select(VitalSignReading)
         .where(VitalSignReading.booking_id == booking_id)
         .order_by(VitalSignReading.recorded_at.desc())
-        .limit(1)
+        .limit(20)
     )
-    v = res.scalar_one_or_none()
+    # Newest reading that actually contains a measurement — an empty legacy row
+    # must never make the report claim "vitals were recorded".
+    v = next(
+        (r for r in res.scalars().all()
+         if any(getattr(r, f, None) is not None for f in MEASUREMENT_FIELDS)),
+        None,
+    )
     if v is None:
         return None
     return {

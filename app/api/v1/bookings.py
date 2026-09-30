@@ -51,11 +51,39 @@ from app.schemas.schemas import (
     EscalationCreateRequest,
     SOSCreateRequest,
 )
+from app.core.timeutil import booking_end_utc, booking_start_utc, is_booking_expired, is_slot_expired
+from app.services import catalog_guard
 from app.services.clinical_engine import compute_sla_breach, get_escalation_metadata
 from app.services.common_services import audit, notify_admins, notify_parties, send_notification
 from app.websockets.manager import booking_topic, manager, user_topic
 
 router = APIRouter(prefix="/bookings", tags=["bookings"])
+
+_TERMINAL = (BookingStatus.completed, BookingStatus.cancelled, BookingStatus.missed, BookingStatus.disputed)
+_ACTIVE_NOW = (BookingStatus.worker_en_route, BookingStatus.worker_arrived, BookingStatus.in_progress)
+
+
+def _time_bucket(b: Booking, now: Optional[datetime] = None) -> str:
+    """See core.timeutil.time_bucket (server-side truth for the app tabs)."""
+    from app.core.timeutil import time_bucket
+    return time_bucket(b, now)
+
+
+def _annotate_time(bm: BookingOut, b: Booking, now: Optional[datetime] = None) -> BookingOut:
+    now = now or datetime.now(timezone.utc)
+    bucket = _time_bucket(b, now)
+    bm.time_bucket = bucket
+    bm.is_expired = bool(b.status not in _TERMINAL and b.status not in _ACTIVE_NOW and is_booking_expired(b, now=now))
+    return bm
+
+
+def _offering_name(b: Booking, svc, pkg) -> Optional[str]:
+    """Name of what the customer actually bought: the package wins."""
+    if b.package_id and pkg is not None:
+        return pkg.name
+    if b.service_id and svc is not None:
+        return svc.name
+    return None
 
 
 def _gen_booking_ref() -> str:
@@ -176,6 +204,12 @@ async def create_booking(
         service = sres.scalar_one_or_none()
         if not service:
             raise HTTPException(status_code=404, detail="Service not found")
+        _reason = catalog_guard.unbookable_reason(service)
+        if _reason:
+            raise HTTPException(
+                status_code=409,
+                detail={"code": _reason, "message": "This service is not available for booking."},
+            )
         base_amount = service.base_price
         duration = service.duration_minutes
 
@@ -184,6 +218,23 @@ async def create_booking(
         package = kres.scalar_one_or_none()
         if not package:
             raise HTTPException(status_code=404, detail="Care package not found")
+        _psvc = None
+        if package.primary_service_id:
+            _pr = await db.execute(select(ServiceCatalogue).where(ServiceCatalogue.id == package.primary_service_id))
+            _psvc = _pr.scalar_one_or_none()
+        _reason = catalog_guard.unbookable_reason(package, fallback_items=(_psvc,))
+        if _reason:
+            raise HTTPException(
+                status_code=409,
+                detail={"code": _reason, "message": "This care package is not available for booking."},
+            )
+        if package.available_cities:
+            _city = (resolved_snapshot or {}).get("city") if isinstance(resolved_snapshot, dict) else None
+            if _city and _city not in package.available_cities:
+                raise HTTPException(
+                    status_code=409,
+                    detail={"code": "PACKAGE_NOT_AVAILABLE_IN_CITY", "message": "This package is not available in your city."},
+                )
         # per_visit_price and package_price are both nullable — an admin can
         # save a package without ever setting either. That used to silently
         # fall through to a ₹0 booking, which shows up to the consumer as
@@ -246,9 +297,14 @@ async def create_booking(
         tax_amount=tax_amount,
         total_amount=total,
         special_instructions=payload.special_instructions,
-        rule_set_id_snapshot=(service.escalation_rule_set_id if service else (package.escalation_rule_set_id if package else None)),
-        checklist_template_id_snapshot=(service.checklist_template_id if service else (package.checklist_template_id if package else None)),
-        documentation_template_id_snapshot=(service.documentation_template_id if service else (package.documentation_template_id if package else None)),
+        # ROOT CAUSE (wrong questionnaire): snapshots were taken from the
+        # *service* first, but the purchased *package* is what defines the
+        # questionnaire. A package booking that also carried a service_id
+        # snapshotted the service's templates. Package wins, falling back to
+        # the service only for fields the package leaves empty.
+        rule_set_id_snapshot=((package.escalation_rule_set_id if package and package.escalation_rule_set_id else None) or (service.escalation_rule_set_id if service else None)),
+        checklist_template_id_snapshot=((package.checklist_template_id if package and package.checklist_template_id else None) or (service.checklist_template_id if service else None)),
+        documentation_template_id_snapshot=((package.documentation_template_id if package and package.documentation_template_id else None) or (service.documentation_template_id if service else None)),
     )
     db.add(booking)
     await db.flush()
@@ -261,6 +317,7 @@ async def create_booking(
 @router.get("/consumer", response_model=List[BookingOut])
 async def my_consumer_bookings(
     status: Optional[BookingStatus] = None,
+    bucket: Optional[str] = None,
     profile: ConsumerProfile = Depends(get_consumer_profile),
     db: AsyncSession = Depends(get_db),
 ):
@@ -290,18 +347,21 @@ async def my_consumer_bookings(
             if patient:
                 bm.patient_name = patient.full_name
 
+        _svc = _pkg = None
         if b.service_id:
             if b.service_id not in svc_cache:
                 sr = await db.execute(select(ServiceCatalogue).where(ServiceCatalogue.id == b.service_id))
                 svc_cache[b.service_id] = sr.scalar_one_or_none()
-            if svc_cache[b.service_id]:
-                bm.service_name = svc_cache[b.service_id].name
-        elif b.package_id:
+            _svc = svc_cache[b.service_id]
+        if b.package_id:
             if b.package_id not in pkg_cache:
                 pr = await db.execute(select(CarePackage).where(CarePackage.id == b.package_id))
                 pkg_cache[b.package_id] = pr.scalar_one_or_none()
-            if pkg_cache[b.package_id]:
-                bm.service_name = pkg_cache[b.package_id].name
+            _pkg = pkg_cache[b.package_id]
+        _nm = _offering_name(b, _svc, _pkg)
+        if _nm:
+            bm.service_name = _nm
+        _annotate_time(bm, b)
 
         if b.worker_id:
             if b.worker_id not in worker_name_cache:
@@ -314,6 +374,8 @@ async def my_consumer_bookings(
                 bm.worker_name = worker_name_cache[b.worker_id]
 
         out.append(bm)
+    if bucket in ("upcoming", "active", "past"):
+        out = [o for o in out if o.time_bucket == bucket]
     return out
 
 
@@ -346,18 +408,21 @@ async def my_worker_bookings(
             if patient:
                 bm.patient_name = patient.full_name
 
+        _svc = _pkg = None
         if b.service_id:
             if b.service_id not in svc_cache:
                 sr = await db.execute(select(ServiceCatalogue).where(ServiceCatalogue.id == b.service_id))
                 svc_cache[b.service_id] = sr.scalar_one_or_none()
-            if svc_cache[b.service_id]:
-                bm.service_name = svc_cache[b.service_id].name
-        elif b.package_id:
+            _svc = svc_cache[b.service_id]
+        if b.package_id:
             if b.package_id not in pkg_cache:
                 pr = await db.execute(select(CarePackage).where(CarePackage.id == b.package_id))
                 pkg_cache[b.package_id] = pr.scalar_one_or_none()
-            if pkg_cache[b.package_id]:
-                bm.service_name = pkg_cache[b.package_id].name
+            _pkg = pkg_cache[b.package_id]
+        _nm = _offering_name(b, _svc, _pkg)
+        if _nm:
+            bm.service_name = _nm
+        _annotate_time(bm, b)
 
         out.append(bm)
     return out
@@ -369,137 +434,77 @@ async def my_worker_bookings(
 @router.get("/available", response_model=List[BookingOut], include_in_schema=False)
 @router.get("/worker/new-requests", response_model=List[BookingOut])
 async def new_requests(profile: WorkerProfile = Depends(get_worker_profile), db: AsyncSession = Depends(get_db)):
-    """Unassigned bookings the worker is qualified for, opted into, AND inside
-    the current radius wave.
+    """Open bookings this worker may claim right now.
 
-    Patch 2 filters (qualification + opt-in) run BEFORE Patch 3 proximity
-    filtering, so we don't pay the Haversine cost for ineligible rows. Wave
-    progression is computed opportunistically per booking based on elapsed
-    time since ``booking.created_at`` — no scheduler required.
+    Uses the SAME rule as the push broadcast and the accept guard
+    (``dispatch.evaluate_worker_for_booking``), so what a nurse is pinged about,
+    what she sees here, and what she can accept can no longer disagree.
+
+    ROOT CAUSE fixed: the old query took the first 50 open bookings ordered by
+    scheduled_date ASC *before* any eligibility/expiry filtering. Past-dated
+    and far-away rows filled that window, so an eligible nearby nurse never saw
+    newer bookings. Expired slots are now excluded in SQL, ordering is by
+    dispatch time, and eligibility runs over a bounded candidate set.
     """
-    from app.services.proximity import (
-        compute_current_wave,
-        effective_origin_for_worker,
-        haversine_km,
-        radius_for_wave,
+    from app.core.timeutil import IST
+    from app.services.dispatch import (
+        DISPATCHABLE_STATUSES,
+        booking_dispatch_block_reason,
+        evaluate_worker_for_booking,
+        resolve_target,
     )
-    from app.services.qualification import can_worker_receive_service
-    from app.services.dispatch import worker_has_schedule_conflict
+    from app.services.proximity import compute_current_wave
+
+    now = datetime.now(timezone.utc)
+    # Slots dated before yesterday (IST) can never be open; the exact
+    # start+grace check runs in Python below.
+    earliest_date = (now.astimezone(IST) - timedelta(days=1)).date()
     res = await db.execute(
-        select(Booking).where(
+        select(Booking)
+        .where(
             Booking.worker_id.is_(None),
-            # searching_nurse == Workflow 1 composite bookings post-Rx-approval,
-            # dispatchable the same way as a normal confirmed booking.
-            Booking.status.in_([BookingStatus.confirmed, BookingStatus.rematch_pending, BookingStatus.searching_nurse]),
-        ).order_by(Booking.scheduled_date.asc()).limit(50)
+            Booking.status.in_(DISPATCHABLE_STATUSES),
+            Booking.scheduled_date >= earliest_date,
+        )
+        .order_by(func.coalesce(Booking.dispatch_started_at, Booking.created_at).asc())
+        .limit(500)
     )
     items: list[Booking] = list(res.scalars().all())
 
-    # Patch 3 — compute worker effective origin once. ``None`` means we have
-    # neither a fresh current location nor a home location on file.
-    worker_origin = effective_origin_for_worker(profile)
-
-    # Tele-only providers (Tele-Doctor) never travel to the patient, so
-    # "how far away is this booking" is a meaningless question for them —
-    # applying it anyway would silently hide teleconsultation bookings from
-    # the one provider type that exists to take them, since a remote doctor
-    # can never be "near" any address. `is_tele_capable and not
-    # is_physical_capable` is true only for tele_doctor: the legacy generic
-    # `doctor` type is both, so it keeps today's geography-based behaviour
-    # unless/until it's explicitly re-typed to tele_doctor.
-    worker_is_tele_only = is_tele_capable(profile.worker_type) and not is_physical_capable(profile.worker_type)
-
-    visible: list[tuple[Booking, Optional[float]]] = []
-    svc_cache: dict = {}
-    pkg_cache: dict = {}
+    visible: list[tuple[Booking, Optional[float], object]] = []
+    target_cache: dict = {}
     patient_cache: dict = {}
-    now = datetime.now(timezone.utc)
-    wave_dirty: list[Booking] = []
+    wave_dirty = False
     for b in items:
-        # ----- Patch 2 filters first (cheap) ---------------------------------
-        target = None
-        if b.service_id:
-            if b.service_id in svc_cache:
-                target = svc_cache[b.service_id]
-            else:
-                sr = await db.execute(select(ServiceCatalogue).where(ServiceCatalogue.id == b.service_id))
-                target = sr.scalar_one_or_none()
-                svc_cache[b.service_id] = target
-        elif b.package_id:
-            if b.package_id in pkg_cache:
-                target = pkg_cache[b.package_id]
-            else:
-                pr = await db.execute(select(CarePackage).where(CarePackage.id == b.package_id))
-                target = pr.scalar_one_or_none()
-                pkg_cache[b.package_id] = target
-        if not target:
+        if booking_dispatch_block_reason(b, now=now) is not None:
             continue
-        allowed, _ = await can_worker_receive_service(profile, target, db)
-        if not allowed:
-            continue
+        key = (b.package_id, b.service_id)
+        if key not in target_cache:
+            target_cache[key] = await resolve_target(db, b)
+        target = target_cache[key]
 
-        # ----- Patch 3 — opportunistic wave progression ---------------------
         current_wave = compute_current_wave(b, now=now)
+        elig = await evaluate_worker_for_booking(db, profile, b, target, now=now, wave=current_wave)
+        if not elig.ok:
+            continue
         if current_wave > (b.assignment_wave or 1):
             b.assignment_wave = current_wave
             if current_wave >= 4 and b.assignment_escalated_at is None:
                 b.assignment_escalated_at = now
-            wave_dirty.append(b)
-
-        # ----- Patch 3 — proximity / wave radius filter ----------------------
-        # Skipped entirely for tele-only providers: waves and radii exist to
-        # progressively widen a PHYSICAL search area, which has no meaning
-        # for a video consultation. A tele-doctor sees every otherwise-
-        # eligible booking regardless of the patient's address.
-        distance_km: Optional[float] = None
-        if not worker_is_tele_only:
-            radius_km = radius_for_wave(b.assignment_wave or 1, b.is_urgent)
-            if radius_km is None:
-                # Past last wave → escalated. Do not show to workers; admin handles.
-                continue
-
-            booking_has_coords = b.latitude is not None and b.longitude is not None
-            if booking_has_coords and worker_origin is not None:
-                distance_km = haversine_km(
-                    worker_origin[0], worker_origin[1], b.latitude, b.longitude
-                )
-                if distance_km > radius_km:
-                    continue
-            elif booking_has_coords and worker_origin is None:
-                # Worker has no fresh-or-home coordinates: per spec, urgent jobs
-                # must NOT be shown. For normal jobs we fall back to city match.
-                if b.is_urgent:
-                    continue
-                addr_city = (b.address_snapshot or {}).get("city") if isinstance(b.address_snapshot, dict) else None
-                if profile.base_city and addr_city and profile.base_city != addr_city:
-                    continue
-            # If booking has no lat/lng we fall back to city/zone match as well.
-            elif not booking_has_coords:
-                addr_city = (b.address_snapshot or {}).get("city") if isinstance(b.address_snapshot, dict) else None
-                if profile.base_city and addr_city and profile.base_city != addr_city:
-                    continue
-                if b.is_urgent and worker_origin is None:
-                    continue
-
-        # Only surface bookings the worker is actually free for.
-        if await worker_has_schedule_conflict(db, profile.id, b):
-            continue
-
-        visible.append((b, distance_km))
+            wave_dirty = True
+        visible.append((b, elig.distance_km, target))
         if len(visible) >= 20:
             break
 
-    # Persist wave bumps in a single commit so the next call doesn't redo work.
     if wave_dirty:
         try:
             await db.commit()
-        except Exception:
+        except Exception:  # noqa: BLE001
             await db.rollback()
 
     out: list[BookingOut] = []
-    for b, dist in visible:
+    for b, dist, target in visible:
         bm = BookingOut.model_validate(b)
-
         if b.patient_id:
             if b.patient_id not in patient_cache:
                 pres = await db.execute(select(Patient).where(Patient.id == b.patient_id))
@@ -507,14 +512,11 @@ async def new_requests(profile: WorkerProfile = Depends(get_worker_profile), db:
             patient = patient_cache[b.patient_id]
             if patient:
                 bm.patient_name = patient.full_name
-
-        if b.service_id and b.service_id in svc_cache and svc_cache[b.service_id]:
-            bm.service_name = svc_cache[b.service_id].name
-        elif b.package_id and b.package_id in pkg_cache and pkg_cache[b.package_id]:
-            bm.service_name = pkg_cache[b.package_id].name
-
+        if target is not None:
+            bm.service_name = target.name
         if dist is not None:
             bm.distance_km = round(dist, 2)
+        _annotate_time(bm, b, now)
         out.append(bm)
     return out
 
@@ -603,6 +605,7 @@ async def get_booking(booking_id: UUID, current: CurrentUser = Depends(get_curre
         raise HTTPException(status_code=403, detail="Forbidden")
 
     bm = BookingOut.model_validate(b)
+    _annotate_time(bm, b)
 
     # Enrich with patient_name / service_name / worker_name — this endpoint
     # backs the consumer/nurse "booking detail" pages, which otherwise show
@@ -614,16 +617,16 @@ async def get_booking(booking_id: UUID, current: CurrentUser = Depends(get_curre
         if patient:
             bm.patient_name = patient.full_name
 
+    svc = pkg = None
     if b.service_id:
         sres = await db.execute(select(ServiceCatalogue).where(ServiceCatalogue.id == b.service_id))
         svc = sres.scalar_one_or_none()
-        if svc:
-            bm.service_name = svc.name
-    elif b.package_id:
+    if b.package_id:
         pkres = await db.execute(select(CarePackage).where(CarePackage.id == b.package_id))
         pkg = pkres.scalar_one_or_none()
-        if pkg:
-            bm.service_name = pkg.name
+    _nm = _offering_name(b, svc, pkg)
+    if _nm:
+        bm.service_name = _nm
 
     if b.worker_id:
         wres2 = await db.execute(
@@ -730,13 +733,10 @@ async def accept_booking(
     if not pre_b:
         raise HTTPException(status_code=404, detail="Booking not found")
 
-    target = None
-    if pre_b.service_id:
-        sr = await db.execute(select(ServiceCatalogue).where(ServiceCatalogue.id == pre_b.service_id))
-        target = sr.scalar_one_or_none()
-    elif pre_b.package_id:
-        pr = await db.execute(select(CarePackage).where(CarePackage.id == pre_b.package_id))
-        target = pr.scalar_one_or_none()
+    from app.services.dispatch import resolve_target as _resolve_target
+    # Package-first: the purchased package defines eligibility, not a
+    # service_id that may also be stored on the row.
+    target = await _resolve_target(db, pre_b)
 
     if target is not None:
         from app.services.qualification import (
@@ -765,17 +765,49 @@ async def accept_booking(
                 },
             )
 
-    # Schedule guard — a worker cannot hold two overlapping visits.
-    from app.services.dispatch import worker_has_schedule_conflict
-    if await worker_has_schedule_conflict(db, worker_id, pre_b):
+    # Everything below (open/expired check, eligibility, schedule-conflict and
+    # the claim UPDATE) runs under one per-worker advisory lock, so two
+    # concurrent accepts of overlapping bookings by the SAME nurse cannot both
+    # pass the conflict check.
+    from app.services.dispatch import (
+        booking_dispatch_block_reason,
+        evaluate_worker_for_booking,
+        lock_worker_schedule,
+    )
+    await lock_worker_schedule(db, worker_id)
+
+    # Re-read after taking the lock so we judge current state.
+    await db.refresh(pre_b)
+    block = booking_dispatch_block_reason(pre_b, now=now)
+    if block == "SLOT_EXPIRED":
+        await db.rollback()
         return JSONResponse(
-            status_code=409,
-            content={
-                "success": False,
-                "code": "WORKER_SCHEDULE_CONFLICT",
-                "message": "You already have a visit booked at this time.",
-            },
+            status_code=410,
+            content={"success": False, "code": "BOOKING_SLOT_EXPIRED",
+                     "message": "This booking's time slot has already passed."},
         )
+
+    # Same eligibility rule as the push and the pull list (approval,
+    # availability, qualification/opt-in, radius for the current wave).
+    # A worker who is already the winner is let through to the idempotent
+    # branch below.
+    already_mine = pre_b.worker_id == worker_id and pre_b.status == BookingStatus.assigned
+    if not already_mine and pre_b.worker_id is None:
+        elig = await evaluate_worker_for_booking(db, profile, pre_b, target, now=now)
+        if not elig.ok:
+            await db.rollback()
+            if elig.reason == "SCHEDULE_CONFLICT":
+                return JSONResponse(
+                    status_code=409,
+                    content={"success": False, "code": "WORKER_SCHEDULE_CONFLICT",
+                             "message": "You already have a visit booked at this time."},
+                )
+            return JSONResponse(
+                status_code=403,
+                content={"success": False, "code": "WORKER_NOT_ELIGIBLE_FOR_BOOKING",
+                         "reason": elig.reason,
+                         "message": "This booking isn't available to you."},
+            )
 
     # Atomic conditional update — only succeeds if booking is still open and
     # unclaimed. The DB enforces a single winner.
@@ -799,20 +831,22 @@ async def accept_booking(
         vres = await db.execute(select(VisitRecord).where(VisitRecord.booking_id == b.id))
         visit = vres.scalar_one_or_none()
         if not visit:
+            # ROOT CAUSE: the IntegrityError handler used db.rollback(), which
+            # rolls back the WHOLE transaction — including the claim UPDATE
+            # above — so a race on visit creation silently un-assigned the
+            # booking while still returning 200. A SAVEPOINT scopes the
+            # rollback to just the duplicate INSERT.
             try:
-                db.add(VisitRecord(
-                    booking_id=b.id,
-                    worker_id=worker_id,
-                    patient_id=b.patient_id,
-                    status=VisitStatus.scheduled,
-                ))
-                await db.flush()
+                async with db.begin_nested():
+                    db.add(VisitRecord(
+                        booking_id=b.id,
+                        worker_id=worker_id,
+                        patient_id=b.patient_id,
+                        status=VisitStatus.scheduled,
+                    ))
+                    await db.flush()
             except IntegrityError:
-                # A concurrent transaction created the visit first — ignore.
-                await db.rollback()
-                # Re-fetch booking after rollback so caller still gets fresh row.
-                bres = await db.execute(select(Booking).where(Booking.id == booking_id))
-                b = bres.scalar_one()
+                pass  # a concurrent transaction created the visit first
         await audit(db, profile.user_id, "worker", "booking.accept", "booking", b.id)
         await db.commit()
         await db.refresh(b)
@@ -957,9 +991,13 @@ async def mark_worker_en_route(
         await db.commit()
         try:
             from app.services.dispatch import notify_nearby_workers
-            await notify_nearby_workers(db, b)
+            b.dispatch_started_at = datetime.now(timezone.utc)
+            b.assignment_wave = 1
+            await db.commit()
+            await notify_nearby_workers(db, b, new_cycle=True)
+            await db.commit()
         except Exception:  # noqa: BLE001
-            pass
+            await db.rollback()
         await manager.broadcast(booking_topic(b.id), {"type": "booking.rematch", "booking_id": str(b.id)})
         return JSONResponse(
             status_code=403,
@@ -1001,9 +1039,8 @@ _CANCELLATION_CUTOFF_HOURS = 6
 
 
 def _scheduled_start_utc(b: Booking) -> datetime:
-    # Same convention as dispatch._window: scheduled_date + scheduled_start_time
-    # are treated as UTC wall-clock throughout the codebase.
-    return datetime.combine(b.scheduled_date, b.scheduled_start_time, tzinfo=timezone.utc)
+    # scheduled_date + scheduled_start_time are IST wall-clock (see core.timeutil).
+    return booking_start_utc(b)
 
 
 @router.post("/{booking_id}/cancel", response_model=BookingOut)
@@ -1085,7 +1122,7 @@ async def cancel_booking(
                     {"booking_id": str(b.id)},
                 )
             from app.services.dispatch import notify_nearby_workers
-            await notify_nearby_workers(db, b)
+            await notify_nearby_workers(db, b, new_cycle=True)
             await db.commit()
         except Exception:  # noqa: BLE001
             await db.rollback()

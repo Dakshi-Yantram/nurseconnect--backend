@@ -25,6 +25,7 @@ from app.models.models import (
     OfflineSyncQueue,
     WorkerPayout,
 )
+from app.core.timeutil import booking_start_utc
 from app.workers.celery_app import celery_app
 
 logger = get_task_logger(__name__)
@@ -98,7 +99,7 @@ def detect_missed_visits() -> dict:
         ).scalars().all()
         missed = 0
         for b in scheduled:
-            start_dt = datetime.combine(b.scheduled_date, b.scheduled_start_time, tzinfo=timezone.utc)
+            start_dt = booking_start_utc(b)  # IST wall-clock -> UTC instant
             if start_dt + timedelta(minutes=grace_minutes) < now:
                 b.status = BookingStatus.missed
                 missed += 1
@@ -159,7 +160,7 @@ async def _send_visit_reminders_async() -> dict:
             )
         )
         for b in res.scalars().all():
-            start = datetime.combine(b.scheduled_date, b.scheduled_start_time, tzinfo=timezone.utc)
+            start = booking_start_utc(b)  # IST wall-clock -> UTC instant
             if not (lo <= start < hi):
                 continue
             wres = await db.execute(_select(_WP).where(_WP.id == b.worker_id))
@@ -178,3 +179,87 @@ async def _send_visit_reminders_async() -> dict:
             sent += 1
         await db.commit()
     return {"reminders_sent": sent}
+
+
+@celery_app.task
+def rebroadcast_open_bookings() -> dict:
+    """Push each booking to the nurses in the radius ring that has just opened.
+
+    ROOT CAUSE (some eligible nearby nurses never got the request): the push
+    only ever ran once, at payment time, and only for the wave-1 radius (5 km,
+    3 km urgent). Nurses in the wave-2/3 rings were only reachable if they
+    happened to open the app and poll. This beat task re-runs the (idempotent)
+    broadcast for every open booking; the per-(booking, worker, cycle) ledger
+    guarantees a nurse is never pushed the same booking twice.
+    """
+    import asyncio
+    return asyncio.run(_rebroadcast_open_bookings_async())
+
+
+async def _rebroadcast_open_bookings_async() -> dict:
+    from app.core.database import AsyncSessionLocal
+    from app.services.dispatch import (
+        DISPATCHABLE_STATUSES,
+        booking_dispatch_block_reason,
+        notify_nearby_workers,
+    )
+    from sqlalchemy import select as _select
+
+    bookings = pushed = 0
+    async with AsyncSessionLocal() as db:
+        now = datetime.now(timezone.utc)
+        res = await db.execute(
+            _select(Booking.id).where(
+                Booking.worker_id.is_(None),
+                Booking.status.in_(DISPATCHABLE_STATUSES),
+                Booking.scheduled_date >= (now - timedelta(days=1)).date(),
+            ).limit(500)
+        )
+        ids = [r[0] for r in res.all()]
+    for bid in ids:
+        # One short session per booking so a failure on one cannot poison the rest.
+        async with AsyncSessionLocal() as db:
+            try:
+                b = (await db.execute(_select(Booking).where(Booking.id == bid))).scalar_one_or_none()
+                if b is None or booking_dispatch_block_reason(b) is not None:
+                    continue
+                n = await notify_nearby_workers(db, b)
+                await db.commit()
+                bookings += 1
+                pushed += n
+            except Exception:  # noqa: BLE001
+                await db.rollback()
+                logger.exception("rebroadcast failed for booking %s", bid)
+    return {"bookings": bookings, "workers_notified": pushed}
+
+
+@celery_app.task
+def expire_stale_unpaid_bookings() -> dict:
+    """Cancel never-paid bookings whose slot has passed.
+
+    They would otherwise sit in pending_payment forever (and, before the
+    time-bucket fix, show as "Upcoming"). Only bookings with NO payment
+    activity are touched: anything with an initiated/captured payment is left
+    for the payment reconcile path and ops.
+    """
+    from app.models.enums import PaymentStatus
+    from app.core.timeutil import is_booking_expired
+
+    now = datetime.now(timezone.utc)
+    n = 0
+    with _session() as s:
+        rows = s.execute(
+            select(Booking).where(
+                Booking.status.in_([BookingStatus.pending_payment, BookingStatus.draft]),
+                Booking.payment_status == PaymentStatus.pending,
+                Booking.scheduled_date <= (now.date()),
+            )
+        ).scalars().all()
+        for b in rows:
+            if is_booking_expired(b, now=now):
+                b.status = BookingStatus.cancelled
+                b.cancelled_at = now
+                b.cancellation_reason = "Slot expired before payment"
+                n += 1
+        s.commit()
+    return {"expired": n}

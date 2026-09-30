@@ -70,14 +70,39 @@ async def create_order(
     profile: ConsumerProfile = Depends(get_consumer_profile),
     db: AsyncSession = Depends(get_db),
 ):
-    res = await db.execute(select(Booking).where(Booking.id == payload.booking_id, Booking.consumer_id == profile.id))
+    # Row lock: two concurrent "Pay" taps must not create two Razorpay orders
+    # (the second waits, then sees the order the first one stored).
+    res = await db.execute(
+        select(Booking)
+        .where(Booking.id == payload.booking_id, Booking.consumer_id == profile.id)
+        .with_for_update()
+    )
     booking = res.scalar_one_or_none()
     if not booking:
         raise HTTPException(status_code=404, detail="Booking not found")
     if booking.payment_status == PaymentStatus.captured:
         raise HTTPException(status_code=400, detail="Already paid")
 
+    # Backend is the authority on expiry / status / sellability — never
+    # rely on the app having hidden the Pay button.
+    from app.services.payment_guard import assert_booking_payable
+    await assert_booking_payable(db, booking)
+
     amount_paise = int(booking.total_amount * 100)
+    if amount_paise <= 0:
+        raise HTTPException(status_code=409, detail={"code": "INVALID_AMOUNT", "message": "Booking has no payable amount."})
+
+    # Idempotent: reuse the order already created for this booking.
+    if booking.razorpay_order_id and booking.payment_status == PaymentStatus.initiated:
+        await db.rollback()  # release the row lock
+        return PaymentOrderResponse(
+            razorpay_order_id=booking.razorpay_order_id,
+            razorpay_key_id=settings.RAZORPAY_KEY_ID or "rzp_test_placeholder",
+            amount=amount_paise,
+            currency="INR",
+            booking_id=booking.id,
+        )
+
     order = await razorpay_client.create_order(
         amount_paise=amount_paise,
         currency="INR",
@@ -127,6 +152,25 @@ async def create_order(
 #      dispatch-notify or invoicing cannot expire, poison or roll back the
 #      request's session.
 # ===========================================================================
+def _post_capture_status(booking: Booking) -> BookingStatus:
+    """Status a booking moves to once money is captured.
+
+    ROOT CAUSE: /verify, /reconcile and the webhook unconditionally set
+    confirmed / prescription_pending. A capture that landed after the booking
+    was cancelled (or had already progressed past confirmation) therefore
+    resurrected or regressed it. Money is still recorded in the ledger, but
+    a cancelled booking stays cancelled (ops refunds it) and a booking that
+    is already further along keeps its status.
+    """
+    if booking.status in (BookingStatus.pending_payment, BookingStatus.draft):
+        return (
+            BookingStatus.prescription_pending
+            if is_guarded_workflow(booking)
+            else BookingStatus.confirmed
+        )
+    return booking.status
+
+
 def _payment_state(booking: Booking, *, replay: bool = False) -> dict:
     """Snapshot the verify/status response as plain primitives.
 
@@ -187,11 +231,31 @@ async def _run_post_payment_side_effects(
                     notified = await notify_nearby_workers(session, booking)
                     await session.commit()
                     if notified == 0:
-                        # Nobody was reachable, so this booking would sit on
-                        # "Finding a nurse" indefinitely with no one aware of
-                        # it. Escalate to ops so it gets assigned by hand
-                        # instead of silently stalling.
-                        await _escalate_undispatched_booking(session, booking_id)
+                        # Nobody NEW was notified. That is only a problem when
+                        # nobody has EVER been notified this cycle for a
+                        # booking that is still open — replays of /verify,
+                        # webhooks and reconcile all land here too, and used
+                        # to page ops every time for bookings that were
+                        # already claimed. The alert is claimed atomically so
+                        # it fires at most once per dispatch cycle.
+                        from app.services.dispatch import (
+                            booking_dispatch_block_reason,
+                            broadcast_count,
+                            claim_no_worker_alert,
+                        )
+                        fresh = (await session.execute(
+                            select(Booking).where(Booking.id == booking_id)
+                        )).scalar_one_or_none()
+                        if (
+                            fresh is not None
+                            and booking_dispatch_block_reason(fresh) is None
+                            and await broadcast_count(session, booking_id, int(fresh.dispatch_cycle or 1)) == 0
+                            and await claim_no_worker_alert(session, booking_id, int(fresh.dispatch_cycle or 1))
+                        ):
+                            await session.commit()
+                            await _escalate_undispatched_booking(session, booking_id)
+                        else:
+                            await session.rollback()
                 except Exception:  # noqa: BLE001
                     await session.rollback()
                     logger.exception("dispatch notify failed for booking %s", booking_id)
@@ -266,7 +330,7 @@ async def verify_payment(
         # Webhook (or earlier /verify) already processed this payment id.
         booking.razorpay_payment_id = payload.razorpay_payment_id
         booking.payment_status = PaymentStatus.captured
-        booking.status = BookingStatus.prescription_pending if is_guarded_workflow(booking) else BookingStatus.confirmed
+        booking.status = _post_capture_status(booking)
         if booking.dispatch_started_at is None:
             booking.dispatch_started_at = datetime.now(timezone.utc)
         await db.commit()
@@ -282,7 +346,7 @@ async def verify_payment(
     # payment unlocks pharmacist Rx review, NOT dispatch. Dispatch only starts
     # once Rx is approved (see composite_care.py: approve_prescription ->
     # searching_nurse).
-    booking.status = BookingStatus.prescription_pending if is_guarded_workflow(booking) else BookingStatus.confirmed
+    booking.status = _post_capture_status(booking)
     # Start the dispatch wave clock now — workers only see the booking from
     # this moment, so waves must not count time spent on the payment screen.
     if booking.dispatch_started_at is None:
@@ -486,9 +550,7 @@ async def reconcile_payment(
 
     booking.razorpay_payment_id = payment_id
     booking.payment_status = PaymentStatus.captured
-    booking.status = (
-        BookingStatus.prescription_pending if is_guarded_workflow(booking) else BookingStatus.confirmed
-    )
+    booking.status = _post_capture_status(booking)
     if booking.dispatch_started_at is None:
         booking.dispatch_started_at = datetime.now(timezone.utc)
 
@@ -560,7 +622,7 @@ async def razorpay_webhook(request: Request, x_razorpay_signature: str = Header(
         if b and b.payment_status != PaymentStatus.captured:
             b.payment_status = PaymentStatus.captured
             b.razorpay_payment_id = razorpay_payment_id
-            b.status = BookingStatus.prescription_pending if is_guarded_workflow(b) else BookingStatus.confirmed
+            b.status = _post_capture_status(b)
             if b.dispatch_started_at is None:
                 b.dispatch_started_at = datetime.now(timezone.utc)
             # post_ledger_entry flushes immediately; wrap to catch the partial
@@ -872,11 +934,20 @@ async def get_booking_payment_receipt(
     patient_name = (patient.full_name if patient and patient.full_name else None) or "\u2014"
 
     package_name = package_code = service_period = None
+    offering_label = "Care Package"
     if booking.package_id:
         pkres = await db.execute(select(CarePackage).where(CarePackage.id == booking.package_id))
         package = pkres.scalar_one_or_none()
         if package is not None:
             package_name, package_code = package.name, package.package_code
+    if package_name is None and booking.service_id:
+        # One-time service bookings: the receipt used to show "Care Package: —".
+        from app.models.models import ServiceCatalogue as _Svc
+        sres = await db.execute(select(_Svc).where(_Svc.id == booking.service_id))
+        svc = sres.scalar_one_or_none()
+        if svc is not None:
+            package_name, package_code = svc.name, svc.service_code
+            offering_label = "Service"
     if booking.package_booking_id:
         cpbres = await db.execute(
             select(CarePackageBooking).where(CarePackageBooking.id == booking.package_booking_id)
@@ -913,6 +984,7 @@ async def get_booking_payment_receipt(
         patient_name=patient_name,
         package_name=package_name,
         package_code=package_code,
+        offering_label=offering_label,
         service_period=service_period,
         payment_id=payment_id,
         payment_datetime=payment_datetime,
@@ -1067,6 +1139,12 @@ async def choose_cash_payment(
         raise HTTPException(status_code=404, detail="Booking not found")
 
     from app.services.cash_payment import CashPaymentError, select_cash_payment
+    from app.services.payment_guard import assert_booking_payable
+
+    # Idempotent replay of an already-selected cash booking is fine; anything
+    # else must still be payable (not expired / cancelled / test-only).
+    if booking.payment_status != PaymentStatus.cash_due:
+        await assert_booking_payable(db, booking)
 
     try:
         await select_cash_payment(db, booking)

@@ -9,6 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.database import get_db
 from app.core.deps import get_current_user
 from app.models.enums import WorkerType
+from app.services import catalog_guard
 from app.models.models import CarePackage, ChecklistTemplate, ServiceCatalogue
 from app.schemas.schemas import CarePackageOut, PackageServiceSummary, ServiceOut
 
@@ -88,10 +89,13 @@ async def list_services(
     # nullable ARRAY and "NULL means unrestricted" does not express cleanly
     # as an indexable predicate. The catalogue is small and already fully
     # loaded here, so this costs nothing measurable.
+    # Public catalogue: test-only / template-less rows never leave the server
+    # in production (admin screens use /admin/* endpoints, not this one).
     return [
         ServiceOut.model_validate(s)
         for s in res.scalars().all()
         if _matches_provider_type(s, ptype)
+        and (not catalog_guard.block_test_catalog() or catalog_guard.is_publicly_visible(s))
     ]
 
 
@@ -99,9 +103,23 @@ async def list_services(
 async def get_service(service_id: UUID, db: AsyncSession = Depends(get_db)):
     res = await db.execute(select(ServiceCatalogue).where(ServiceCatalogue.id == service_id))
     s = res.scalar_one_or_none()
-    if not s:
+    if not s or (catalog_guard.block_test_catalog() and not catalog_guard.is_publicly_visible(s)):
         raise HTTPException(status_code=404, detail="Service not found")
     return ServiceOut.model_validate(s)
+
+
+async def _filter_sellable_packages(items: List[CarePackage], db: AsyncSession) -> List[CarePackage]:
+    """Drop test-only / template-less packages (uses the primary service's
+    templates as a fallback, exactly like the checkout engine does)."""
+    ids = {p.primary_service_id for p in items if p.primary_service_id}
+    by_id: dict = {}
+    if ids:
+        sres = await db.execute(select(ServiceCatalogue).where(ServiceCatalogue.id.in_(ids)))
+        by_id = {x.id: x for x in sres.scalars().all()}
+    return [
+        p for p in items
+        if catalog_guard.is_publicly_visible(p, fallback_items=(by_id.get(p.primary_service_id),))
+    ]
 
 
 def _package_included_ids(package: CarePackage) -> List[UUID]:
@@ -185,6 +203,8 @@ async def list_care_packages(
     if city:
         items = [p for p in items if not p.available_cities or city in p.available_cities]
     items = [p for p in items if _matches_provider_type(p, ptype)]
+    if catalog_guard.block_test_catalog():
+        items = await _filter_sellable_packages(items, db)
     return await _care_packages_out(items, db)
 
 
@@ -192,7 +212,9 @@ async def list_care_packages(
 async def get_care_package(package_id: UUID, db: AsyncSession = Depends(get_db)):
     res = await db.execute(select(CarePackage).where(CarePackage.id == package_id))
     p = res.scalar_one_or_none()
-    if not p:
+    if not p or p.is_deleted:
+        raise HTTPException(status_code=404, detail="Care package not found")
+    if catalog_guard.block_test_catalog() and not await _filter_sellable_packages([p], db):
         raise HTTPException(status_code=404, detail="Care package not found")
     return (await _care_packages_out([p], db))[0]
 

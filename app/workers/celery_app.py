@@ -49,6 +49,15 @@ celery_app.conf.beat_schedule = {
         "task": "app.workers.tasks.detect_missed_visits",
         "schedule": 60.0,
     },
+    # wave re-broadcast: push each radius ring as it opens (idempotent)
+    "rebroadcast-open-bookings-every-minute": {
+        "task": "app.workers.tasks.rebroadcast_open_bookings",
+        "schedule": 60.0,
+    },
+    "expire-stale-unpaid-bookings-every-10-min": {
+        "task": "app.workers.tasks.expire_stale_unpaid_bookings",
+        "schedule": 600.0,
+    },
     # visit_reminders: every 5 min
     "visit-reminders-every-5-min": {
         "task": "app.workers.tasks.send_visit_reminders",

@@ -98,17 +98,31 @@ class ResolvedWorkflow:
 # allowed because nothing is required.
 # ---------------------------------------------------------------------------
 _FALLBACK_FAMILY_SUMMARY = (
-    "Visit completed for {{patient_name}}. Care delivered as planned. "
+    "Visit completed for {{patient_name}}. "
     "Please contact us if you have any questions."
 )
 
 
+_RISK_ORDER = {
+    ServiceRiskLevel.LOW: 0,
+    ServiceRiskLevel.MEDIUM: 1,
+    ServiceRiskLevel.HIGH: 2,
+    ServiceRiskLevel.CRITICAL: 3,
+}
+
+
 def _effective_risk(service: Optional[ServiceCatalogue], package: Optional[CarePackage]) -> ServiceRiskLevel:
-    if package and package.risk_level:
-        return package.risk_level
-    if service and service.risk_level:
-        return service.risk_level
-    return ServiceRiskLevel.LOW
+    """Highest risk of the purchased package and its primary service.
+
+    ROOT CAUSE: ``package.risk_level`` is a non-null enum (default LOW), so the
+    old ``if package and package.risk_level`` always returned the package's
+    value — a LOW package silently hid a HIGH primary service and let the
+    "clinical template required" gate be skipped.
+    """
+    levels = [x.risk_level for x in (package, service) if x is not None and x.risk_level]
+    if not levels:
+        return ServiceRiskLevel.LOW
+    return max(levels, key=lambda r: _RISK_ORDER.get(r, 0))
 
 
 async def resolve_workflow_for_booking(booking_id: UUID, db: AsyncSession) -> ResolvedWorkflow:
@@ -143,8 +157,22 @@ async def resolve_workflow_for_booking(booking_id: UUID, db: AsyncSession) -> Re
     doc_tpl: Optional[DocumentationTemplate] = None
     source = "fallback"
 
+    # 0. The templates snapshotted on the booking at purchase time win: they
+    #    are what the customer bought (package-first, see create_booking) and
+    #    they cannot drift if an admin later re-points the package.
+    if booking.checklist_template_id_snapshot:
+        cres = await db.execute(select(ChecklistTemplate).where(ChecklistTemplate.id == booking.checklist_template_id_snapshot))
+        checklist_tpl = cres.scalar_one_or_none()
+    if booking.documentation_template_id_snapshot:
+        dres = await db.execute(select(DocumentationTemplate).where(DocumentationTemplate.id == booking.documentation_template_id_snapshot))
+        doc_tpl = dres.scalar_one_or_none()
+    if (checklist_tpl or doc_tpl) and package:
+        source = "package"
+    elif checklist_tpl or doc_tpl:
+        source = "service"
+
     # Try the package first
-    if package:
+    if package and not (checklist_tpl or doc_tpl):
         if package.checklist_template_id:
             cres = await db.execute(select(ChecklistTemplate).where(ChecklistTemplate.id == package.checklist_template_id))
             checklist_tpl = cres.scalar_one_or_none()
@@ -154,13 +182,16 @@ async def resolve_workflow_for_booking(booking_id: UUID, db: AsyncSession) -> Re
         if checklist_tpl or doc_tpl:
             source = "package"
 
-    # Then the service
-    if not checklist_tpl and service and service.checklist_template_id:
+    # Then the service — but a purchased package that defines its own
+    # questionnaire is never blended with the primary service's (that mixed
+    # two packages' questionnaires into one visit).
+    _package_owns_workflow = source == "package"
+    if not _package_owns_workflow and not checklist_tpl and service and service.checklist_template_id:
         cres = await db.execute(select(ChecklistTemplate).where(ChecklistTemplate.id == service.checklist_template_id))
         checklist_tpl = cres.scalar_one_or_none()
         if checklist_tpl:
             source = "service"
-    if not doc_tpl and service and service.documentation_template_id:
+    if not _package_owns_workflow and not doc_tpl and service and service.documentation_template_id:
         dres = await db.execute(select(DocumentationTemplate).where(DocumentationTemplate.id == service.documentation_template_id))
         doc_tpl = dres.scalar_one_or_none()
         if doc_tpl and source == "fallback":
@@ -302,7 +333,12 @@ def _is_question_complete(qtype: str, answer: Any) -> bool:
         return isinstance(answer, list) and len(answer) > 0
     if qtype == "photo":
         return isinstance(answer, dict) and bool(answer.get("file_url"))
-    if qtype in ("vitals_entry", "medication_entry"):
+    if qtype == "vitals_entry":
+        # A real vitals answer carries at least one plausible measurement;
+        # {"notes": "..."} or an empty stub is NOT "vitals recorded".
+        from app.services.vitals_integrity import vitals_dict_is_meaningful
+        return vitals_dict_is_meaningful(answer)
+    if qtype == "medication_entry":
         return isinstance(answer, dict) and len(answer) > 0
     if qtype == "consent_confirmation":
         return isinstance(answer, dict) and bool(answer.get("consented"))
@@ -655,31 +691,34 @@ async def render_family_summary(
         vres = await db.execute(select(VisitRecord).where(VisitRecord.booking_id == booking_id))
         visit = vres.scalar_one_or_none()
 
-    # Find latest vitals row for this visit, if any. Imported lazily to avoid
-    # circulars in case downstream tests stub the engine.
+    # Only measurements that were actually recorded are ever filled in. A
+    # missing value renders as "not recorded" — never a dash/zero that reads
+    # like a normal value — and any line whose vitals are entirely missing is
+    # replaced by an explicit statement (see _strip_unrecorded_vitals).
+    recorded: Dict[str, str] = {}
     if visit is not None:
         from app.models.models import VitalSignReading  # local import
+        from app.services.vitals_integrity import MEASUREMENT_FIELDS
         v_q = await db.execute(
             select(VitalSignReading)
             .where(VitalSignReading.visit_record_id == visit.id)
             .order_by(VitalSignReading.recorded_at.desc())
-            .limit(1)
+            .limit(20)
         )
-        latest = v_q.scalar_one_or_none()
+        latest = next(
+            (r for r in v_q.scalars().all()
+             if any(getattr(r, f, None) is not None for f in MEASUREMENT_FIELDS)),
+            None,
+        )
         if latest:
-            ctx.update(
-                {
-                    "bp_systolic": str(latest.bp_systolic) if latest.bp_systolic is not None else "—",
-                    "bp_diastolic": str(latest.bp_diastolic) if latest.bp_diastolic is not None else "—",
-                    "pulse": str(latest.pulse) if latest.pulse is not None else "—",
-                    "spo2": str(latest.spo2) if latest.spo2 is not None else "—",
-                }
-            )
-    ctx.setdefault("bp_systolic", "—")
-    ctx.setdefault("bp_diastolic", "—")
-    ctx.setdefault("pulse", "—")
-    ctx.setdefault("spo2", "—")
-    ctx.setdefault("next_visit_date", "TBD")
+            for key in ("bp_systolic", "bp_diastolic", "pulse", "spo2"):
+                val = getattr(latest, key, None)
+                if val is not None:
+                    recorded[key] = str(val)
+    ctx.update(recorded)
+    for key in ("bp_systolic", "bp_diastolic", "pulse", "spo2"):
+        ctx.setdefault(key, "not recorded")
+    ctx.setdefault("next_visit_date", "to be confirmed")
 
     rendered = template_str
     for k, v in ctx.items():

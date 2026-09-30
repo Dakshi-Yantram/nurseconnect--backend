@@ -20,6 +20,19 @@ async def create_all():
             "ALTER TABLE worker_profiles ADD COLUMN IF NOT EXISTS signature_url TEXT NULL"
         ))
 
+    # Additive columns for dispatch idempotency + report finalization (see
+    # add_dispatch_idempotency_and_report_lock.py). Same reasoning as above:
+    # create_all never alters existing tables.
+    async with engine.begin() as conn:
+        for stmt in (
+            "ALTER TABLE bookings ADD COLUMN IF NOT EXISTS dispatch_cycle INTEGER NOT NULL DEFAULT 1",
+            "ALTER TABLE bookings ADD COLUMN IF NOT EXISTS no_worker_alerted_cycle INTEGER NULL",
+            "ALTER TABLE visit_records ADD COLUMN IF NOT EXISTS report_finalized_at TIMESTAMPTZ NULL",
+            "ALTER TABLE visit_records ADD COLUMN IF NOT EXISTS report_finalized_by UUID NULL REFERENCES users(id)",
+            "ALTER TABLE visit_records ADD COLUMN IF NOT EXISTS report_content_hash VARCHAR(64) NULL",
+        ):
+            await conn.execute(text(stmt))
+
     print("Tables created successfully!")
 
 asyncio.run(create_all())

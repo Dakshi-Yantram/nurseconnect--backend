@@ -92,6 +92,9 @@ async def _require_worker_for_write(booking_id: UUID, current: CurrentUser, db: 
     booking, worker = await _require_assigned_worker_or_admin(booking_id, current, db)
     if worker is None:
         raise HTTPException(status_code=403, detail="Only the assigned worker can submit workflow data")
+    # Finalized reports are immutable for everyone, including via this path.
+    from app.services.report_lock import assert_booking_report_editable
+    await assert_booking_report_editable(db, booking_id)
     return booking, worker
 
 

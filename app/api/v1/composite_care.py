@@ -32,6 +32,7 @@ succeeds, the nurse and patient safety-checklist screens in this file
 unlock.
 """
 import random
+import secrets
 from datetime import datetime, timezone
 from typing import List, Optional
 from uuid import UUID, uuid4
@@ -94,6 +95,7 @@ from app.services.care_workflow_engine import (
     validate_documentation_completion,
 )
 from app.services.common_services import audit, notify_parties
+from app.services import report_lock
 from app.services.composite_care_workflow import (
     checklist_items_for,
     diff_safety_checklists,
@@ -166,6 +168,18 @@ async def create_composite_booking(
     package = kres.scalar_one_or_none()
     if not package:
         raise HTTPException(status_code=404, detail="Care package not found")
+    # Same server-side gates as the standard booking flow. ROOT CAUSE: this
+    # path validated neither the slot (past dates were accepted) nor whether
+    # the package is deleted / test-only / template-less.
+    from app.api.v1.bookings import _validate_schedule
+    from app.services import catalog_guard
+    _validate_schedule(payload.scheduled_date, payload.scheduled_start_time)
+    _reason = catalog_guard.unbookable_reason(package)
+    if _reason:
+        raise HTTPException(
+            status_code=409,
+            detail={"code": _reason, "message": "This care package is not available for booking."},
+        )
     if not package.material_included:
         raise HTTPException(
             status_code=400,
@@ -253,6 +267,18 @@ async def create_service_only_booking(
     package = kres.scalar_one_or_none()
     if not package:
         raise HTTPException(status_code=404, detail="Care package not found")
+    # Same server-side gates as the standard booking flow. ROOT CAUSE: this
+    # path validated neither the slot (past dates were accepted) nor whether
+    # the package is deleted / test-only / template-less.
+    from app.api.v1.bookings import _validate_schedule
+    from app.services import catalog_guard
+    _validate_schedule(payload.scheduled_date, payload.scheduled_start_time)
+    _reason = catalog_guard.unbookable_reason(package)
+    if _reason:
+        raise HTTPException(
+            status_code=409,
+            detail={"code": _reason, "message": "This care package is not available for booking."},
+        )
     if package.material_included:
         raise HTTPException(
             status_code=400,
@@ -643,6 +669,7 @@ async def submit_nurse_safety_checklist(
     db: AsyncSession = Depends(get_db),
 ):
     booking, visit = await _get_booking_and_visit(db, booking_id)
+    report_lock.assert_report_editable(visit)
     if booking.worker_id != profile.id:
         raise HTTPException(status_code=403, detail="Not assigned to you")
     if not visit.check_in_at:
@@ -673,6 +700,7 @@ async def submit_patient_safety_verification(
     db: AsyncSession = Depends(get_db),
 ):
     booking, visit = await _get_booking_and_visit(db, booking_id)
+    report_lock.assert_report_editable(visit)
     if booking.consumer_id != profile.id:
         raise HTTPException(status_code=403, detail="Not your booking")
     if not visit.pre_procedure_checklist:
@@ -760,6 +788,7 @@ async def report_supply_issue(
     hygiene self-report: this is the nurse reporting the patient's materials,
     so conflating them would lose the distinction ops needs to triage."""
     booking, visit = await _get_booking_and_visit(db, booking_id)
+    report_lock.assert_report_editable(visit)
     if booking.worker_id != profile.id:
         raise HTTPException(status_code=403, detail="Not assigned to you")
     if booking.material_included:
@@ -856,8 +885,19 @@ async def submit_pre_procedure_photo(
     db: AsyncSession = Depends(get_db),
 ):
     booking, visit = await _get_booking_and_visit(db, booking_id)
+    report_lock.assert_report_editable(visit)
     if booking.worker_id != profile.id:
         raise HTTPException(status_code=403, detail="Not assigned to you")
+    if not visit.check_in_at:
+        # ROOT CAUSE: this endpoint flipped the booking to in_progress on its
+        # own, so a guarded-package visit could be "started" without the
+        # start-OTP or the location check. Starting is only done by
+        # /visits/{id}/verify-start-otp.
+        raise HTTPException(
+            status_code=409,
+            detail={"code": "VISIT_NOT_STARTED",
+                    "message": "Start the visit with the customer's code before the procedure."},
+        )
     if not (visit.pre_procedure_checklist and visit.patient_safety_verification):
         raise HTTPException(
             status_code=400,
@@ -926,6 +966,7 @@ async def submit_post_procedure_photo(
     db: AsyncSession = Depends(get_db),
 ):
     booking, visit = await _get_booking_and_visit(db, booking_id)
+    report_lock.assert_report_editable(visit)
     if booking.worker_id != profile.id:
         raise HTTPException(status_code=403, detail="Not assigned to you")
     if not visit.pre_procedure_photo_url:
@@ -989,7 +1030,7 @@ async def generate_completion_otp(
         otp_code = existing.decode() if isinstance(existing, bytes) else existing
         return {"sent": True, "otp": otp_code, "expires_in_seconds": ttl}
 
-    otp_code = str(random.randint(1000, 9999))
+    otp_code = f"{secrets.randbelow(9000) + 1000}"  # CSPRNG, not random.randint
     await redis_client.setex(_completion_otp_key(booking_id), _COMPLETION_OTP_TTL_SECONDS, otp_code)
     await redis_client.delete(_completion_attempts_key(booking_id))
 
@@ -1032,6 +1073,11 @@ async def verify_completion_otp(
         raise HTTPException(status_code=400, detail="Post-procedure photo must be captured first")
     if visit.check_out_at:
         raise HTTPException(status_code=400, detail="Already checked out")
+    if booking.status != BookingStatus.in_progress:
+        raise HTTPException(
+            status_code=409,
+            detail={"code": "VISIT_NOT_ACTIVE", "message": "This visit isn't in progress."},
+        )
 
     attempts_raw = await redis_client.get(_completion_attempts_key(booking_id))
     attempts = int(attempts_raw) if attempts_raw else 0
@@ -1074,7 +1120,12 @@ async def verify_completion_otp(
 
     family_summary = (payload.family_summary or "").strip() or await render_family_summary(booking_id, visit.id, db)
 
-    await redis_client.delete(_completion_otp_key(booking_id))
+    # Single use: only the caller whose DEL actually removed the key proceeds.
+    if await redis_client.delete(_completion_otp_key(booking_id)) != 1:
+        raise HTTPException(
+            status_code=409,
+            detail={"code": "OTP_ALREADY_USED", "message": "This completion code has already been used."},
+        )
     await redis_client.delete(_completion_attempts_key(booking_id))
 
     visit.check_out_at = datetime.now(timezone.utc)
@@ -1087,6 +1138,7 @@ async def verify_completion_otp(
     visit.status = VisitStatus.completed
     visit.documentation_complete = True
     booking.status = BookingStatus.completed
+    report_lock.finalize_report(visit, profile.user_id)
     profile.completed_visits_count += 1
 
     try:

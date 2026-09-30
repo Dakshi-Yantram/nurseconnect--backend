@@ -1,4 +1,4 @@
-﻿#!/bin/bash
+#!/bin/bash
 
 set -e
 
@@ -27,6 +27,13 @@ fi
 echo "Running database schema sync..."
 if [ -f add_gate_and_anticheat_schema.py ]; then
     python3 add_gate_and_anticheat_schema.py
+fi
+# Dispatch ledger + report-finalization columns/triggers. Idempotent and runs
+# BEFORE the restart below, so the new code never starts against a database
+# that lacks the columns it reads (set -e aborts the deploy first if it fails,
+# leaving the currently-running version serving traffic).
+if [ -f add_dispatch_idempotency_and_report_lock.py ]; then
+    python3 add_dispatch_idempotency_and_report_lock.py
 fi
 
 echo "DEBUG: hostname is $(hostname)"

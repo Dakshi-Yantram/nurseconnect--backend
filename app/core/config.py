@@ -290,6 +290,18 @@ class Settings(BaseSettings):
     # the test-suite books far-future slots on purpose.
     ENFORCE_BOOKING_SCHEDULE_LIMITS: bool = True
 
+    # Test-only / template-missing catalogue rows are hidden and unbookable in
+    # production-like environments. The CI/test-suite sets this true.
+    ALLOW_TEST_CATALOG_ITEMS: bool = False
+
+    # Visit start: nurse must be within this many metres of the customer's
+    # saved location (server-verified) before the visit-start OTP is accepted.
+    VISIT_START_RADIUS_M: int = 150
+    ENFORCE_VISIT_START_GEOFENCE: bool = True
+    # ^ Ignored (treated as True) when APP_ENV is production/staging/uat.
+    # Legacy OTP-less POST /visits/{id}/checkin. Never honoured in production.
+    ALLOW_LEGACY_CHECKIN: bool = False
+
     @property
     def cors_origin_list(self) -> List[str]:
         origins = [o.strip() for o in self.CORS_ORIGINS.split(",") if o.strip()]

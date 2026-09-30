@@ -58,6 +58,11 @@ jobs:
       JWT_SECRET_KEY: ci-test-secret-do-not-use-in-prod
       OTP_DEV_MODE: "true"
       ENFORCE_BOOKING_SCHEDULE_LIMITS: "false"
+      # Test-only relaxations. Each is ignored/forced-strict in production-like
+      # APP_ENV values (production, staging, stage, uat), never in this job.
+      ALLOW_TEST_CATALOG_ITEMS: "true"
+      ENFORCE_VISIT_START_GEOFENCE: "false"
+      ALLOW_LEGACY_CHECKIN: "true"
       OTP_DEV_FIXED_CODE: "123456"
       EMAIL_DEV_MODE: "true"
       MOCK_EXTERNAL_PROVIDERS: "true"
@@ -84,6 +89,12 @@ jobs:
 
       - name: Create database tables
         run: python3 -m app.api.v1.create_tables
+
+      - name: Apply hardening migration (dispatch ledger, report-lock triggers)
+        run: python3 add_dispatch_idempotency_and_report_lock.py
+
+      - name: Offline unit tests (no server needed)
+        run: python3 -m unittest tests.test_hardening_offline tests.test_invoice_pdf tests.test_pricing_engine tests.test_payout_release -v
 
       - name: Seed reference data
         run: python3 -m app.seed

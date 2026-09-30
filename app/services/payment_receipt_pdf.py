@@ -102,6 +102,7 @@ def render_payment_receipt_pdf(
     sgst_amount: Decimal = Decimal("0"),
     subsidy_amount: Decimal = Decimal("0"),
     invoice_number: Optional[str] = None,
+    offering_label: str = "Care Package",
 ) -> bytes:
     """The patient-facing payment receipt.
 
@@ -128,10 +129,10 @@ def render_payment_receipt_pdf(
     _box(
         doc,
         [
-            ("Package Code", package_code or dash),
+            (f"{offering_label} Code", package_code or dash),
             ("Service Period", service_period or dash),
         ],
-        title=f"Care Package: {package_name or dash}",
+        title=f"{offering_label}: {package_name or dash}",
     )
 
     doc.text("PAYMENT DETAILS:", bold=True)

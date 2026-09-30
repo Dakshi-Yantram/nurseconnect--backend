@@ -2155,6 +2155,31 @@ async def _run_pending_column_migrations():
         ))
     print("Column migrations: bookings.dispatch_started_at ensured")
 
+    # ---- from add_dispatch_idempotency_and_report_lock.py --------------
+    # Columns/table only. The immutability TRIGGERS are installed by that
+    # standalone script (deploy.sh runs it); everything here is additive,
+    # IF NOT EXISTS, and matches the ORM models exactly, so code that reads
+    # these columns can never 500 on a database that missed the script.
+    async with engine.begin() as conn:
+        for stmt in (
+            "ALTER TABLE bookings ADD COLUMN IF NOT EXISTS dispatch_cycle INTEGER NOT NULL DEFAULT 1",
+            "ALTER TABLE bookings ADD COLUMN IF NOT EXISTS no_worker_alerted_cycle INTEGER NULL",
+            "ALTER TABLE visit_records ADD COLUMN IF NOT EXISTS report_finalized_at TIMESTAMPTZ NULL",
+            "ALTER TABLE visit_records ADD COLUMN IF NOT EXISTS report_finalized_by UUID NULL REFERENCES users(id)",
+            "ALTER TABLE visit_records ADD COLUMN IF NOT EXISTS report_content_hash VARCHAR(64) NULL",
+            """CREATE TABLE IF NOT EXISTS booking_dispatch_notifications (
+                id UUID PRIMARY KEY,
+                booking_id UUID NOT NULL REFERENCES bookings(id) ON DELETE CASCADE,
+                worker_id UUID NOT NULL REFERENCES worker_profiles(id) ON DELETE CASCADE,
+                cycle INTEGER NOT NULL DEFAULT 1,
+                wave INTEGER NOT NULL DEFAULT 1,
+                notified_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                CONSTRAINT ux_dispatch_notif_booking_worker_cycle UNIQUE (booking_id, worker_id, cycle)
+            )""",
+        ):
+            await conn.execute(text(stmt))
+    print("Column migrations: dispatch ledger + report finalization ensured")
+
     # ---- from add_contracts_schema.py ----------------------------------
     async with engine.begin() as conn:
         await conn.execute(text("""
