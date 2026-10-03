@@ -1,0 +1,9 @@
+{
+  "_comment": "Merge this block into frontend/eas.json under \"build\". Then: eas build --platform android --profile staging",
+  "staging": {
+    "distribution": "internal",
+    "android": { "buildType": "apk" },
+    "credentialsSource": "remote",
+    "env": { "EXPO_PUBLIC_BACKEND_URL": "https://staging-api.nurseconnect.co.in" }
+  }
+}

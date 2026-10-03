@@ -1,0 +1,15 @@
+[Unit]
+Description=NurseConnect UAT Celery worker
+After=network.target
+
+[Service]
+User=ubuntu
+WorkingDirectory=/home/ubuntu/nurseconnect-uat
+EnvironmentFile=/home/ubuntu/nurseconnect-uat/.env
+ExecStartPre=/usr/bin/python3 /home/ubuntu/nurseconnect-uat/deploy/uat/preflight.py
+ExecStart=/usr/bin/python3 -m celery -A app.workers.celery_app worker -l info --concurrency 2
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

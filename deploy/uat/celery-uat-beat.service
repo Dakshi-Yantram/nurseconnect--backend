@@ -1,0 +1,15 @@
+[Unit]
+Description=NurseConnect UAT Celery beat (re-broadcast every minute, expire unpaid every 10)
+After=network.target
+
+[Service]
+User=ubuntu
+WorkingDirectory=/home/ubuntu/nurseconnect-uat
+EnvironmentFile=/home/ubuntu/nurseconnect-uat/.env
+ExecStartPre=/usr/bin/python3 /home/ubuntu/nurseconnect-uat/deploy/uat/preflight.py
+ExecStart=/usr/bin/python3 -m celery -A app.workers.celery_app beat -l info --schedule /home/ubuntu/nurseconnect-uat/celerybeat-schedule
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

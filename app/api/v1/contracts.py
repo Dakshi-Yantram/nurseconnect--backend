@@ -141,11 +141,19 @@ async def get_my_contracts(
         )
     ]
 
-    # Stage 2 unlocks only after the worker's first completed booking.
-    stage2_unlocked = completed_visits_count >= 1
+    # Stage 2 unlocks only after the worker's first completed booking, and only
+    # while it is switched on (CONTRACT_STAGE2_ENABLED).
+    from app.services.contract_flags import stage2_available, stage2_reason
+    stage2_enabled = settings.CONTRACT_STAGE2_ENABLED
+    stage2_accepted = bool(stage2 and stage2.status == "accepted")
+    stage2_unlocked = stage2_available(completed_visits_count, stage2_enabled)
     stage2_status = stage2.status if stage2 else ("pending" if stage2_unlocked else "not_applicable")
+    if not stage2_enabled and not stage2_accepted:
+        stage2_status = "not_applicable"  # already-signed nurses keep "accepted"
     stage2_text = None
-    if stage2:
+    if not stage2_enabled and not stage2_accepted:
+        stage2_text = None
+    elif stage2:
         stage2_text = stage2.rendered_text
     elif stage2_unlocked:
         stage2_text = contract_templates.render_stage2(
@@ -163,7 +171,7 @@ async def get_my_contracts(
             status=stage2_status,
             rendered_text=stage2_text,
             unlocked=stage2_unlocked and not (stage2 and stage2.status == "accepted"),
-            reason=None if stage2_unlocked else "Complete your first booking to unlock the Master Agreement.",
+            reason=None if stage2_accepted else stage2_reason(completed_visits_count, stage2_enabled),
         )
     )
     return out
@@ -334,12 +342,23 @@ async def initiate_stage2_esign(
     via the webhook or a status poll, both of which check with Digio
     directly (see get_document_status / verify_webhook_signature).
     """
+    if not settings.CONTRACT_STAGE2_ENABLED:
+        from app.services.contract_flags import STAGE2_OFF_REASON
+        raise HTTPException(status_code=403, detail=STAGE2_OFF_REASON)
     if (worker.completed_visits_count or 0) < 1:
         raise HTTPException(status_code=403, detail="Stage 2 unlocks only after your first completed booking.")
 
     existing_agreement = await _get_stage(db, worker.id, 2)
     if existing_agreement and existing_agreement.status == "accepted":
         raise HTTPException(status_code=409, detail="Stage 2 agreement already executed.")
+
+    # e-Sign not configured on this server yet: say so plainly instead of calling
+    # Digio, getting a 401 and returning a 502 that Cloudflare turns into a
+    # crash-looking error page. A plain-string detail (the app renders it as-is).
+    from app.integrations.providers import digio_client as _digio_cfg
+    from app.services.esign_guard import ESIGN_UNAVAILABLE_MESSAGE, esign_not_configured
+    if esign_not_configured(_digio_cfg):
+        raise HTTPException(status_code=409, detail=ESIGN_UNAVAILABLE_MESSAGE)
 
     # Reuse an in-flight, not-yet-expired session rather than spamming Digio
     # with a fresh signing request every time the screen is reopened.

@@ -302,6 +302,10 @@ class Settings(BaseSettings):
     # Legacy OTP-less POST /visits/{id}/checkin. Never honoured in production.
     ALLOW_LEGACY_CHECKIN: bool = False
 
+    # Stage 2 (Master Agreement via Digio e-Sign). true = current behaviour.
+    # false = nurses see only Stage 1 (in-app OTP); Stage 2 is "not_applicable".
+    CONTRACT_STAGE2_ENABLED: bool = True
+
     @property
     def cors_origin_list(self) -> List[str]:
         origins = [o.strip() for o in self.CORS_ORIGINS.split(",") if o.strip()]

@@ -1,0 +1,15 @@
+[Unit]
+Description=NurseConnect UAT API (port 8010)
+After=network.target
+
+[Service]
+User=ubuntu
+WorkingDirectory=/home/ubuntu/nurseconnect-uat
+EnvironmentFile=/home/ubuntu/nurseconnect-uat/.env
+ExecStartPre=/usr/bin/python3 /home/ubuntu/nurseconnect-uat/deploy/uat/preflight.py
+ExecStart=/home/ubuntu/.local/bin/gunicorn -k uvicorn.workers.UvicornWorker server:app --bind 127.0.0.1:8010 --workers 2
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

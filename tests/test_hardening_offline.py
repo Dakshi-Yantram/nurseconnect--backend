@@ -523,6 +523,68 @@ class TestSchemaGuard(unittest.TestCase):
         self.assertFalse(asyncio.run(self.sg.ensure_additive_schema(Dead())))
 
 
+class TestEsignGuard(unittest.TestCase):
+    """Missing Digio credentials must produce a clear message, not a 502 that
+    Cloudflare turns into a crash-looking page."""
+
+    def setUp(self):
+        from app.services import esign_guard
+        self.g = esign_guard
+
+    def client(self, mock, cid="", secret=""):
+        return SimpleNamespace(mock=mock, client_id=cid, client_secret=secret)
+
+    def test_real_mode_without_credentials_is_reported_unconfigured(self):
+        self.assertTrue(self.g.esign_not_configured(self.client(False)))
+        self.assertTrue(self.g.esign_not_configured(self.client(False, cid="id")))
+        self.assertTrue(self.g.esign_not_configured(self.client(False, secret="s")))
+
+    def test_real_mode_with_both_credentials_is_configured(self):
+        self.assertFalse(self.g.esign_not_configured(self.client(False, "id", "secret")))
+
+    def test_mock_mode_is_never_blocked(self):
+        # dev/test: mock client, no credentials, must keep using the mock signing flow
+        self.assertFalse(self.g.esign_not_configured(self.client(True)))
+
+    def test_message_is_a_plain_human_string(self):
+        m = self.g.ESIGN_UNAVAILABLE_MESSAGE
+        self.assertIsInstance(m, str)          # the app renders `detail` as text
+        self.assertNotIn("Digio", m)           # nothing internal leaks to users
+        self.assertNotIn("401", m)
+
+
+class TestStage2Switch(unittest.TestCase):
+    """CONTRACT_STAGE2_ENABLED turns the Master Agreement step off without
+    changing anything when it is on."""
+
+    def setUp(self):
+        from app.services import contract_flags
+        self.f = contract_flags
+
+    def test_enabled_keeps_the_original_rule(self):
+        self.assertFalse(self.f.stage2_available(0, True))
+        self.assertFalse(self.f.stage2_available(None, True))   # legacy NULL rows
+        self.assertTrue(self.f.stage2_available(1, True))
+        self.assertTrue(self.f.stage2_available(7, True))
+        self.assertEqual(self.f.stage2_reason(0, True), self.f.STAGE2_LOCKED_REASON)
+        self.assertIsNone(self.f.stage2_reason(1, True))
+
+    def test_disabled_never_unlocks_even_after_many_visits(self):
+        for visits in (0, 1, 50, None):
+            self.assertFalse(self.f.stage2_available(visits, False), visits)
+            self.assertEqual(self.f.stage2_reason(visits, False), self.f.STAGE2_OFF_REASON)
+
+    def test_messages_are_plain_user_facing_text(self):
+        for m in (self.f.STAGE2_OFF_REASON, self.f.STAGE2_LOCKED_REASON):
+            self.assertIsInstance(m, str)
+            self.assertNotIn("Digio", m)
+
+    def test_flag_defaults_to_on_so_nothing_changes_until_it_is_set(self):
+        import re
+        src = open("app/core/config.py", encoding="utf-8-sig").read()
+        self.assertTrue(re.search(r"CONTRACT_STAGE2_ENABLED:\s*bool\s*=\s*True", src))
+
+
 # --------------------------------------------------------------------------- 8
 class TestInvoiceUsesPurchasedOffering(unittest.TestCase):
     def test_legacy_component_carries_the_package_name(self):
