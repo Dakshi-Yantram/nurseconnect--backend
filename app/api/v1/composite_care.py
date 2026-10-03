@@ -96,6 +96,7 @@ from app.services.care_workflow_engine import (
 )
 from app.services.common_services import audit, notify_parties
 from app.services import report_lock
+from app.services.address_guard import MISSING_LOCATION_MESSAGE, coordinates_missing
 from app.services.composite_care_workflow import (
     checklist_items_for,
     diff_safety_checklists,
@@ -192,6 +193,9 @@ async def create_composite_booking(
     package_fee = package.package_price or package.per_visit_price
     if not package_fee:
         raise HTTPException(status_code=400, detail="Package has no configured price")
+
+    if coordinates_missing(payload.latitude, payload.longitude):
+        raise HTTPException(status_code=400, detail=MISSING_LOCATION_MESSAGE)
 
     prescription_url, prescription_public_id = await _resolve_prescription(payload, profile.id)
 
@@ -319,6 +323,9 @@ async def create_service_only_booking(
     package_fee = package.package_price or package.per_visit_price
     if not package_fee:
         raise HTTPException(status_code=400, detail="Package has no configured price")
+
+    if coordinates_missing(payload.latitude, payload.longitude):
+        raise HTTPException(status_code=400, detail=MISSING_LOCATION_MESSAGE)
 
     prescription_url, prescription_public_id = await _resolve_prescription(payload, profile.id)
 

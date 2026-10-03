@@ -66,6 +66,7 @@ from app.schemas.schemas import (
 )
 from app.security.access_control import assert_user_can_access_patient
 from app.services.common_services import audit
+from app.services.preference_defaults import default_preference
 from app.services.qualification import (
     is_worker_opted_in_for_service,
     is_worker_qualified_for_service,
@@ -863,10 +864,11 @@ async def my_service_eligibility(
         # that as opted-in (see is_worker_opted_in_for_service). Report the
         # same default here — otherwise this screen tells a nurse they are
         # opted out of work they are in fact being offered.
-        p_status = p.preference_status.value if p else WorkerPreferenceStatus.OPTED_IN.value
-        willing = bool(p.willing_to_accept) if p else True
-
         qualified, locked_reason = await is_worker_qualified_for_service(profile, svc, db)
+        if p:
+            p_status, willing = p.preference_status.value, bool(p.willing_to_accept)
+        else:
+            p_status, willing = default_preference(qualified)
 
         items.append(ServiceEligibilityItem(
             target_type="service",
@@ -894,10 +896,11 @@ async def my_service_eligibility(
         # that as opted-in (see is_worker_opted_in_for_service). Report the
         # same default here — otherwise this screen tells a nurse they are
         # opted out of work they are in fact being offered.
-        p_status = p.preference_status.value if p else WorkerPreferenceStatus.OPTED_IN.value
-        willing = bool(p.willing_to_accept) if p else True
-
         qualified, locked_reason = await is_worker_qualified_for_service(profile, pkg, db)
+        if p:
+            p_status, willing = p.preference_status.value, bool(p.willing_to_accept)
+        else:
+            p_status, willing = default_preference(qualified)
 
         items.append(ServiceEligibilityItem(
             target_type="package",

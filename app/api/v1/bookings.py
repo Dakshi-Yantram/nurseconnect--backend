@@ -53,6 +53,7 @@ from app.schemas.schemas import (
 )
 from app.core.timeutil import booking_end_utc, booking_start_utc, is_booking_expired, is_slot_expired
 from app.services import catalog_guard
+from app.services.address_guard import MISSING_LOCATION_MESSAGE, coordinates_missing
 from app.services.clinical_engine import compute_sla_breach, get_escalation_metadata
 from app.services.common_services import audit, notify_admins, notify_parties, send_notification
 from app.websockets.manager import booking_topic, manager, user_topic
@@ -125,8 +126,8 @@ async def _resolve_service_address(
     elif address is not None:
         resolved_snapshot = address.model_dump()
 
-    if resolved_snapshot is None or resolved_lat is None or resolved_lng is None:
-        raise HTTPException(status_code=400, detail="Provide address_id or address + latitude/longitude")
+    if resolved_snapshot is None or coordinates_missing(resolved_lat, resolved_lng):
+        raise HTTPException(status_code=400, detail=MISSING_LOCATION_MESSAGE)
 
     return resolved_snapshot, resolved_lat, resolved_lng
 

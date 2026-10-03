@@ -585,6 +585,60 @@ class TestStage2Switch(unittest.TestCase):
         self.assertTrue(re.search(r"CONTRACT_STAGE2_ENABLED:\s*bool\s*=\s*True", src))
 
 
+class TestAmarFindings(unittest.TestCase):
+    """UAT findings: (1) a nurse could opt out but not back in, (2) a booking with
+    no real coordinates showed a developer message, or (package flow) was created
+    at 0/0 with no error and could never be matched to a nurse."""
+
+    def setUp(self):
+        from app.services import address_guard, preference_defaults
+        self.g, self.p = address_guard, preference_defaults
+
+    # ---- address coordinates
+    def test_missing_or_zero_coordinates_are_rejected(self):
+        from decimal import Decimal
+        for lat, lng in ((None, None), (None, 72.8), (19.0, None), (0, 0), (0.0, 0.0),
+                         (Decimal("0"), Decimal("0")), (91, 10), (10, 181), ("x", "y")):
+            self.assertTrue(self.g.coordinates_missing(lat, lng), (lat, lng))
+
+    def test_real_coordinates_are_accepted(self):
+        from decimal import Decimal
+        for lat, lng in ((19.0760, 72.8777), (17.385, 78.4867), (-33.86, 151.2),
+                         (0, 72.8), (19.0, 0), (Decimal("28.6139"), Decimal("77.2090"))):
+            self.assertFalse(self.g.coordinates_missing(lat, lng), (lat, lng))
+
+    def test_message_is_plain_and_helpful(self):
+        m = self.g.MISSING_LOCATION_MESSAGE
+        self.assertIsInstance(m, str)
+        self.assertNotIn("latitude", m.lower())
+        self.assertNotIn("address_id", m)
+        self.assertIn("Use current location", m)
+
+    def test_guard_is_wired_into_both_booking_paths_before_the_prescription_upload(self):
+        bookings = open("app/api/v1/bookings.py", encoding="utf-8-sig").read()
+        self.assertIn("coordinates_missing(resolved_lat, resolved_lng)", bookings)
+        self.assertNotIn("Provide address_id or address + latitude/longitude", bookings)
+        composite = open("app/api/v1/composite_care.py", encoding="utf-8-sig").read()
+        guarded = ("raise HTTPException(status_code=400, detail=MISSING_LOCATION_MESSAGE)\n\n"
+                   "    prescription_url, prescription_public_id = await _resolve_prescription")
+        self.assertEqual(composite.count(guarded), 2)   # both create endpoints, guard BEFORE the upload
+
+    # ---- nurse opt-in / opt-out
+    def test_unchosen_item_is_opted_in_only_when_the_nurse_is_qualified(self):
+        self.assertEqual(self.p.default_preference(True), ("OPTED_IN", True))
+        self.assertEqual(self.p.default_preference(False), ("OPTED_OUT", False))
+
+    def test_opted_out_values_match_the_enum_the_apps_compare_against(self):
+        from app.models.enums import WorkerPreferenceStatus
+        self.assertEqual(WorkerPreferenceStatus.OPTED_IN.value, self.p.OPTED_IN)
+        self.assertEqual(WorkerPreferenceStatus.OPTED_OUT.value, self.p.OPTED_OUT)
+
+    def test_service_list_uses_the_qualification_aware_default(self):
+        w = open("app/api/v1/workers.py", encoding="utf-8-sig").read()
+        self.assertEqual(w.count("default_preference(qualified)"), 2)   # services and packages
+        self.assertNotIn("WorkerPreferenceStatus.OPTED_IN.value if p else", w)
+
+
 # --------------------------------------------------------------------------- 8
 class TestInvoiceUsesPurchasedOffering(unittest.TestCase):
     def test_legacy_component_carries_the_package_name(self):

@@ -281,6 +281,49 @@ class TestVitalsIntegrity:
         assert crit.status_code == 200, crit.text
 
 
+class TestAmarFindingsLive:
+    """Live regression tests for the two UAT findings (not run in CI sandbox)."""
+
+    def test_booking_with_zero_coordinates_is_refused_with_a_plain_message(self, consumer):
+        ch = _h(consumer)
+        svc_id = requests.get(f"{API}/services", timeout=15).json()[0]["id"]
+        r = requests.post(
+            f"{API}/bookings/", headers=ch, timeout=15,
+            json={
+                "patient_id": _patient_id(API, ch),
+                "service_id": svc_id,
+                "scheduled_date": (date.today() + timedelta(days=3)).isoformat(),
+                "scheduled_start_time": "10:30:00",
+                "address": {"line1": "No GPS Lane", "city": "Mumbai", "state": "MH", "pincode": "400001"},
+                "latitude": 0, "longitude": 0, "is_urgent": False,
+            },
+        )
+        assert r.status_code == 400, r.text
+        msg = r.json().get("detail")
+        msg = msg if isinstance(msg, str) else str(msg)
+        assert "location of this address" in msg and "latitude" not in msg.lower(), msg
+
+    def test_a_qualified_nurse_can_opt_out_and_back_in(self, worker):
+        wh = _h(worker)
+        items = requests.get(f"{API}/workers/me/service-eligibility", headers=wh, timeout=20).json()
+        item = next((i for i in items if i["can_opt_in"] and i["preference_status"] == "OPTED_IN"), None)
+        if item is None:
+            pytest.skip("test nurse has no qualified item currently opted in")
+        body = {"target_type": item["target_type"], "target_id": item["id"]}
+        try:
+            out = requests.put(f"{API}/workers/me/service-preferences", headers=wh, timeout=15,
+                               json={**body, "preference_status": "OPTED_OUT"})
+            assert out.status_code == 200, out.text
+            assert out.json()["preference_status"] == "OPTED_OUT"
+            back = requests.put(f"{API}/workers/me/service-preferences", headers=wh, timeout=15,
+                                json={**body, "preference_status": "OPTED_IN"})
+            assert back.status_code == 200, back.text
+            assert back.json()["preference_status"] == "OPTED_IN"
+        finally:  # leave the shared test nurse the way we found her
+            requests.put(f"{API}/workers/me/service-preferences", headers=wh, timeout=15,
+                         json={**body, "preference_status": "OPTED_IN"})
+
+
 # ------------------------------------------------------------------ GROUP B
 strict_only = pytest.mark.skipif(
     not STRICT_URL,
